@@ -37,6 +37,9 @@ struct Args {
     #[arg(long, env = "CMUX_SOCKET_PATH")]
     socket: Option<String>,
 
+    #[arg(long, env = "CMUX_AGENT_TUI_WORKSPACE_CWD")]
+    workspace_cwd: Option<String>,
+
     #[arg(
         long,
         default_value = "codex {prompt}",
@@ -233,6 +236,7 @@ enum KeyAction {
 
 struct App {
     socket_path: String,
+    workspace_cwd: String,
     codex_template: String,
     codex_plan_template: String,
     claude_template: String,
@@ -302,10 +306,19 @@ impl App {
             .socket
             .or_else(|| std::env::var("CMUX_SOCKET").ok())
             .unwrap_or_else(|| "/tmp/cmux.sock".to_string());
+        let workspace_cwd = args
+            .workspace_cwd
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| ".".to_string());
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
         let mut app = Self {
             socket_path,
+            workspace_cwd,
             codex_template: args.codex_command,
             codex_plan_template: args.codex_plan_command,
             claude_template: args.claude_command,
@@ -765,6 +778,7 @@ impl App {
                 "title": title,
                 "description": prompt,
                 "initial_command": command,
+                "cwd": self.workspace_cwd,
                 "focus": false,
             }),
         )?;
