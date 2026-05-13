@@ -771,6 +771,7 @@ impl App {
         let workspace_id = string_field(&created, "workspace_id")
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
         self.upsert_optimistic_workspace(workspace_id.clone(), title, latest_message);
+        self.select_workspace_by_id(&workspace_id);
         if !prompt.is_empty() {
             let _ = client.v2(
                 "workspace.prompt_submit",
@@ -808,6 +809,25 @@ impl App {
             *existing = workspace;
         } else {
             self.workspaces.push(workspace);
+        }
+    }
+
+    fn select_workspace_by_id(&mut self, workspace_id: &str) {
+        let Some(workspace_index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let group = display_group(self.workspaces[workspace_index].agent_state());
+        self.collapsed_groups.remove(&group);
+        if let Some(row_index) =
+            visible_rows(&self.workspaces, &self.collapsed_groups)
+                .iter()
+                .position(|row| matches!(row, WorkspaceListRow::Workspace(index) if *index == workspace_index))
+        {
+            self.selected = row_index;
         }
     }
 
@@ -1822,8 +1842,10 @@ fn handle_paste(app: &mut App, text: &str) {
     }
 
     if saw_image {
-        app.composer.insert_str(rendered.join(" "));
-        select_image_token_at_cursor(app);
+        let mut insertion = rendered.join(" ");
+        insertion.push(' ');
+        app.composer.insert_str(&insertion);
+        app.selected_image = None;
     } else {
         app.selected_image = None;
         app.composer.insert_str(text);
@@ -1855,7 +1877,8 @@ fn normalize_composer_image_paths(app: &mut App) {
             }
             if saw_image {
                 changed = true;
-                let next = rendered.join(" ");
+                let mut next = rendered.join(" ");
+                next.push(' ');
                 if row == cursor_row {
                     cursor_col = next.chars().count();
                 }
