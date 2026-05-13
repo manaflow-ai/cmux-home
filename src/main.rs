@@ -272,6 +272,10 @@ enum ViewMode {
 struct PersistedState {
     draft: Option<PersistedDraft>,
     stashes: Vec<PersistedDraft>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    plan_mode: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -315,6 +319,16 @@ impl App {
             last_refresh: None,
             started_at: Instant::now(),
         };
+        if let Some(provider) = persisted
+            .provider
+            .as_deref()
+            .and_then(AgentKind::from_label)
+        {
+            app.provider = provider;
+        }
+        if let Some(plan_mode) = persisted.plan_mode {
+            app.plan_mode = plan_mode;
+        }
         if let Some(draft) = persisted.draft {
             app.restore_draft(draft);
             app.status_line = "restored draft".to_string();
@@ -882,6 +896,8 @@ impl App {
         let state = PersistedState {
             draft: self.current_draft(),
             stashes: self.stashes.clone(),
+            provider: Some(self.provider.label().to_string()),
+            plan_mode: Some(self.plan_mode),
         };
         if let Some(parent) = self.state_path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -934,7 +950,7 @@ impl App {
             .unwrap_or(false);
         self.last_quit_tap = Some((ch, now));
         if !should_quit {
-            self.status_line = format!("press ctrl+{ch} again to quit");
+            self.status_line = format!("press ctrl+{ch} to quit");
         }
         should_quit
     }
@@ -2537,6 +2553,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         frame.render_widget(
             Paragraph::new("  enter restore · ctrl+s restore · esc main · ? shortcuts")
                 .style(muted_style()),
+            area,
+        );
+        return;
+    }
+
+    if app.status_line.starts_with("press ctrl+") {
+        frame.render_widget(
+            Paragraph::new(format!("  {}", app.status_line)).style(muted_style()),
             area,
         );
         return;
