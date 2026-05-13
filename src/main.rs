@@ -2869,9 +2869,23 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     if slash_command_query(app).is_some() {
-        draw_command_suggestions(frame, area, app);
+        let suggestions_height = command_suggestions_height(app, area.height);
+        if suggestions_height == 0 || suggestions_height >= area.height {
+            draw_command_suggestions(frame, area, app);
+            return;
+        }
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(suggestions_height)])
+            .split(area);
+        draw_workspace_list(frame, areas[0], app);
+        draw_command_suggestions(frame, areas[1], app);
         return;
     }
+    draw_workspace_list(frame, area, app);
+}
+
+fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.ensure_selected_visible(area.height);
     let spinner_tick = (app.started_at.elapsed().as_millis() / 140) as usize;
     let lines = visible_rows(&app.workspaces, &app.collapsed_groups)
@@ -2893,6 +2907,15 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn command_suggestions_height(app: &App, available_height: u16) -> u16 {
+    let Some(query) = slash_command_query(app) else {
+        return 0;
+    };
+    let row_count = command_suggestions_for_query(&query).len().max(1);
+    let desired = (row_count + 1).min(4) as u16;
+    desired.min(available_height.saturating_sub(1))
 }
 
 fn draw_command_suggestions(frame: &mut Frame<'_>, area: Rect, app: &App) {
