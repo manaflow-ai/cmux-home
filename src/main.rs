@@ -242,10 +242,8 @@ struct App {
     workspace_cwd: String,
     codex_template: String,
     codex_plan_template: String,
-    codex_plan_prefix: String,
     claude_template: String,
     claude_plan_template: String,
-    claude_plan_prefix: String,
     rename_template: Option<String>,
     provider: AgentKind,
     plan_mode: bool,
@@ -317,7 +315,6 @@ struct AgentConfig {
 struct AgentCommandConfig {
     command: Option<String>,
     plan_command: Option<String>,
-    plan_prompt_prefix: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -360,18 +357,12 @@ impl App {
                 .codex
                 .plan_command
                 .unwrap_or(args.codex_plan_command),
-            codex_plan_prefix: config
-                .agents
-                .codex
-                .plan_prompt_prefix
-                .unwrap_or_else(default_codex_plan_prefix),
             claude_template: config.agents.claude.command.unwrap_or(args.claude_command),
             claude_plan_template: config
                 .agents
                 .claude
                 .plan_command
                 .unwrap_or(args.claude_plan_command),
-            claude_plan_prefix: config.agents.claude.plan_prompt_prefix.unwrap_or_default(),
             rename_template: config.rename.command,
             provider: AgentKind::Codex,
             plan_mode: false,
@@ -1232,21 +1223,7 @@ impl App {
             AgentKind::Claude if self.plan_mode => &self.claude_plan_template,
             AgentKind::Claude => &self.claude_template,
         };
-        let prompt = self.command_prompt(prompt);
-        template.replace("{prompt}", &shell_quote(&prompt))
-    }
-
-    fn command_prompt(&self, prompt: &str) -> String {
-        let prefix = match self.provider {
-            AgentKind::Codex if self.plan_mode => &self.codex_plan_prefix,
-            AgentKind::Claude if self.plan_mode => &self.claude_plan_prefix,
-            _ => "",
-        };
-        if !prefix.is_empty() && !prompt.is_empty() {
-            format!("{prefix}\n\n{prompt}")
-        } else {
-            prompt.to_string()
-        }
+        template.replace("{prompt}", &shell_quote(prompt))
     }
 
     fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
@@ -1324,10 +1301,6 @@ fn load_config(path: Option<&PathBuf>) -> AppConfig {
     path.and_then(|path| fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
-}
-
-fn default_codex_plan_prefix() -> String {
-    "Plan mode: propose a concise implementation plan first. Do not edit files or run mutating commands until the user approves.".to_string()
 }
 
 fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
