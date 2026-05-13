@@ -33,6 +33,26 @@ use tui_textarea::{CursorMove, TextArea};
 const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
 const COMPOSER_CONTINUATION_PROMPT: &str = "  ";
+const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
+    CommandSuggestion {
+        command: "/history",
+        detail: "previous prompts",
+    },
+    CommandSuggestion {
+        command: "/stash",
+        detail: "saved drafts",
+    },
+    CommandSuggestion {
+        command: "/stash save",
+        detail: "save text as stash",
+    },
+];
+
+#[derive(Clone, Copy)]
+struct CommandSuggestion {
+    command: &'static str,
+    detail: &'static str,
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Minimal cmux workspace launcher and status TUI")]
@@ -252,6 +272,7 @@ struct App {
     image_paths: Vec<String>,
     selected_image: Option<ImageSelection>,
     stashes: Vec<PersistedDraft>,
+    history: Vec<PersistedDraft>,
     state_path: PathBuf,
     collapsed_groups: HashSet<AgentState>,
     composer: TextArea<'static>,
@@ -272,6 +293,7 @@ enum ComposerMode {
 enum ViewMode {
     Workspaces,
     Stashes,
+    History,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,7 +307,10 @@ struct ImageSelection {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct PersistedState {
     draft: Option<PersistedDraft>,
+    #[serde(default)]
     stashes: Vec<PersistedDraft>,
+    #[serde(default)]
+    history: Vec<PersistedDraft>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
@@ -386,6 +411,7 @@ impl App {
             image_paths: Vec::new(),
             selected_image: None,
             stashes: persisted.stashes,
+            history: persisted.history,
             state_path,
             collapsed_groups: HashSet::new(),
             composer: new_composer(),
@@ -501,7 +527,9 @@ impl App {
                 self.selected = visible.len().saturating_sub(1);
             }
         } else {
-            self.selected = self.selected.min(self.stashes.len().saturating_sub(1));
+            self.selected = self
+                .selected
+                .min(self.active_draft_list_len().saturating_sub(1));
         }
         self.clamp_list_scroll(1);
         self.last_refresh = Some(snapshot.loaded_at);
@@ -848,6 +876,7 @@ impl App {
                 json!({ "workspace_id": workspace_id, "message": prompt }),
             );
         }
+        self.record_prompt_history(&prompt, &images);
         self.composer = new_composer();
         self.image_paths.clear();
         self.composer_mode = ComposerMode::NewWorkspace;
@@ -988,11 +1017,31 @@ impl App {
         self.status_line = format!("restored stash {count}");
     }
 
+    fn restore_selected_history(&mut self) {
+        let Some(draft) = self.history.get(self.selected).cloned() else {
+            self.status_line = "select a prompt".to_string();
+            return;
+        };
+        let count = self.selected + 1;
+        self.restore_draft(draft);
+        self.view_mode = ViewMode::Workspaces;
+        self.selected = 0;
+        self.list_scroll = 0;
+        self.status_line = format!("restored prompt {count}");
+    }
+
     fn open_stash_view(&mut self) {
         self.view_mode = ViewMode::Stashes;
         self.selected = self.selected.min(self.stashes.len().saturating_sub(1));
         self.list_scroll = 0;
         self.status_line = format!("{} stashes", self.stashes.len());
+    }
+
+    fn open_history_view(&mut self) {
+        self.view_mode = ViewMode::History;
+        self.selected = self.selected.min(self.history.len().saturating_sub(1));
+        self.list_scroll = 0;
+        self.status_line = format!("{} prompts", self.history.len());
     }
 
     fn open_workspace_view(&mut self) {
@@ -1009,6 +1058,27 @@ impl App {
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
+    }
+
+    fn record_prompt_history(&mut self, prompt: &str, images: &[String]) {
+        if prompt.trim().is_empty() && images.is_empty() {
+            return;
+        }
+        let lines = if prompt.is_empty() {
+            vec![String::new()]
+        } else {
+            prompt.lines().map(str::to_string).collect()
+        };
+        self.history.insert(
+            0,
+            PersistedDraft {
+                lines,
+                image_paths: images.to_vec(),
+                provider: self.provider.label().to_string(),
+                plan_mode: self.plan_mode,
+                saved_at_ms: now_millis(),
+            },
+        );
     }
 
     fn current_draft(&self) -> Option<PersistedDraft> {
@@ -1028,6 +1098,7 @@ impl App {
         let state = PersistedState {
             draft: self.current_draft(),
             stashes: self.stashes.clone(),
+            history: self.history.clone(),
             provider: Some(self.provider.label().to_string()),
             plan_mode: Some(self.plan_mode),
         };
@@ -1124,7 +1195,7 @@ impl App {
     }
 
     fn select_previous(&mut self) {
-        if self.view_mode == ViewMode::Stashes {
+        if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self.selected.saturating_sub(1);
             return;
         }
@@ -1133,11 +1204,11 @@ impl App {
     }
 
     fn select_next(&mut self) {
-        if self.view_mode == ViewMode::Stashes {
+        if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self
                 .selected
                 .saturating_add(1)
-                .min(self.stashes.len().saturating_sub(1));
+                .min(self.active_draft_list_len().saturating_sub(1));
             return;
         }
         let rows = visible_rows(&self.workspaces, &self.collapsed_groups);
@@ -1170,13 +1241,21 @@ impl App {
     }
 
     fn max_list_scroll(&self, viewport_height: u16) -> usize {
-        if self.view_mode == ViewMode::Stashes {
+        if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             let rows = usize::from(viewport_height.saturating_sub(1).max(1));
-            return self.stashes.len().saturating_sub(rows);
+            return self.active_draft_list_len().saturating_sub(rows);
         }
         visible_rows(&self.workspaces, &self.collapsed_groups)
             .len()
             .saturating_sub(usize::from(viewport_height.max(1)))
+    }
+
+    fn active_draft_list_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Workspaces => 0,
+            ViewMode::Stashes => self.stashes.len(),
+            ViewMode::History => self.history.len(),
+        }
     }
 
     fn toggle_selected_group(&mut self) -> bool {
@@ -1645,7 +1724,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         }
         KeyEvent {
             code: KeyCode::Esc, ..
-        } if app.view_mode == ViewMode::Stashes => {
+        } if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) => {
             app.open_workspace_view();
         }
         _ if app.composer_is_active() => return handle_composer_key(app, key),
@@ -1719,7 +1798,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             code: KeyCode::Char('i'),
             modifiers: KeyModifiers::CONTROL,
             ..
-        } => app.toggle_provider(),
+        } => {
+            if !complete_command_suggestion(app) {
+                app.toggle_provider();
+            }
+        }
         KeyEvent {
             code: KeyCode::Backspace,
             modifiers: KeyModifiers::NONE,
@@ -1792,6 +1875,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } if app.view_mode == ViewMode::Stashes => {
             app.restore_selected_stash();
+        }
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } if app.view_mode == ViewMode::History => {
+            app.restore_selected_history();
         }
         KeyEvent {
             code: KeyCode::Enter,
@@ -1886,7 +1976,11 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             code: KeyCode::Char('i'),
             modifiers: KeyModifiers::CONTROL,
             ..
-        } => app.toggle_provider(),
+        } => {
+            if !complete_command_suggestion(app) {
+                app.toggle_provider();
+            }
+        }
         KeyEvent {
             code: KeyCode::Esc, ..
         } => {
@@ -1982,6 +2076,12 @@ fn handle_composer_command(app: &mut App) -> bool {
     }
 
     let text = app.composer.lines().join("\n").trim().to_string();
+    if text == "/history" {
+        app.reset_composer();
+        app.open_history_view();
+        return true;
+    }
+
     if text == "/stash" {
         app.reset_composer();
         app.open_stash_view();
@@ -2011,7 +2111,56 @@ fn handle_composer_command(app: &mut App) -> bool {
         return true;
     }
 
+    if text.starts_with('/') {
+        if complete_command_suggestion(app) {
+            return true;
+        }
+        app.status_line = "unknown command".to_string();
+        return true;
+    }
+
     false
+}
+
+fn complete_command_suggestion(app: &mut App) -> bool {
+    let Some(query) = slash_command_query(app) else {
+        return false;
+    };
+    let Some(suggestion) = command_suggestions_for_query(&query).into_iter().next() else {
+        return false;
+    };
+    let current = query.trim_end();
+    if current == suggestion.command {
+        return false;
+    }
+    let text = if suggestion.command == "/stash save" {
+        "/stash save ".to_string()
+    } else {
+        suggestion.command.to_string()
+    };
+    app.composer = composer_from_lines(vec![text]);
+    app.composer.move_cursor(CursorMove::End);
+    app.selected_image = None;
+    app.status_line = format!("command {}", suggestion.command);
+    true
+}
+
+fn slash_command_query(app: &App) -> Option<String> {
+    if app.composer_mode != ComposerMode::NewWorkspace {
+        return None;
+    }
+    let text = app.composer.lines().join("\n");
+    let trimmed = text.trim_start();
+    trimmed.starts_with('/').then(|| trimmed.to_string())
+}
+
+fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
+    let query = query.trim_start();
+    COMMAND_SUGGESTIONS
+        .iter()
+        .copied()
+        .filter(|suggestion| suggestion.command.starts_with(query))
+        .collect()
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
@@ -2029,12 +2178,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
             app.scroll_list(3, workspace_end);
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if app.view_mode == ViewMode::Stashes {
+            if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) {
                 if mouse.row > 0 {
                     let row = app
                         .list_scroll
                         .saturating_add(usize::from(mouse.row.saturating_sub(1)));
-                    app.selected = row.min(app.stashes.len().saturating_sub(1));
+                    app.selected = row.min(app.active_draft_list_len().saturating_sub(1));
                 }
                 return;
             }
@@ -2698,7 +2847,29 @@ fn composer_visible_start(app: &App, height: usize, width: u16) -> usize {
 
 fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if app.view_mode == ViewMode::Stashes {
-        draw_stashes(frame, area, app);
+        draw_draft_list(
+            frame,
+            area,
+            app,
+            "Stashes",
+            "no stashes",
+            app.stashes.clone(),
+        );
+        return;
+    }
+    if app.view_mode == ViewMode::History {
+        draw_draft_list(
+            frame,
+            area,
+            app,
+            "History",
+            "no previous prompts",
+            app.history.clone(),
+        );
+        return;
+    }
+    if slash_command_query(app).is_some() {
+        draw_command_suggestions(frame, area, app);
         return;
     }
     app.ensure_selected_visible(area.height);
@@ -2724,7 +2895,38 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_stashes(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn draw_command_suggestions(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let query = slash_command_query(app).unwrap_or_default();
+    let suggestions = command_suggestions_for_query(&query);
+    let mut lines = vec![Line::from(Span::styled("Commands", muted_style()))];
+    if suggestions.is_empty() {
+        lines.push(Line::from(Span::styled("  no commands", muted_style())));
+    } else {
+        lines.extend(
+            suggestions
+                .into_iter()
+                .take(area.height.saturating_sub(1) as usize)
+                .map(|suggestion| {
+                    Line::from(vec![
+                        Span::styled("  ", muted_style()),
+                        Span::styled(suggestion.command.to_string(), input_style()),
+                        Span::styled("  ", muted_style()),
+                        Span::styled(suggestion.detail.to_string(), muted_style()),
+                    ])
+                }),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_draft_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    title: &str,
+    empty_label: &str,
+    drafts: Vec<PersistedDraft>,
+) {
     if area.height == 0 {
         return;
     }
@@ -2737,17 +2939,20 @@ fn draw_stashes(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
     app.list_scroll = app
         .list_scroll
-        .min(app.stashes.len().saturating_sub(viewport_rows));
+        .min(drafts.len().saturating_sub(viewport_rows));
     let mut lines = vec![Line::from(Span::styled(
-        format!("Stashes ({})", app.stashes.len()),
+        format!("{title} ({})", drafts.len()),
         muted_style(),
     ))];
 
-    if app.stashes.is_empty() {
-        lines.push(Line::from(Span::styled("  no stashes", muted_style())));
+    if drafts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  {empty_label}"),
+            muted_style(),
+        )));
     } else {
         lines.extend(
-            app.stashes
+            drafts
                 .iter()
                 .enumerate()
                 .skip(app.list_scroll)
@@ -3020,6 +3225,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    if app.view_mode == ViewMode::History {
+        frame.render_widget(
+            Paragraph::new("  enter restore · esc main · ? shortcuts").style(muted_style()),
+            area,
+        );
+        return;
+    }
+
     if app.status_line.starts_with("press ctrl+") {
         frame.render_widget(
             Paragraph::new(format!("  {}", app.status_line)).style(muted_style()),
@@ -3038,6 +3251,14 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 );
             }
             ComposerMode::NewWorkspace => {
+                if slash_command_query(app).is_some() {
+                    frame.render_widget(
+                        Paragraph::new("  enter run · tab complete · esc clear")
+                            .style(muted_style()),
+                        area,
+                    );
+                    return;
+                }
                 let plan_label = app.plan_toggle_label();
                 let plan_style = if plan_label == "plan" {
                     purple_style()
