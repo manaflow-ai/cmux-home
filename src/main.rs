@@ -1361,16 +1361,15 @@ impl App {
                 ("socket", &self.socket_path),
             ],
         );
-        let _ = Command::new("sh")
-            .arg("-lc")
-            .arg(rendered)
-            .current_dir(&self.workspace_cwd)
-            .env("CMUX_SOCKET_PATH", &self.socket_path)
-            .env("CMUX_WORKSPACE_ID", workspace_id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let mut command = Command::new("sh");
+        configure_workspace_hook_command(
+            &mut command,
+            &rendered,
+            &self.workspace_cwd,
+            &self.socket_path,
+            workspace_id,
+        );
+        let _ = command.spawn();
     }
 
     fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
@@ -1393,17 +1392,37 @@ impl App {
                 ("socket", &self.socket_path),
             ],
         );
-        let _ = Command::new("sh")
-            .arg("-lc")
-            .arg(rendered)
-            .current_dir(&self.workspace_cwd)
-            .env("CMUX_SOCKET_PATH", &self.socket_path)
-            .env("CMUX_WORKSPACE_ID", workspace_id)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        let mut command = Command::new("sh");
+        configure_workspace_hook_command(
+            &mut command,
+            &rendered,
+            &self.workspace_cwd,
+            &self.socket_path,
+            workspace_id,
+        );
+        let _ = command.spawn();
     }
+}
+
+fn configure_workspace_hook_command(
+    command: &mut Command,
+    rendered: &str,
+    workspace_cwd: &str,
+    socket_path: &str,
+    workspace_id: &str,
+) {
+    command
+        .arg("-lc")
+        .arg(rendered)
+        .current_dir(workspace_cwd)
+        .env("CMUX_SOCKET_PATH", socket_path)
+        .env("CMUX_WORKSPACE_ID", workspace_id)
+        .env_remove("CMUX_SURFACE_ID")
+        .env_remove("CMUX_TAB_ID")
+        .env_remove("CMUX_PANEL_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 }
 
 fn new_composer() -> TextArea<'static> {
