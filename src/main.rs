@@ -738,6 +738,11 @@ impl App {
     fn submit_new_workspace(&mut self) -> Result<()> {
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let command = self.render_agent_command(&prompt);
+        let latest_message = if prompt.is_empty() {
+            "standing by for task".to_string()
+        } else {
+            one_line_preview(&prompt, 120)
+        };
         let title = if prompt.is_empty() {
             self.agent_label()
         } else {
@@ -755,6 +760,7 @@ impl App {
         )?;
         let workspace_id = string_field(&created, "workspace_id")
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+        self.upsert_optimistic_workspace(workspace_id.clone(), title, latest_message);
         if !prompt.is_empty() {
             let _ = client.v2(
                 "workspace.prompt_submit",
@@ -766,6 +772,33 @@ impl App {
         self.composer_mode = ComposerMode::NewWorkspace;
         self.status_line = format!("started {} workspace", self.agent_label());
         Ok(())
+    }
+
+    fn upsert_optimistic_workspace(
+        &mut self,
+        workspace_id: String,
+        title: String,
+        latest_message: String,
+    ) {
+        let workspace = WorkspaceStatus {
+            id: workspace_id.clone(),
+            title,
+            latest_message,
+            selected: false,
+            pinned: false,
+            statuses: HashMap::new(),
+            unread_notifications: 0,
+            updated_at: Some(Instant::now()),
+        };
+        if let Some(existing) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        {
+            *existing = workspace;
+        } else {
+            self.workspaces.push(workspace);
+        }
     }
 
     fn submit_rename_workspace(&mut self, workspace_id: String) -> Result<()> {
@@ -1518,7 +1551,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if app.composer_has_text() {
                 app.submit_new_workspace()?;
-                return Ok(KeyAction::Refresh("workspace created".to_string()));
+                return Ok(KeyAction::Continue);
             }
             if app.toggle_selected_group() {
                 return Ok(KeyAction::Continue);
@@ -1561,7 +1594,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
                     return Ok(KeyAction::Continue);
                 }
                 app.submit_new_workspace()?;
-                return Ok(KeyAction::Refresh("workspace created".to_string()));
+                return Ok(KeyAction::Continue);
             }
             ComposerMode::RenameWorkspace(workspace_id) => {
                 app.submit_rename_workspace(workspace_id)?;
