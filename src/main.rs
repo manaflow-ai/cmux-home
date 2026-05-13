@@ -245,6 +245,7 @@ struct App {
     list_scroll: usize,
     view_mode: ViewMode,
     image_paths: Vec<String>,
+    selected_image: Option<ImageSelection>,
     stashes: Vec<PersistedDraft>,
     state_path: PathBuf,
     collapsed_groups: HashSet<AgentState>,
@@ -266,6 +267,14 @@ enum ComposerMode {
 enum ViewMode {
     Workspaces,
     Stashes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ImageSelection {
+    row: usize,
+    start: usize,
+    end: usize,
+    image_index: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -309,6 +318,7 @@ impl App {
             list_scroll: 0,
             view_mode: ViewMode::Workspaces,
             image_paths: Vec::new(),
+            selected_image: None,
             stashes: persisted.stashes,
             state_path,
             collapsed_groups: HashSet::new(),
@@ -861,6 +871,7 @@ impl App {
     fn reset_composer(&mut self) {
         self.composer = new_composer();
         self.image_paths.clear();
+        self.selected_image = None;
         self.composer_mode = ComposerMode::NewWorkspace;
     }
 
@@ -907,6 +918,7 @@ impl App {
     fn restore_draft(&mut self, draft: PersistedDraft) {
         self.composer = composer_from_lines(non_empty_lines(draft.lines));
         self.image_paths = draft.image_paths;
+        self.selected_image = None;
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
@@ -1482,7 +1494,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !delete_image_token_before_cursor(&mut app.composer) {
+            if delete_image_token_before_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
                 app.composer.input(key);
             }
         }
@@ -1491,7 +1506,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !delete_image_token_after_cursor(&mut app.composer) {
+            if delete_image_token_after_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
                 app.composer.input(key);
             }
         }
@@ -1500,7 +1518,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !move_across_image_token(&mut app.composer, CursorMove::Back) {
+            if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
             }
         }
@@ -1509,7 +1527,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !move_across_image_token(&mut app.composer, CursorMove::Forward) {
+            if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
             }
         }
@@ -1575,6 +1593,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             };
         }
         _ => {
+            app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
         }
@@ -1640,7 +1659,10 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !delete_image_token_before_cursor(&mut app.composer) {
+            if delete_image_token_before_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
                 app.composer.input(key);
             }
         }
@@ -1649,7 +1671,10 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !delete_image_token_after_cursor(&mut app.composer) {
+            if delete_image_token_after_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
                 app.composer.input(key);
             }
         }
@@ -1658,7 +1683,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !move_across_image_token(&mut app.composer, CursorMove::Back) {
+            if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
             }
         }
@@ -1667,7 +1692,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::NONE,
             ..
         } => {
-            if !move_across_image_token(&mut app.composer, CursorMove::Forward) {
+            if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
             }
         }
@@ -1677,6 +1702,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             if !open_image_token_at_cursor(app) {
+                app.selected_image = None;
                 app.composer.input(key);
                 normalize_composer_image_paths(app);
             }
@@ -1696,6 +1722,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             move_to_line_end_or_next_line(&mut app.composer);
         }
         _ => {
+            app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
         }
@@ -1796,7 +1823,9 @@ fn handle_paste(app: &mut App, text: &str) {
 
     if saw_image {
         app.composer.insert_str(rendered.join(" "));
+        select_image_token_at_cursor(app);
     } else {
+        app.selected_image = None;
         app.composer.insert_str(text);
     }
 }
@@ -1851,6 +1880,7 @@ fn normalize_composer_image_paths(app: &mut App) {
     for _ in 0..cursor_col {
         app.composer.move_cursor(CursorMove::Forward);
     }
+    select_image_token_at_cursor(app);
 }
 
 fn shell_words(text: &str) -> Vec<String> {
@@ -1971,27 +2001,54 @@ fn delete_image_token_after_cursor(textarea: &mut TextArea<'static>) -> bool {
     true
 }
 
-fn move_across_image_token(textarea: &mut TextArea<'static>, movement: CursorMove) -> bool {
-    let Some((line, _, col)) = composer_line_at_cursor(textarea) else {
+fn navigate_image_token(app: &mut App, movement: CursorMove) -> bool {
+    if let Some(selection) = app.selected_image.take() {
+        let current_col = app.composer.cursor().1;
+        let target = match movement {
+            CursorMove::Back => selection.start,
+            CursorMove::Forward => selection.end,
+            _ => return false,
+        };
+        move_cursor_to_col(&mut app.composer, current_col, target);
+        return true;
+    }
+
+    let Some((line, row, col)) = composer_line_at_cursor(&app.composer) else {
         return false;
     };
-    let ranges = image_token_ranges(&line);
+    let ranges = image_token_refs(&line);
     match movement {
         CursorMove::Back => {
-            if let Some((start, _)) = ranges
+            if let Some((start, end, image_number)) = ranges
                 .into_iter()
-                .find(|(start, end)| col > *start && col <= *end)
+                .find(|(start, end, _)| col > *start && col <= *end)
             {
-                move_cursor_to_col(textarea, col, start);
+                app.selected_image =
+                    image_number
+                        .checked_sub(1)
+                        .map(|image_index| ImageSelection {
+                            row,
+                            start,
+                            end,
+                            image_index,
+                        });
                 return true;
             }
         }
         CursorMove::Forward => {
-            if let Some((_, end)) = ranges
+            if let Some((start, end, image_number)) = ranges
                 .into_iter()
-                .find(|(start, end)| col >= *start && col < *end)
+                .find(|(start, end, _)| col >= *start && col < *end)
             {
-                move_cursor_to_col(textarea, col, end);
+                app.selected_image =
+                    image_number
+                        .checked_sub(1)
+                        .map(|image_index| ImageSelection {
+                            row,
+                            start,
+                            end,
+                            image_index,
+                        });
                 return true;
             }
         }
@@ -2058,7 +2115,12 @@ fn move_to_line_end_or_next_line(textarea: &mut TextArea<'static>) {
 }
 
 fn open_image_token_at_cursor(app: &mut App) -> bool {
-    let Some(image_index) = image_token_at_cursor(&app.composer) else {
+    let Some(image_index) = app
+        .selected_image
+        .as_ref()
+        .map(|selection| selection.image_index)
+        .or_else(|| image_token_at_cursor(&app.composer))
+    else {
         return false;
     };
     let Some(path) = app.image_paths.get(image_index).cloned() else {
@@ -2072,11 +2134,39 @@ fn open_image_token_at_cursor(app: &mut App) -> bool {
     true
 }
 
+fn select_image_token_at_cursor(app: &mut App) -> bool {
+    let Some((line, row, col)) = composer_line_at_cursor(&app.composer) else {
+        app.selected_image = None;
+        return false;
+    };
+    let Some((start, end, image_number)) = image_token_refs(&line)
+        .into_iter()
+        .find(|(_, end, _)| col == *end)
+        .or_else(|| {
+            image_token_refs(&line)
+                .into_iter()
+                .find(|(start, end, _)| col > *start && col < *end)
+        })
+    else {
+        app.selected_image = None;
+        return false;
+    };
+    app.selected_image = image_number
+        .checked_sub(1)
+        .map(|image_index| ImageSelection {
+            row,
+            start,
+            end,
+            image_index,
+        });
+    app.selected_image.is_some()
+}
+
 fn image_token_at_cursor(textarea: &TextArea<'static>) -> Option<usize> {
     let (line, _, col) = composer_line_at_cursor(textarea)?;
     image_token_refs(&line)
         .into_iter()
-        .find(|(start, end, _)| col >= *start && col <= *end)
+        .find(|(start, end, _)| col > *start && col < *end)
         .and_then(|(_, _, number)| number.checked_sub(1))
 }
 
@@ -2184,7 +2274,6 @@ fn render_composer_line<'a>(
     prompt: &'static str,
     text: &'a str,
 ) -> Line<'a> {
-    let (_, cursor_col) = app.composer.cursor();
     let mut spans = vec![Span::styled(prompt, muted_style())];
     if let Some((selection_start, selection_end)) = composer_selection_for_row(app, row, text) {
         append_selected_text_spans(&mut spans, text, selection_start, selection_end);
@@ -2197,17 +2286,21 @@ fn render_composer_line<'a>(
         return Line::from(spans);
     }
 
-    let cursor_row = app.composer.cursor().0;
     let chars = text.chars().collect::<Vec<_>>();
     let mut cursor = 0;
-    for (start, end, _) in refs {
+    for (start, end, image_number) in refs {
         if cursor < start {
             spans.push(Span::styled(
                 chars[cursor..start].iter().collect::<String>(),
                 input_style(),
             ));
         }
-        let selected = cursor_row == row && cursor_col >= start && cursor_col <= end;
+        let selected = app.selected_image.as_ref().is_some_and(|selection| {
+            selection.row == row
+                && selection.start == start
+                && selection.end == end
+                && Some(selection.image_index) == image_number.checked_sub(1)
+        });
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
             image_token_style(selected),
