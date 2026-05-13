@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -43,30 +45,22 @@ struct Args {
     #[arg(long, env = "CMUX_HOME_CONFIG")]
     config: Option<PathBuf>,
 
-    #[arg(
-        long,
-        default_value = "codex {prompt}",
-        env = "CMUX_AGENT_TUI_CODEX_COMMAND"
-    )]
+    #[arg(long, default_value = "codex", env = "CMUX_AGENT_TUI_CODEX_COMMAND")]
     codex_command: String,
 
     #[arg(
         long,
-        default_value = "codex {prompt}",
+        default_value = "codex",
         env = "CMUX_AGENT_TUI_CODEX_PLAN_COMMAND"
     )]
     codex_plan_command: String,
 
-    #[arg(
-        long,
-        default_value = "claude {prompt}",
-        env = "CMUX_AGENT_TUI_CLAUDE_COMMAND"
-    )]
+    #[arg(long, default_value = "claude", env = "CMUX_AGENT_TUI_CLAUDE_COMMAND")]
     claude_command: String,
 
     #[arg(
         long,
-        default_value = "claude --permission-mode plan {prompt}",
+        default_value = "claude --permission-mode plan",
         env = "CMUX_AGENT_TUI_CLAUDE_PLAN_COMMAND"
     )]
     claude_plan_command: String,
@@ -242,8 +236,10 @@ struct App {
     workspace_cwd: String,
     codex_template: String,
     codex_plan_template: String,
+    codex_submit_template: Option<String>,
     claude_template: String,
     claude_plan_template: String,
+    claude_submit_template: Option<String>,
     rename_template: Option<String>,
     provider: AgentKind,
     plan_mode: bool,
@@ -315,6 +311,7 @@ struct AgentConfig {
 struct AgentCommandConfig {
     command: Option<String>,
     plan_command: Option<String>,
+    submit_command: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -329,6 +326,18 @@ struct PersistedDraft {
     provider: String,
     plan_mode: bool,
     saved_at_ms: u64,
+}
+
+#[derive(Serialize)]
+struct SubmitPayload<'a> {
+    workspace_id: &'a str,
+    prompt: &'a str,
+    title: &'a str,
+    agent: &'a str,
+    mode: &'a str,
+    workspace_cwd: &'a str,
+    socket: &'a str,
+    images: &'a [String],
 }
 
 impl App {
@@ -357,12 +366,14 @@ impl App {
                 .codex
                 .plan_command
                 .unwrap_or(args.codex_plan_command),
+            codex_submit_template: config.agents.codex.submit_command,
             claude_template: config.agents.claude.command.unwrap_or(args.claude_command),
             claude_plan_template: config
                 .agents
                 .claude
                 .plan_command
                 .unwrap_or(args.claude_plan_command),
+            claude_submit_template: config.agents.claude.submit_command,
             rename_template: config.rename.command,
             provider: AgentKind::Codex,
             plan_mode: false,
@@ -801,7 +812,8 @@ impl App {
 
     fn submit_new_workspace(&mut self) -> Result<()> {
         let prompt = self.composer.lines().join("\n").trim().to_string();
-        let command = self.render_agent_command(&prompt);
+        let images = self.image_paths.clone();
+        let command = self.render_agent_command(&images);
         let latest_message = if prompt.is_empty() {
             "standing by for task".to_string()
         } else {
@@ -827,8 +839,9 @@ impl App {
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
         self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
         self.select_workspace_by_id(&workspace_id);
+        self.spawn_submit_hook(&workspace_id, &prompt, &title, &images);
         self.spawn_rename_hook(&workspace_id, &prompt, &title);
-        if !prompt.is_empty() {
+        if !prompt.is_empty() || !images.is_empty() {
             let _ = client.v2(
                 "workspace.prompt_submit",
                 json!({ "workspace_id": workspace_id, "message": prompt }),
@@ -1216,14 +1229,71 @@ impl App {
         self.status_line = format!("mode {}", self.agent_label());
     }
 
-    fn render_agent_command(&self, prompt: &str) -> String {
+    fn render_agent_command(&self, images: &[String]) -> String {
         let template = match self.provider {
             AgentKind::Codex if self.plan_mode => &self.codex_plan_template,
             AgentKind::Codex => &self.codex_template,
             AgentKind::Claude if self.plan_mode => &self.claude_plan_template,
             AgentKind::Claude => &self.claude_template,
         };
-        template.replace("{prompt}", &shell_quote(prompt))
+        let image_args = images
+            .iter()
+            .map(|path| format!("--image {}", shell_quote(path)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        render_command_template_parts(
+            template,
+            &[("workspace_cwd", &self.workspace_cwd)],
+            &[("image_args", &image_args)],
+        )
+    }
+
+    fn submit_template(&self) -> Option<&str> {
+        match self.provider {
+            AgentKind::Codex => self.codex_submit_template.as_deref(),
+            AgentKind::Claude => self.claude_submit_template.as_deref(),
+        }
+    }
+
+    fn spawn_submit_hook(&self, workspace_id: &str, prompt: &str, title: &str, images: &[String]) {
+        let Some(template) = self.submit_template() else {
+            return;
+        };
+        if template.trim().is_empty() {
+            return;
+        }
+        let mode = if self.plan_mode { "plan" } else { "build" };
+        let Ok(payload_path) = write_submit_payload(SubmitPayload {
+            workspace_id,
+            prompt,
+            title,
+            agent: self.provider.label(),
+            mode,
+            workspace_cwd: &self.workspace_cwd,
+            socket: &self.socket_path,
+            images,
+        }) else {
+            return;
+        };
+        let payload_path_string = payload_path.display().to_string();
+        let rendered = render_command_template(
+            template,
+            &[
+                ("payload", &payload_path_string),
+                ("workspace_id", workspace_id),
+                ("socket", &self.socket_path),
+            ],
+        );
+        let _ = Command::new("sh")
+            .arg("-lc")
+            .arg(rendered)
+            .current_dir(&self.workspace_cwd)
+            .env("CMUX_SOCKET_PATH", &self.socket_path)
+            .env("CMUX_WORKSPACE_ID", workspace_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 
     fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
@@ -1304,11 +1374,47 @@ fn load_config(path: Option<&PathBuf>) -> AppConfig {
 }
 
 fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
+    render_command_template_parts(template, values, &[])
+}
+
+fn render_command_template_parts(
+    template: &str,
+    quoted_values: &[(&str, &str)],
+    raw_values: &[(&str, &str)],
+) -> String {
     let mut rendered = template.to_string();
-    for (key, value) in values {
+    for (key, value) in quoted_values {
         rendered = rendered.replace(&format!("{{{key}}}"), &shell_quote(value));
     }
+    for (key, value) in raw_values {
+        rendered = rendered.replace(&format!("{{{key}}}"), value);
+    }
     rendered
+}
+
+fn write_submit_payload(payload: SubmitPayload<'_>) -> Result<PathBuf> {
+    let safe_workspace = payload
+        .workspace_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .take(48)
+        .collect::<String>();
+    let path = std::env::temp_dir().join(format!(
+        "cmux-home-submit-{}-{}-{}.json",
+        std::process::id(),
+        now_millis(),
+        safe_workspace
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create submit payload {}", path.display()))?;
+    let bytes = serde_json::to_vec_pretty(&payload).context("serialize submit payload")?;
+    file.write_all(&bytes)
+        .with_context(|| format!("write submit payload {}", path.display()))?;
+    Ok(path)
 }
 
 fn now_millis() -> u64 {
