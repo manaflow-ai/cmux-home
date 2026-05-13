@@ -32,6 +32,7 @@ use tui_textarea::{CursorMove, TextArea};
 
 const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
+const COMPOSER_CONTINUATION_PROMPT: &str = "  ";
 
 #[derive(Parser, Debug)]
 #[command(about = "Minimal cmux workspace launcher and status TUI")]
@@ -964,17 +965,14 @@ impl App {
         self.composer_mode = ComposerMode::NewWorkspace;
     }
 
-    fn restore_latest_stash(&mut self) {
-        let Some(draft) = self.stashes.last().cloned() else {
-            self.status_line = "no stashes".to_string();
+    fn stash_current_draft(&mut self) {
+        let Some(draft) = self.current_draft() else {
+            self.status_line = "nothing to stash".to_string();
             return;
         };
-        let count = self.stashes.len();
-        self.restore_draft(draft);
-        self.view_mode = ViewMode::Workspaces;
-        self.selected = 0;
-        self.list_scroll = 0;
-        self.status_line = format!("restored stash {count}");
+        self.stashes.push(draft);
+        self.reset_composer();
+        self.status_line = format!("stashed draft {}", self.stashes.len());
     }
 
     fn restore_selected_stash(&mut self) {
@@ -1104,10 +1102,10 @@ impl App {
         self.composer_has_input() || matches!(self.composer_mode, ComposerMode::RenameWorkspace(_))
     }
 
-    fn composer_height(&self, screen_height: u16) -> u16 {
+    fn composer_height(&self, screen_height: u16, screen_width: u16) -> u16 {
         if self.composer_is_active() {
             let max_height = ((u32::from(screen_height) * 3) / 4).max(1) as u16;
-            (self.composer.lines().len() as u16).clamp(1, max_height)
+            (composer_visual_line_count(self, screen_width) as u16).clamp(1, max_height)
         } else {
             1
         }
@@ -1121,8 +1119,8 @@ impl App {
         }
     }
 
-    fn bottom_reserved_height(&self, screen_height: u16) -> u16 {
-        self.composer_height(screen_height) + self.help_height() + 2
+    fn bottom_reserved_height(&self, screen_height: u16, screen_width: u16) -> u16 {
+        self.composer_height(screen_height, screen_width) + self.help_height() + 2
     }
 
     fn select_previous(&mut self) {
@@ -1627,7 +1625,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             if app.view_mode == ViewMode::Stashes {
                 app.restore_selected_stash();
             } else {
-                app.restore_latest_stash();
+                app.stash_current_draft();
             }
         }
         KeyEvent {
@@ -1635,7 +1633,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            app.restore_latest_stash();
+            app.status_line = "use /stash to restore".to_string();
         }
         KeyEvent {
             code: KeyCode::Esc, ..
@@ -1937,6 +1935,14 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             }
         }
         KeyEvent {
+            code: KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            app.selected_image = None;
+            app.composer.input(key);
+        }
+        KeyEvent {
             code: KeyCode::Char(' '),
             modifiers: KeyModifiers::NONE,
             ..
@@ -2009,7 +2015,7 @@ fn handle_composer_command(app: &mut App) -> bool {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
-    let reserved_bottom = app.bottom_reserved_height(area.height);
+    let reserved_bottom = app.bottom_reserved_height(area.height, area.width);
     let workspace_end = area.height.saturating_sub(reserved_bottom);
     if mouse.row >= workspace_end {
         return;
@@ -2449,7 +2455,8 @@ fn image_token_refs(line: &str) -> Vec<(usize, usize, usize)> {
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let screen_height = frame.area().height;
-    let composer_height = app.composer_height(screen_height);
+    let screen_width = frame.area().width;
+    let composer_height = app.composer_height(screen_height, screen_width);
     let help_height = app.help_height();
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -2467,15 +2474,17 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_composer(frame, areas[2], app);
     draw_separator(frame, areas[3]);
     draw_help(frame, areas[4], app);
-    let (row, col) = app.composer.cursor();
-    let visible_start = composer_visible_start(app, areas[2].height as usize);
-    let visible_row = row.saturating_sub(visible_start);
-    let prompt_width = if row == 0 {
-        COMPOSER_PROMPT.chars().count()
+    let (row, _) = app.composer.cursor();
+    let visible_start = composer_visible_start(app, areas[2].height as usize, areas[2].width);
+    let (cursor_visual_row, cursor_visual_col) =
+        composer_cursor_visual_position(app, areas[2].width);
+    let visible_row = cursor_visual_row.saturating_sub(visible_start);
+    let prompt_width = composer_prompt_width(row);
+    let cursor_col = if app.composer_is_active() {
+        cursor_visual_col
     } else {
-        2
+        0
     };
-    let cursor_col = if app.composer_is_active() { col } else { 0 };
     let x = areas[2].x + prompt_width as u16 + cursor_col as u16;
     let y = areas[2].y + visible_row as u16;
     if x < areas[2].right() && y < areas[2].bottom() {
@@ -2495,38 +2504,49 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    let visible_start = composer_visible_start(app, area.height as usize);
-    let lines = app
-        .composer
-        .lines()
-        .iter()
-        .enumerate()
+    let visible_start = composer_visible_start(app, area.height as usize, area.width);
+    let lines = wrapped_composer_lines(app, area.width)
+        .into_iter()
         .skip(visible_start)
         .take(area.height as usize)
-        .map(|(index, text)| {
-            let prompt = if index == 0 { COMPOSER_PROMPT } else { "  " };
-            render_composer_line(app, index, prompt, text)
-        })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_composer_line<'a>(
-    app: &App,
-    row: usize,
-    prompt: &'static str,
-    text: &'a str,
-) -> Line<'a> {
-    let mut spans = vec![Span::styled(prompt, muted_style())];
+fn wrapped_composer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (row, text) in app.composer.lines().iter().enumerate() {
+        let text_width = composer_text_width(width, row);
+        let content = render_composer_content_spans(app, row, text);
+        let chunks = wrap_spans(content, text_width);
+        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+            let prompt = if row == 0 && chunk_index == 0 {
+                COMPOSER_PROMPT
+            } else {
+                COMPOSER_CONTINUATION_PROMPT
+            };
+            let mut spans = vec![Span::styled(prompt, muted_style())];
+            spans.extend(chunk);
+            lines.push(Line::from(spans));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     if let Some((selection_start, selection_end)) = composer_selection_for_row(app, row, text) {
         append_selected_text_spans(&mut spans, text, selection_start, selection_end);
-        return Line::from(spans);
+        return spans;
     }
 
     let refs = image_token_refs(text);
     if refs.is_empty() {
         spans.push(Span::styled(text.to_string(), input_style()));
-        return Line::from(spans);
+        return spans;
     }
 
     let chars = text.chars().collect::<Vec<_>>();
@@ -2556,7 +2576,28 @@ fn render_composer_line<'a>(
             input_style(),
         ));
     }
-    Line::from(spans)
+    spans
+}
+
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows = vec![Vec::new()];
+    let mut col = 0;
+    for span in spans {
+        let style = span.style;
+        let content = span.content.to_string();
+        for ch in content.chars() {
+            if col >= width {
+                rows.push(Vec::new());
+                col = 0;
+            }
+            rows.last_mut()
+                .expect("wrapped composer rows are initialized")
+                .push(Span::styled(ch.to_string(), style));
+            col += 1;
+        }
+    }
+    rows
 }
 
 fn composer_selection_for_row(app: &App, row: usize, text: &str) -> Option<(usize, usize)> {
@@ -2571,9 +2612,9 @@ fn composer_selection_for_row(app: &App, row: usize, text: &str) -> Option<(usiz
     (start < end).then_some((start, end))
 }
 
-fn append_selected_text_spans<'a>(
-    spans: &mut Vec<Span<'a>>,
-    text: &'a str,
+fn append_selected_text_spans(
+    spans: &mut Vec<Span<'static>>,
+    text: &str,
     selection_start: usize,
     selection_end: usize,
 ) {
@@ -2598,9 +2639,61 @@ fn append_selected_text_spans<'a>(
     }
 }
 
-fn composer_visible_start(app: &App, height: usize) -> usize {
-    let (row, _) = app.composer.cursor();
-    row.saturating_add(1).saturating_sub(height.max(1))
+fn composer_prompt_width(row: usize) -> usize {
+    if row == 0 {
+        COMPOSER_PROMPT.chars().count()
+    } else {
+        COMPOSER_CONTINUATION_PROMPT.chars().count()
+    }
+}
+
+fn composer_text_width(width: u16, row: usize) -> usize {
+    usize::from(width)
+        .saturating_sub(composer_prompt_width(row))
+        .max(1)
+}
+
+fn visual_line_count_for_text(text: &str, width: usize) -> usize {
+    let len = text.chars().count();
+    if len == 0 {
+        1
+    } else {
+        len.div_ceil(width.max(1))
+    }
+}
+
+fn composer_visual_line_count(app: &App, width: u16) -> usize {
+    app.composer
+        .lines()
+        .iter()
+        .enumerate()
+        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn composer_cursor_visual_position(app: &App, width: u16) -> (usize, usize) {
+    let (cursor_row, cursor_col) = app.composer.cursor();
+    let visual_row_before_cursor = app
+        .composer
+        .lines()
+        .iter()
+        .enumerate()
+        .take(cursor_row)
+        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
+        .sum::<usize>();
+    let text_width = composer_text_width(width, cursor_row);
+    let (row_offset, col_offset) = if cursor_col > 0 && cursor_col % text_width == 0 {
+        ((cursor_col - 1) / text_width, text_width.saturating_sub(1))
+    } else {
+        (cursor_col / text_width, cursor_col % text_width)
+    };
+    (visual_row_before_cursor + row_offset, col_offset)
+}
+
+fn composer_visible_start(app: &App, height: usize, width: u16) -> usize {
+    let (cursor_row, _) = composer_cursor_visual_position(app, width);
+    cursor_row.saturating_add(1).saturating_sub(height.max(1))
 }
 
 fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -2910,7 +3003,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 muted_style(),
             )),
             Line::from(Span::styled(
-                "  ctrl+s restore stash      alt+1-6 to open         esc/? to main",
+                "  ctrl+s to stash           alt+1-6 to open         esc/? to main",
                 muted_style(),
             )),
         ];
@@ -2953,10 +3046,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 };
                 let toggle_kind = app.provider_toggle_kind();
                 let help = Line::from(vec![
-                    Span::styled(
-                        "  enter create · ctrl+s restore stash · tab ",
-                        muted_style(),
-                    ),
+                    Span::styled("  enter create · ctrl+s stash · tab ", muted_style()),
                     Span::styled(
                         app.provider_toggle_label().to_string(),
                         agent_style(toggle_kind, false),
