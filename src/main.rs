@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,6 +39,9 @@ struct Args {
 
     #[arg(long, env = "CMUX_AGENT_TUI_WORKSPACE_CWD")]
     workspace_cwd: Option<String>,
+
+    #[arg(long, env = "CMUX_HOME_CONFIG")]
+    config: Option<PathBuf>,
 
     #[arg(
         long,
@@ -239,8 +242,11 @@ struct App {
     workspace_cwd: String,
     codex_template: String,
     codex_plan_template: String,
+    codex_plan_prefix: String,
     claude_template: String,
     claude_plan_template: String,
+    claude_plan_prefix: String,
+    rename_template: Option<String>,
     provider: AgentKind,
     plan_mode: bool,
     show_shortcuts: bool,
@@ -291,6 +297,34 @@ struct PersistedState {
     plan_mode: Option<bool>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AppConfig {
+    #[serde(default)]
+    agents: AgentConfig,
+    #[serde(default)]
+    rename: RenameConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AgentConfig {
+    #[serde(default)]
+    codex: AgentCommandConfig,
+    #[serde(default)]
+    claude: AgentCommandConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct AgentCommandConfig {
+    command: Option<String>,
+    plan_command: Option<String>,
+    plan_prompt_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RenameConfig {
+    command: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedDraft {
     lines: Vec<String>,
@@ -316,13 +350,29 @@ impl App {
             .unwrap_or_else(|| ".".to_string());
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
+        let config = load_config(args.config.as_ref());
         let mut app = Self {
             socket_path,
             workspace_cwd,
-            codex_template: args.codex_command,
-            codex_plan_template: args.codex_plan_command,
-            claude_template: args.claude_command,
-            claude_plan_template: args.claude_plan_command,
+            codex_template: config.agents.codex.command.unwrap_or(args.codex_command),
+            codex_plan_template: config
+                .agents
+                .codex
+                .plan_command
+                .unwrap_or(args.codex_plan_command),
+            codex_plan_prefix: config
+                .agents
+                .codex
+                .plan_prompt_prefix
+                .unwrap_or_else(default_codex_plan_prefix),
+            claude_template: config.agents.claude.command.unwrap_or(args.claude_command),
+            claude_plan_template: config
+                .agents
+                .claude
+                .plan_command
+                .unwrap_or(args.claude_plan_command),
+            claude_plan_prefix: config.agents.claude.plan_prompt_prefix.unwrap_or_default(),
+            rename_template: config.rename.command,
             provider: AgentKind::Codex,
             plan_mode: false,
             show_shortcuts: false,
@@ -784,8 +834,9 @@ impl App {
         )?;
         let workspace_id = string_field(&created, "workspace_id")
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
-        self.upsert_optimistic_workspace(workspace_id.clone(), title, latest_message);
+        self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
         self.select_workspace_by_id(&workspace_id);
+        self.spawn_rename_hook(&workspace_id, &prompt, &title);
         if !prompt.is_empty() {
             let _ = client.v2(
                 "workspace.prompt_submit",
@@ -1164,6 +1215,16 @@ impl App {
         }
     }
 
+    fn toggle_provider(&mut self) {
+        self.provider = self.provider.toggle();
+        self.status_line = format!("agent {}", self.agent_label());
+    }
+
+    fn toggle_plan_mode(&mut self) {
+        self.plan_mode = !self.plan_mode;
+        self.status_line = format!("mode {}", self.agent_label());
+    }
+
     fn render_agent_command(&self, prompt: &str) -> String {
         let template = match self.provider {
             AgentKind::Codex if self.plan_mode => &self.codex_plan_template,
@@ -1172,18 +1233,52 @@ impl App {
             AgentKind::Claude => &self.claude_template,
         };
         let prompt = self.command_prompt(prompt);
-        let rendered = template.replace("{prompt}", &shell_quote(&prompt));
-        rendered.split_whitespace().collect::<Vec<_>>().join(" ")
+        template.replace("{prompt}", &shell_quote(&prompt))
     }
 
     fn command_prompt(&self, prompt: &str) -> String {
-        if self.plan_mode && self.provider == AgentKind::Codex && !prompt.is_empty() {
-            format!(
-                "Plan mode: propose a concise implementation plan first. Do not edit files or run mutating commands until the user approves.\n\n{prompt}"
-            )
+        let prefix = match self.provider {
+            AgentKind::Codex if self.plan_mode => &self.codex_plan_prefix,
+            AgentKind::Claude if self.plan_mode => &self.claude_plan_prefix,
+            _ => "",
+        };
+        if !prefix.is_empty() && !prompt.is_empty() {
+            format!("{prefix}\n\n{prompt}")
         } else {
             prompt.to_string()
         }
+    }
+
+    fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
+        let Some(template) = self.rename_template.as_deref() else {
+            return;
+        };
+        if template.trim().is_empty() {
+            return;
+        }
+        let mode = if self.plan_mode { "plan" } else { "build" };
+        let rendered = render_command_template(
+            template,
+            &[
+                ("workspace_id", workspace_id),
+                ("prompt", prompt),
+                ("title", title),
+                ("agent", self.provider.label()),
+                ("mode", mode),
+                ("workspace_cwd", &self.workspace_cwd),
+                ("socket", &self.socket_path),
+            ],
+        );
+        let _ = Command::new("sh")
+            .arg("-lc")
+            .arg(rendered)
+            .current_dir(&self.workspace_cwd)
+            .env("CMUX_SOCKET_PATH", &self.socket_path)
+            .env("CMUX_WORKSPACE_ID", workspace_id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 }
 
@@ -1223,6 +1318,24 @@ fn load_persisted_state(path: &PathBuf) -> PersistedState {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+fn load_config(path: Option<&PathBuf>) -> AppConfig {
+    path.and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn default_codex_plan_prefix() -> String {
+    "Plan mode: propose a concise implementation plan first. Do not edit files or run mutating commands until the user approves.".to_string()
+}
+
+fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
+    let mut rendered = template.to_string();
+    for (key, value) in values {
+        rendered = rendered.replace(&format!("{{{key}}}"), &shell_quote(value));
+    }
+    rendered
 }
 
 fn now_millis() -> u64 {
@@ -1503,7 +1616,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             if app.composer_is_active() {
                 app.composer.insert_newline();
             } else {
-                app.plan_mode = !app.plan_mode;
+                app.toggle_plan_mode();
             }
         }
         KeyEvent {
@@ -1520,9 +1633,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         }
         KeyEvent {
             code: KeyCode::Tab, ..
-        } => {
-            app.provider = app.provider.toggle();
         }
+        | KeyEvent {
+            code: KeyCode::Char('\t'),
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('i'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => app.toggle_provider(),
         KeyEvent {
             code: KeyCode::Backspace,
             modifiers: KeyModifiers::NONE,
@@ -1676,13 +1796,20 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::SHIFT,
             ..
         } => {
-            app.plan_mode = !app.plan_mode;
+            app.toggle_plan_mode();
         }
         KeyEvent {
             code: KeyCode::Tab, ..
-        } => {
-            app.provider = app.provider.toggle();
         }
+        | KeyEvent {
+            code: KeyCode::Char('\t'),
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('i'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => app.toggle_provider(),
         KeyEvent {
             code: KeyCode::Esc, ..
         } => {
