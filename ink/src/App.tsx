@@ -293,6 +293,35 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     for (const vm of vms) map.set(vm.id, vm);
     return map;
   }, [vms]);
+
+  // Build a vmId → child workspaces map by parsing the description we wrote
+  // when spawning a cloud sandbox (`freestyle vm <vmId> running codex with…`).
+  // Lets the TUI render workspaces nested under the VM that spawned them so
+  // the relationship is visible without a separate column.
+  const workspacesByVmId = useMemo(() => {
+    const map = new Map<string, Workspace[]>();
+    const vmIdRegex = /freestyle vm ([a-z0-9]{8,})/i;
+    for (const ws of workspaces) {
+      const haystack = (ws.description ?? "") + " " + (ws.title ?? "");
+      const match = haystack.match(vmIdRegex);
+      if (!match) continue;
+      const vmId = match[1]!;
+      if (!vmsById.has(vmId)) continue;
+      const bucket = map.get(vmId) ?? [];
+      bucket.push(ws);
+      map.set(vmId, bucket);
+    }
+    return map;
+  }, [workspaces, vmsById]);
+
+  // Track which workspaces are already grouped under a VM so we don't
+  // double-count them in the top sections.
+  const groupedWorkspaceIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const list of workspacesByVmId.values()) for (const w of list) set.add(w.id);
+    return set;
+  }, [workspacesByVmId]);
+
   const vmHeaderLabel = useMemo(() => {
     if (!freestyle.isEnabled()) return "";
     if (freestyleError) return `Freestyle VMs (error)`;
@@ -303,14 +332,35 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       : `Freestyle VMs (${total})`;
   }, [freestyle, freestyleSummary, freestyleError, vms.length]);
   const visibleRows: ListRow[] = useMemo(() => {
-    const rows = workspaceRows.slice();
+    const topRows: ListRow[] = workspaceRows.filter((row) => {
+      if (row.kind !== "workspace") return true;
+      const ws = workspaces[row.workspaceIndex];
+      return !ws || !groupedWorkspaceIds.has(ws.id);
+    });
+    const rows = topRows.slice();
     if (freestyle.isEnabled()) {
       if (rows.length > 0) rows.push({ kind: "blank" });
       rows.push({ kind: "vm-header" });
-      for (const vm of vms) rows.push({ kind: "vm", vmId: vm.id });
+      for (const vm of vms) {
+        rows.push({ kind: "vm", vmId: vm.id });
+        const children = workspacesByVmId.get(vm.id) ?? [];
+        for (const ws of children) {
+          const idx = workspaces.findIndex((w) => w.id === ws.id);
+          if (idx >= 0) {
+            rows.push({ kind: "workspace", workspaceIndex: idx, depth: 1 });
+          }
+        }
+      }
     }
     return rows;
-  }, [workspaceRows, freestyle, vms]);
+  }, [
+    workspaceRows,
+    workspaces,
+    groupedWorkspaceIds,
+    freestyle,
+    vms,
+    workspacesByVmId,
+  ]);
 
   const composerActive =
     composerHasInput(composer) || composerMode.kind === "rename";

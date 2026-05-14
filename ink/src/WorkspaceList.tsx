@@ -15,7 +15,7 @@ import {
 
 export type ListRow =
   | { kind: "header"; state: AgentState; label: string }
-  | { kind: "workspace"; workspaceIndex: number }
+  | { kind: "workspace"; workspaceIndex: number; depth?: number }
   | { kind: "vm-header" }
   | { kind: "vm"; vmId: string }
   | { kind: "blank" };
@@ -129,6 +129,7 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
             selected={selected}
             width={props.width}
             spinnerTick={props.spinnerTick}
+            depth={row.depth ?? 0}
           />
         );
       })}
@@ -239,11 +240,13 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
   selected,
   width,
   spinnerTick,
+  depth = 0,
 }: {
   workspace: Workspace;
   selected: boolean;
   width: number;
   spinnerTick: number;
+  depth?: number;
 }): React.JSX.Element {
   const state = agentState(workspace);
   const group = displayGroup(state);
@@ -258,24 +261,35 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
         ? " "
         : "∙";
 
-  const titleWidth = 28;
+  const indent = depth > 0 ? "  ".repeat(depth) + "└ " : "";
+  const indentWidth = cellWidth(indent);
+  const titleWidth = Math.max(8, 28 - indentWidth);
   const unreadWidth = cellWidth(unreadText);
   const markerWidth = cellWidth(marker) + 1; // marker + space
   const ageLen = cellWidth(age);
-  const fixedWidth = unreadWidth + markerWidth + titleWidth + 2 + ageLen;
+  const fixedWidth = unreadWidth + markerWidth + indentWidth + titleWidth + 2 + ageLen;
   const messageWidth = Math.max(8, width - fixedWidth);
   const title = padEnd(truncate(workspace.title, titleWidth), titleWidth);
   const message = truncate(workspace.latestMessage, messageWidth);
   const messageLen = cellWidth(message);
   const gap = Math.max(
     1,
-    width - (unreadWidth + markerWidth + titleWidth + 1 + messageLen) - ageLen,
+    width -
+      (unreadWidth + markerWidth + indentWidth + titleWidth + 1 + messageLen) -
+      ageLen,
   );
   const pad = " ".repeat(gap);
   const trailing = Math.max(
     0,
     width -
-      (unreadWidth + markerWidth + titleWidth + 1 + messageLen + pad.length + ageLen),
+      (unreadWidth +
+        markerWidth +
+        indentWidth +
+        titleWidth +
+        1 +
+        messageLen +
+        pad.length +
+        ageLen),
   );
 
   const baseColor = COLORS.muted;
@@ -290,6 +304,9 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
       <Text>
         <Text color={unreadColor} backgroundColor={baseBg}>{unreadText}</Text>
         <Text color={baseColor} backgroundColor={baseBg}>{markerSegment}</Text>
+        {indent ? (
+          <Text color={baseColor} backgroundColor={baseBg}>{indent}</Text>
+        ) : null}
         <Text color={titleColor} backgroundColor={baseBg}>{title}</Text>
         <Text color={baseColor} backgroundColor={baseBg}>{tailSegment}</Text>
       </Text>
