@@ -64,6 +64,19 @@ export class FreestyleClient {
     if (!this.fs) throw new Error("FREESTYLE_API_KEY is not set");
     await this.fs.vms.ref({ vmId }).delete();
   }
+
+  async createFromSnapshot(snapshotId: string): Promise<{ vmId: string }> {
+    if (!this.fs) throw new Error("FREESTYLE_API_KEY is not set");
+    const created = (await (this.fs.vms as unknown as {
+      create: (input: unknown) => Promise<{ vmId: string }>;
+    }).create({
+      snapshotId,
+      ports: [{ port: 443, targetPort: 7777 }],
+      readySignalTimeoutSeconds: 600,
+    }));
+    if (!created.vmId) throw new Error("freestyle vms.create did not return vmId");
+    return { vmId: created.vmId };
+  }
 }
 
 export function defaultFreestyleApiKey(): string | null {

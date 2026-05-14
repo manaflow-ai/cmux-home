@@ -5,8 +5,14 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
 import {
   COLORS,
@@ -422,6 +428,115 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     return true;
   }, [selectedRow]);
 
+  const selectedVmRow = useCallback(() => {
+    if (selectedRow?.kind !== "vm") return null;
+    return vmsById.get(selectedRow.vmId) ?? null;
+  }, [selectedRow, vmsById]);
+
+  const vmDevServerUrl = useCallback((vmId: string): string => {
+    // Freestyle exposes port 443 on <vmId>.vm.freestyle.sh which goes to the
+    // cmuxd-ws daemon. For variation 1 we point the browser there; the user
+    // can re-navigate once their dev server is reachable.
+    return `https://${vmId}.vm.freestyle.sh`;
+  }, []);
+
+  const launchVmSandbox = useCallback(
+    async (vm: FreestyleSummary["vms"][number]) => {
+      const shortId = vm.id.slice(0, 8);
+      setStatusLine(`opening sandbox for ${shortId}…`);
+      try {
+        // The helper script reads FREESTYLE_API_KEY from process env, falling
+        // back to ~/.secrets/cmux*.env. Don't bake the key into the command
+        // string or it leaks into cmux logs and ps listings.
+        const cmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vm.id)}`;
+        const workspaceId = await client.createWorkspace({
+          title: `vm:${shortId}`,
+          description: `cmux ssh + subrouter into freestyle vm ${vm.id}`,
+          initialCommand: cmd,
+          cwd: resolvedCwd,
+          focus: false,
+        });
+        try {
+          await client.createBrowserPane({
+            workspaceId,
+            url: "http://127.0.0.1:3000",
+            direction: "right",
+            focus: false,
+          });
+        } catch (err) {
+          setStatusLine(`opened ssh, browser pane failed: ${(err as Error).message}`);
+          return;
+        }
+        setStatusLine(`opened sandbox workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+      } catch (err) {
+        setStatusLine(`launch failed: ${(err as Error).message}`);
+      }
+    },
+    [client, freestyle, resolvedCwd],
+  );
+
+  const launchVmOutside = useCallback(
+    async (vm: FreestyleSummary["vms"][number]) => {
+      const shortId = vm.id.slice(0, 8);
+      setStatusLine(`opening workspace for ${shortId} (codex on mac)…`);
+      try {
+        const workspaceId = await client.createWorkspace({
+          title: `vm:${shortId} (local)`,
+          description: `local dev workspace pointing at freestyle vm ${vm.id}`,
+          initialCommand: "",
+          cwd: resolvedCwd,
+          focus: false,
+        });
+        try {
+          await client.createBrowserPane({
+            workspaceId,
+            url: vmDevServerUrl(vm.id),
+            direction: "right",
+            focus: false,
+          });
+        } catch (err) {
+          setStatusLine(`workspace created, browser pane failed: ${(err as Error).message}`);
+          return;
+        }
+        setStatusLine(`opened local workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+      } catch (err) {
+        setStatusLine(`launch failed: ${(err as Error).message}`);
+      }
+    },
+    [client, resolvedCwd, vmDevServerUrl],
+  );
+
+  const destroyVm = useCallback(
+    async (vm: FreestyleSummary["vms"][number]) => {
+      const shortId = vm.id.slice(0, 8);
+      setStatusLine(`destroying vm ${shortId}…`);
+      try {
+        await freestyle.destroy(vm.id);
+        setStatusLine(`destroyed vm ${shortId}`);
+        void refreshFreestyle();
+      } catch (err) {
+        setStatusLine(`destroy failed: ${(err as Error).message}`);
+      }
+    },
+    [freestyle, refreshFreestyle],
+  );
+
+  const createVmFromDefaultSnapshot = useCallback(async () => {
+    const snapshotId = process.env.FREESTYLE_SANDBOX_SNAPSHOT?.trim();
+    if (!snapshotId) {
+      setStatusLine("set FREESTYLE_SANDBOX_SNAPSHOT to create a VM from default snapshot");
+      return;
+    }
+    setStatusLine(`creating vm from ${snapshotId.slice(0, 12)}…`);
+    try {
+      const result = await freestyle.createFromSnapshot(snapshotId);
+      setStatusLine(`created vm ${result.vmId.slice(0, 8)}`);
+      void refreshFreestyle();
+    } catch (err) {
+      setStatusLine(`create failed: ${(err as Error).message}`);
+    }
+  }, [freestyle, refreshFreestyle]);
+
   const submitRename = useCallback(
     async (workspaceId: string): Promise<void> => {
       const title = composer.lines.join(" ").trim();
@@ -594,6 +709,32 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       if (toggleCollapsedSelected()) return;
       if (selectedWorkspace) {
         setStatusLine(`open: ${selectedWorkspace.title}`);
+        return;
+      }
+      const selectedVm = selectedVmRow();
+      if (selectedVm) {
+        void launchVmSandbox(selectedVm);
+        return;
+      }
+      return;
+    }
+    if (key.ctrl && input === "o") {
+      const selectedVm = selectedVmRow();
+      if (selectedVm) {
+        void launchVmOutside(selectedVm);
+      }
+      return;
+    }
+    if (key.ctrl && input === "x") {
+      const selectedVm = selectedVmRow();
+      if (selectedVm) {
+        void destroyVm(selectedVm);
+      }
+      return;
+    }
+    if (key.ctrl && input === "n") {
+      if (selectedRow?.kind === "vm-header") {
+        void createVmFromDefaultSnapshot();
       }
       return;
     }
@@ -603,11 +744,16 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   });
 
   // Determine which mode to show in the help bar.
-  const helpMode: "workspace" | "composer" | "rename" = composerActive
-    ? composerMode.kind === "rename"
-      ? "rename"
-      : "composer"
-    : "workspace";
+  const helpMode: "workspace" | "composer" | "rename" | "vm" | "vm-header" =
+    composerActive
+      ? composerMode.kind === "rename"
+        ? "rename"
+        : "composer"
+      : selectedRow?.kind === "vm"
+        ? "vm"
+        : selectedRow?.kind === "vm-header"
+          ? "vm-header"
+          : "workspace";
 
   // Only forward a status override when it's the "press ctrl+X to quit"
   // hint that the HelpBar actually displays. This keeps the HelpBar props
@@ -660,6 +806,10 @@ function Separator({ width }: { width: number }): React.JSX.Element {
       <Text color={COLORS.muted}>{"─".repeat(Math.max(0, width))}</Text>
     </Box>
   );
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function statusesEqual(

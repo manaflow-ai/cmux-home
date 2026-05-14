@@ -4,7 +4,7 @@ import type { AgentKind } from "./types.js";
 import { AGENT_COLOR, COLORS } from "./format.js";
 
 export interface HelpBarProps {
-  readonly mode: "workspace" | "composer" | "rename";
+  readonly mode: "workspace" | "composer" | "rename" | "vm" | "vm-header";
   readonly provider: AgentKind;
   readonly planMode: boolean;
   readonly composerSlashActive: boolean;
@@ -101,6 +101,26 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
     );
   }
 
+  if (props.mode === "vm") {
+    return (
+      <Box>
+        <CurrentMode provider={props.provider} planMode={props.planMode} />
+        <Text color={COLORS.muted}>
+          {" · enter open sandbox (ssh + subrouter) · ctrl+o open local workspace · ctrl+x destroy · ? for shortcuts"}
+        </Text>
+      </Box>
+    );
+  }
+  if (props.mode === "vm-header") {
+    return (
+      <Box>
+        <CurrentMode provider={props.provider} planMode={props.planMode} />
+        <Text color={COLORS.muted}>
+          {" · ctrl+n new VM from FREESTYLE_SANDBOX_SNAPSHOT · ? for shortcuts"}
+        </Text>
+      </Box>
+    );
+  }
   const prefix = props.selectedIsGroup
     ? "enter to collapse · ctrl+x to delete all"
     : "enter to open · space to reply · ctrl+x to delete";

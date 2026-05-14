@@ -82,6 +82,21 @@ export class CmuxClient {
     return id;
   }
 
+  async createBrowserPane(input: {
+    workspaceId: string;
+    url: string;
+    direction?: "right" | "left" | "up" | "down";
+    focus?: boolean;
+  }): Promise<void> {
+    await this.rpc("pane.create", {
+      workspace_id: input.workspaceId,
+      type: "browser",
+      direction: input.direction ?? "right",
+      url: input.url,
+      focus: input.focus ?? false,
+    });
+  }
+
   async submitPrompt(workspaceId: string, message: string): Promise<void> {
     await this.rpc("workspace.prompt_submit", {
       workspace_id: workspaceId,
