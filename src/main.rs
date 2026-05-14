@@ -4655,10 +4655,12 @@ fn event_description(frame: &EventFrame) -> Option<String> {
 
 fn workspace_from_created_event(frame: &EventFrame, workspace_id: &str) -> WorkspaceStatus {
     let title = event_title(frame).unwrap_or_else(|| workspace_id.chars().take(8).collect());
-    let latest_message = event_description(frame)
+    let optimistic_preview = event_description(frame)
         .filter(|description| !description.trim().is_empty())
         .map(|description| one_line_preview(&description, 120))
-        .or_else(|| prompt_preview_from_title(&title))
+        .or_else(|| prompt_preview_from_title(&title));
+    let latest_message = optimistic_preview
+        .clone()
         .unwrap_or_else(|| "starting workspace".to_string());
     WorkspaceStatus {
         id: workspace_id.to_string(),
@@ -4672,9 +4674,9 @@ fn workspace_from_created_event(frame: &EventFrame, workspace_id: &str) -> Works
         pinned: false,
         statuses: HashMap::new(),
         unread_notifications: 0,
-        conversation: Some(ConversationSnapshot {
+        conversation: optimistic_preview.map(|preview| ConversationSnapshot {
             actor: ConversationActor::User,
-            preview: latest_message,
+            preview,
             modified_at: SystemTime::now(),
         }),
         updated_at: Some(Instant::now()),
@@ -4925,6 +4927,26 @@ mod tests {
 
         assert_eq!(workspace.latest_message, "fix submit flicker");
         assert_eq!(display_group(workspace.agent_state()), AgentState::Working);
+    }
+
+    #[test]
+    fn plain_created_workspace_event_does_not_fake_agent_work() {
+        let frame = EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("workspace:1".to_string()),
+            payload: json!({
+                "workspace_id": "workspace:1",
+                "title": "shell",
+                "selected": false
+            }),
+        };
+
+        let workspace = workspace_from_created_event(&frame, "workspace:1");
+
+        assert_eq!(workspace.latest_message, "starting workspace");
+        assert!(workspace.conversation.is_none());
+        assert_eq!(display_group(workspace.agent_state()), AgentState::Idle);
     }
 
     #[test]
