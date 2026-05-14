@@ -1,14 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -26,9 +24,35 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tui_textarea::{CursorMove, TextArea};
+
+mod cmux_client;
+mod commands;
+mod config;
+mod events;
+mod model;
+mod skills;
+mod util;
+
+use cmux_client::CmuxClient;
+use commands::{
+    configure_workspace_hook_command, render_command_template, render_command_template_parts,
+    write_submit_payload, SubmitPayload,
+};
+use config::{load_config, load_persisted_state, state_path, PersistedDraft, PersistedState};
+use events::{
+    event_name, event_title, event_workspace_id, notification_is_unread,
+    preserve_optimistic_submission, workspace_from_created_event, EventFrame,
+};
+use model::{
+    display_group, AgentKind, AgentState, ConversationActor, ConversationSnapshot, WorkspaceStatus,
+};
+use skills::{load_skill_entries, SkillEntry};
+use util::{
+    contains_any, now_millis, one_line_preview, shell_quote, shell_words, time_ago, truncate,
+    user_home,
+};
 
 const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
@@ -53,15 +77,6 @@ const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
 struct CommandSuggestion {
     command: &'static str,
     detail: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct SkillEntry {
-    name: String,
-    description: String,
-    sources: Vec<String>,
-    priority: usize,
-    path: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,170 +190,6 @@ struct Args {
     claude_plan_command: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AgentKind {
-    Codex,
-    Claude,
-}
-
-impl AgentKind {
-    fn toggle(self) -> Self {
-        match self {
-            AgentKind::Codex => AgentKind::Claude,
-            AgentKind::Claude => AgentKind::Codex,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            AgentKind::Codex => "codex",
-            AgentKind::Claude => "claude",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "codex" => Some(AgentKind::Codex),
-            "claude" => Some(AgentKind::Claude),
-            _ => None,
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            AgentKind::Codex => Color::Rgb(102, 217, 239),
-            AgentKind::Claude => Color::Rgb(215, 119, 87),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum AgentState {
-    Empty,
-    Idle,
-    Working,
-    NeedsAttention,
-    Unknown,
-}
-
-impl AgentState {
-    fn label(self) -> &'static str {
-        match self {
-            AgentState::Empty => "empty",
-            AgentState::Idle => "idle",
-            AgentState::Working => "working",
-            AgentState::NeedsAttention => "needs attention",
-            AgentState::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConversationActor {
-    User,
-    Assistant,
-}
-
-impl ConversationActor {
-    fn label(self) -> &'static str {
-        match self {
-            ConversationActor::User => "user",
-            ConversationActor::Assistant => "assistant",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ConversationSnapshot {
-    actor: ConversationActor,
-    preview: String,
-    modified_at: SystemTime,
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkspaceStatus {
-    id: String,
-    title: String,
-    latest_message: String,
-    selected: bool,
-    pinned: bool,
-    statuses: HashMap<String, String>,
-    unread_notifications: usize,
-    conversation: Option<ConversationSnapshot>,
-    updated_at: Option<Instant>,
-}
-
-impl WorkspaceStatus {
-    fn agent_state(&self) -> AgentState {
-        if self.unread_notifications > 0 {
-            return AgentState::NeedsAttention;
-        }
-
-        let mut saw_status = false;
-        let mut saw_idle = false;
-        for (key, value) in &self.statuses {
-            let key = key.to_ascii_lowercase();
-            let value = value.to_ascii_lowercase();
-            let is_agent = key == "codex" || key == "claude" || key == "claude_code";
-            if !is_agent {
-                continue;
-            }
-            saw_status = true;
-            if contains_any(
-                &value,
-                &[
-                    "error", "failed", "failure", "blocked", "denied", "rejected",
-                ],
-            ) {
-                return AgentState::NeedsAttention;
-            }
-            if contains_any(&value, &["running", "working", "thinking", "busy"]) {
-                return AgentState::Working;
-            }
-            if contains_any(&value, &["idle", "done", "complete", "completed"]) {
-                saw_idle = true;
-            }
-        }
-
-        match self.conversation.as_ref().map(|snapshot| snapshot.actor) {
-            Some(ConversationActor::Assistant) => return AgentState::NeedsAttention,
-            Some(ConversationActor::User) => return AgentState::Working,
-            None => {}
-        }
-
-        if saw_idle {
-            return AgentState::Idle;
-        }
-
-        if saw_status {
-            AgentState::Unknown
-        } else {
-            AgentState::Empty
-        }
-    }
-
-    fn fingerprint(&self) -> String {
-        let mut statuses = self
-            .statuses
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>();
-        statuses.sort();
-        format!(
-            "{}|{}|{}|{}|{}|{}",
-            self.title,
-            self.latest_message,
-            self.agent_state().label(),
-            self.unread_notifications,
-            self.conversation
-                .as_ref()
-                .map(|snapshot| snapshot.actor.label())
-                .unwrap_or("none"),
-            statuses.join("|")
-        )
-    }
-}
-
 #[derive(Debug)]
 enum UiEvent {
     CmuxEvent(EventFrame),
@@ -431,68 +282,6 @@ struct ImageSelection {
     start: usize,
     end: usize,
     image_index: usize,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct PersistedState {
-    draft: Option<PersistedDraft>,
-    #[serde(default)]
-    stashes: Vec<PersistedDraft>,
-    #[serde(default)]
-    history: Vec<PersistedDraft>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    plan_mode: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AppConfig {
-    #[serde(default)]
-    agents: AgentConfig,
-    #[serde(default)]
-    rename: RenameConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AgentConfig {
-    #[serde(default)]
-    codex: AgentCommandConfig,
-    #[serde(default)]
-    claude: AgentCommandConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AgentCommandConfig {
-    command: Option<String>,
-    plan_command: Option<String>,
-    submit_command: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RenameConfig {
-    command: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PersistedDraft {
-    lines: Vec<String>,
-    image_paths: Vec<String>,
-    provider: String,
-    plan_mode: bool,
-    saved_at_ms: u64,
-}
-
-#[derive(Serialize)]
-struct SubmitPayload<'a> {
-    workspace_id: &'a str,
-    prompt: &'a str,
-    title: &'a str,
-    agent: &'a str,
-    mode: &'a str,
-    workspace_cwd: &'a str,
-    socket: &'a str,
-    images: &'a [String],
 }
 
 impl App {
@@ -1202,13 +991,7 @@ impl App {
         };
         self.history.insert(
             0,
-            PersistedDraft {
-                lines,
-                image_paths: images.to_vec(),
-                provider: self.provider.label().to_string(),
-                plan_mode: self.plan_mode,
-                saved_at_ms: now_millis(),
-            },
+            draft_from_parts(lines, images.to_vec(), self.provider, self.plan_mode),
         );
     }
 
@@ -1216,13 +999,12 @@ impl App {
         if !self.composer_has_input() && self.image_paths.is_empty() {
             return None;
         }
-        Some(PersistedDraft {
-            lines: self.composer.lines().to_vec(),
-            image_paths: self.image_paths.clone(),
-            provider: self.provider.label().to_string(),
-            plan_mode: self.plan_mode,
-            saved_at_ms: now_millis(),
-        })
+        Some(draft_from_parts(
+            self.composer.lines().to_vec(),
+            self.image_paths.clone(),
+            self.provider,
+            self.plan_mode,
+        ))
     }
 
     fn persist_state(&self) {
@@ -1695,36 +1477,15 @@ impl App {
     }
 }
 
-fn configure_workspace_hook_command(
-    command: &mut Command,
-    rendered: &str,
-    workspace_cwd: &str,
-    socket_path: &str,
-    workspace_id: &str,
-) {
-    command
-        .arg("-lc")
-        .arg(rendered)
-        .current_dir(workspace_cwd)
-        .env("CMUX_SOCKET_PATH", socket_path)
-        .env("CMUX_WORKSPACE_ID", workspace_id)
-        .env_remove("CMUX_SURFACE_ID")
-        .env_remove("CMUX_TAB_ID")
-        .env_remove("CMUX_PANEL_ID")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-}
-
 fn new_composer() -> TextArea<'static> {
-    let mut composer = TextArea::default();
-    composer.set_placeholder_text("");
-    composer.set_cursor_line_style(Style::default());
-    composer
+    configure_composer(TextArea::default())
 }
 
 fn composer_from_lines(lines: Vec<String>) -> TextArea<'static> {
-    let mut composer = TextArea::new(lines);
+    configure_composer(TextArea::new(lines))
+}
+
+fn configure_composer(mut composer: TextArea<'static>) -> TextArea<'static> {
     composer.set_placeholder_text("");
     composer.set_cursor_line_style(Style::default());
     composer
@@ -1737,358 +1498,18 @@ fn non_empty_lines(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-fn state_path() -> PathBuf {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_home).join("cmux-home/state.json");
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/cmux-home/state.json")
-}
-
-fn load_persisted_state(path: &PathBuf) -> PersistedState {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn load_config(path: Option<&PathBuf>) -> AppConfig {
-    path.and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
-}
-
-fn load_skill_entries(workspace_cwd: &str) -> Vec<SkillEntry> {
-    let mut by_name = HashMap::new();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let workspace = PathBuf::from(workspace_cwd);
-
-    scan_skill_root(
-        &workspace.join(".codex/skills"),
-        "codex project",
-        0,
-        &mut by_name,
-    );
-    scan_skill_root(
-        &workspace.join(".claude/skills"),
-        "claude project",
-        0,
-        &mut by_name,
-    );
-    scan_skill_root(
-        &workspace.join(".agents/skills"),
-        "agents project",
-        1,
-        &mut by_name,
-    );
-    scan_skill_root(&workspace.join("skills"), "project", 1, &mut by_name);
-
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".codex")));
-    if let Some(codex_home) = codex_home {
-        scan_skill_root(&codex_home.join("skills"), "codex", 2, &mut by_name);
-        scan_skill_root(
-            &codex_home.join("skills/.system"),
-            "codex system",
-            4,
-            &mut by_name,
-        );
-        scan_plugin_skill_roots(
-            &codex_home.join("plugins/cache"),
-            "codex plugin",
-            5,
-            &mut by_name,
-        );
-    }
-
-    if let Some(home) = home.as_ref() {
-        scan_skill_root(&home.join(".agents/skills"), "agents", 3, &mut by_name);
-    }
-
-    let claude_home = std::env::var_os("CLAUDE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".claude")));
-    if let Some(claude_home) = claude_home {
-        scan_skill_root(&claude_home.join("skills"), "claude", 2, &mut by_name);
-        scan_plugin_skill_roots(
-            &claude_home.join("plugins/cache"),
-            "claude plugin",
-            5,
-            &mut by_name,
-        );
-        scan_plugin_skill_roots(
-            &claude_home.join("plugins/marketplaces"),
-            "claude marketplace",
-            5,
-            &mut by_name,
-        );
-    }
-
-    let mut skills = by_name.into_values().collect::<Vec<SkillEntry>>();
-    skills.sort_by(|a, b| {
-        a.priority
-            .cmp(&b.priority)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    skills
-}
-
-fn scan_plugin_skill_roots(
-    root: &PathBuf,
-    source: &str,
-    priority: usize,
-    by_name: &mut HashMap<String, SkillEntry>,
-) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        scan_skill_root(&path.join("skills"), source, priority, by_name);
-        scan_skill_root(&path, source, priority + 1, by_name);
-    }
-}
-
-fn scan_skill_root(
-    root: &PathBuf,
-    source: &str,
-    priority: usize,
-    by_name: &mut HashMap<String, SkillEntry>,
-) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let skill_path = path.join("SKILL.md");
-        if !skill_path.is_file() {
-            continue;
-        }
-        if let Some(skill) = parse_skill_entry(&skill_path, source, priority) {
-            merge_skill_entry(by_name, skill);
-        }
-    }
-}
-
-fn merge_skill_entry(by_name: &mut HashMap<String, SkillEntry>, skill: SkillEntry) {
-    let key = skill.name.to_ascii_lowercase();
-    if let Some(existing) = by_name.get_mut(&key) {
-        for source in skill.sources {
-            if !existing.sources.contains(&source) {
-                existing.sources.push(source);
-            }
-        }
-        if skill.priority < existing.priority
-            || (existing.description.is_empty() && !skill.description.is_empty())
-        {
-            existing.description = skill.description;
-            existing.priority = skill.priority;
-            existing.path = skill.path;
-        }
-        return;
-    }
-    by_name.insert(key, skill);
-}
-
-fn parse_skill_entry(path: &PathBuf, source: &str, priority: usize) -> Option<SkillEntry> {
-    let body = fs::read_to_string(path).ok()?;
-    let fallback_name = path.parent()?.file_name()?.to_string_lossy().to_string();
-    let mut name = String::new();
-    let mut description = String::new();
-
-    if let Some(frontmatter) = markdown_frontmatter(&body) {
-        for line in frontmatter.lines() {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            let value = unquote_yaml_scalar(value.trim());
-            match key.trim() {
-                "name" if !value.is_empty() => name = value,
-                "description" if !value.is_empty() => description = value,
-                _ => {}
-            }
-        }
-    }
-
-    if name.is_empty() {
-        name = fallback_name;
-    }
-    if description.is_empty() {
-        description = markdown_first_text_line(&body).unwrap_or_default();
-    }
-    description = one_line_preview(&description, 120);
-
-    Some(SkillEntry {
-        name,
-        description,
-        sources: vec![source.to_string()],
-        priority,
-        path: path.clone(),
-    })
-}
-
-fn markdown_frontmatter(body: &str) -> Option<&str> {
-    let rest = body.strip_prefix("---\n")?;
-    let (frontmatter, _) = rest.split_once("\n---")?;
-    Some(frontmatter)
-}
-
-fn markdown_first_text_line(body: &str) -> Option<String> {
-    body.lines()
-        .map(str::trim)
-        .filter(|line| {
-            !line.is_empty()
-                && *line != "---"
-                && !line.starts_with('#')
-                && !line.starts_with("name:")
-                && !line.starts_with("description:")
-        })
-        .map(str::to_string)
-        .next()
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    let value = value.trim();
-    if value.len() >= 2 {
-        let bytes = value.as_bytes();
-        let first = bytes[0];
-        let last = bytes[value.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return value[1..value.len() - 1].to_string();
-        }
-    }
-    value.to_string()
-}
-
-fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
-    render_command_template_parts(template, values, &[])
-}
-
-fn render_command_template_parts(
-    template: &str,
-    quoted_values: &[(&str, &str)],
-    raw_values: &[(&str, &str)],
-) -> String {
-    let mut rendered = template.to_string();
-    for (key, value) in quoted_values {
-        rendered = rendered.replace(&format!("{{{key}}}"), &shell_quote(value));
-    }
-    for (key, value) in raw_values {
-        rendered = rendered.replace(&format!("{{{key}}}"), value);
-    }
-    rendered
-}
-
-fn write_submit_payload(payload: SubmitPayload<'_>) -> Result<PathBuf> {
-    let safe_workspace = payload
-        .workspace_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-        .take(48)
-        .collect::<String>();
-    let path = std::env::temp_dir().join(format!(
-        "cmux-home-submit-{}-{}-{}.json",
-        std::process::id(),
-        now_millis(),
-        safe_workspace
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("create submit payload {}", path.display()))?;
-    let bytes = serde_json::to_vec_pretty(&payload).context("serialize submit payload")?;
-    file.write_all(&bytes)
-        .with_context(|| format!("write submit payload {}", path.display()))?;
-    Ok(path)
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-struct CmuxClient {
-    path: String,
-}
-
-impl CmuxClient {
-    fn new(path: String) -> Self {
-        Self { path }
-    }
-
-    fn v2(&mut self, method: &str, params: Value) -> Result<Value> {
-        let request = json!({
-            "id": format!("cmux-home-{}", method),
-            "method": method,
-            "params": params,
-        });
-        let response = self.send_line(&request.to_string())?;
-        let value: Value = serde_json::from_str(response.trim())
-            .with_context(|| format!("invalid JSON response for {method}: {response}"))?;
-        if value.get("ok").and_then(Value::as_bool) != Some(true) {
-            bail!("{} failed: {}", method, value);
-        }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    fn v1(&mut self, command: &str) -> Result<String> {
-        self.send_line(command)
-    }
-
-    fn send_line(&mut self, line: &str) -> Result<String> {
-        let mut stream =
-            UnixStream::connect(&self.path).with_context(|| format!("connect {}", self.path))?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(1500)))
-            .context("set read timeout")?;
-        stream
-            .write_all(format!("{line}\n").as_bytes())
-            .context("write socket command")?;
-
-        let mut response = Vec::new();
-        let mut buf = [0_u8; 4096];
-        let mut saw_newline = false;
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    response.extend_from_slice(&buf[..n]);
-                    if response.contains(&b'\n') {
-                        saw_newline = true;
-                        if is_complete_single_line_response(&response) {
-                            break;
-                        }
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(120)))
-                            .ok();
-                    }
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    if saw_newline {
-                        break;
-                    }
-                    return Err(err).context("read socket response");
-                }
-                Err(err) => return Err(err).context("read socket response"),
-            }
-        }
-        String::from_utf8(response).context("socket response was not UTF-8")
+fn draft_from_parts(
+    lines: Vec<String>,
+    image_paths: Vec<String>,
+    provider: AgentKind,
+    plan_mode: bool,
+) -> PersistedDraft {
+    PersistedDraft {
+        lines,
+        image_paths,
+        provider: provider.label().to_string(),
+        plan_mode,
+        saved_at_ms: now_millis(),
     }
 }
 
@@ -2660,13 +2081,12 @@ fn handle_composer_command(app: &mut App) -> bool {
         if draft_text.is_empty() {
             app.status_line = "nothing to stash".to_string();
         } else {
-            app.stashes.push(PersistedDraft {
-                lines: draft_text.lines().map(str::to_string).collect(),
-                image_paths: Vec::new(),
-                provider: app.provider.label().to_string(),
-                plan_mode: app.plan_mode,
-                saved_at_ms: now_millis(),
-            });
+            app.stashes.push(draft_from_parts(
+                draft_text.lines().map(str::to_string).collect(),
+                Vec::new(),
+                app.provider,
+                app.plan_mode,
+            ));
             app.reset_composer();
             app.status_line = format!("stashed draft {}", app.stashes.len());
         }
@@ -2861,43 +2281,6 @@ fn normalize_composer_image_paths(app: &mut App) {
         app.composer.move_cursor(CursorMove::Forward);
     }
     select_image_token_at_cursor(app);
-}
-
-fn shell_words(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for ch in text.trim().chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if quote == Some(ch) {
-            quote = None;
-            continue;
-        }
-        if quote.is_none() && (ch == '\'' || ch == '"') {
-            quote = Some(ch);
-            continue;
-        }
-        if quote.is_none() && ch.is_whitespace() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
 }
 
 fn normalize_pasted_path(word: &str) -> String {
@@ -3697,14 +3080,6 @@ fn is_selectable_row(row: Option<&WorkspaceListRow>) -> bool {
         row,
         Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
     )
-}
-
-fn display_group(state: AgentState) -> AgentState {
-    match state {
-        AgentState::NeedsAttention => AgentState::NeedsAttention,
-        AgentState::Working => AgentState::Working,
-        AgentState::Idle | AgentState::Empty | AgentState::Unknown => AgentState::Idle,
-    }
 }
 
 fn render_group_header(label: String, selected: bool, width: usize) -> Line<'static> {
@@ -4531,10 +3906,6 @@ fn claude_user_content_is_tool_result(value: &Value) -> bool {
         })
 }
 
-fn user_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-
 fn spawn_event_stream(socket_path: String, tx: Sender<UiEvent>) {
     thread::spawn(move || loop {
         if let Err(err) = run_event_stream_once(&socket_path, &tx) {
@@ -4581,174 +3952,6 @@ fn run_event_stream_once(socket_path: &str, tx: &Sender<UiEvent>) -> Result<()> 
             _ => {}
         }
     }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct EventFrame {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    name: Option<String>,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    payload: Value,
-}
-
-fn event_name(frame: &EventFrame) -> String {
-    frame.name.clone().unwrap_or_else(|| "event".to_string())
-}
-
-fn event_workspace_id(frame: &EventFrame) -> Option<&str> {
-    frame
-        .workspace_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .or_else(|| frame.payload.get("workspace_id").and_then(Value::as_str))
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/workspace_id")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/params/workspace_id")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            frame
-                .payload
-                .get("args")
-                .and_then(Value::as_str)
-                .and_then(workspace_id_from_args)
-        })
-}
-
-fn event_title(frame: &EventFrame) -> Option<String> {
-    frame
-        .payload
-        .get("custom_title")
-        .and_then(Value::as_str)
-        .or_else(|| frame.payload.get("title").and_then(Value::as_str))
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/title")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string)
-}
-
-fn event_description(frame: &EventFrame) -> Option<String> {
-    frame
-        .payload
-        .get("description")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/description")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string)
-}
-
-fn workspace_from_created_event(frame: &EventFrame, workspace_id: &str) -> WorkspaceStatus {
-    let title = event_title(frame).unwrap_or_else(|| workspace_id.chars().take(8).collect());
-    let optimistic_preview = event_description(frame)
-        .filter(|description| !description.trim().is_empty())
-        .map(|description| one_line_preview(&description, 120))
-        .or_else(|| prompt_preview_from_title(&title));
-    let latest_message = optimistic_preview
-        .clone()
-        .unwrap_or_else(|| "starting workspace".to_string());
-    WorkspaceStatus {
-        id: workspace_id.to_string(),
-        title,
-        latest_message: latest_message.clone(),
-        selected: frame
-            .payload
-            .get("selected")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-        pinned: false,
-        statuses: HashMap::new(),
-        unread_notifications: 0,
-        conversation: optimistic_preview.map(|preview| ConversationSnapshot {
-            actor: ConversationActor::User,
-            preview,
-            modified_at: SystemTime::now(),
-        }),
-        updated_at: Some(Instant::now()),
-    }
-}
-
-fn prompt_preview_from_title(title: &str) -> Option<String> {
-    let (_, prompt) = title.split_once(':')?;
-    let prompt = prompt.trim();
-    (!prompt.is_empty()).then(|| one_line_preview(prompt, 120))
-}
-
-fn preserve_optimistic_submission(existing: &WorkspaceStatus, refreshed: &mut WorkspaceStatus) {
-    if refreshed.conversation.is_some()
-        || refreshed.unread_notifications > 0
-        || has_agent_status(&refreshed.statuses)
-    {
-        return;
-    }
-    let Some(conversation) = existing.conversation.as_ref() else {
-        return;
-    };
-    if conversation.actor != ConversationActor::User
-        || conversation
-            .modified_at
-            .elapsed()
-            .unwrap_or(Duration::from_secs(0))
-            > Duration::from_secs(300)
-    {
-        return;
-    }
-    refreshed.conversation = Some(conversation.clone());
-    if refreshed.latest_message.trim().is_empty()
-        || refreshed.latest_message == "standing by for task"
-    {
-        refreshed.latest_message = existing.latest_message.clone();
-    }
-}
-
-fn has_agent_status(statuses: &HashMap<String, String>) -> bool {
-    statuses.keys().any(|key| {
-        let key = key.to_ascii_lowercase();
-        key == "codex" || key == "claude" || key == "claude_code"
-    })
-}
-
-fn notification_is_unread(frame: &EventFrame) -> bool {
-    frame
-        .payload
-        .get("is_read")
-        .and_then(Value::as_bool)
-        .map(|is_read| !is_read)
-        .unwrap_or(true)
-}
-
-fn workspace_id_from_args(args: &str) -> Option<&str> {
-    let words = shell_words(args);
-    let id = words
-        .iter()
-        .find_map(|word| {
-            word.strip_prefix("--tab=")
-                .or_else(|| word.strip_prefix("--workspace="))
-        })
-        .or_else(|| {
-            words.windows(2).find_map(|pair| {
-                (pair[0] == "--tab" || pair[0] == "--workspace").then_some(pair[1].as_str())
-            })
-        });
-    id.map(|id| {
-        let offset = args.find(id).unwrap_or(0);
-        &args[offset..offset + id.len()]
-    })
 }
 
 fn unread_notifications_by_workspace(payload: Value) -> HashMap<String, usize> {
@@ -4841,26 +4044,6 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .filter(|s| !s.is_empty())
-}
-
-fn one_line_preview(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&collapsed, max_chars)
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    format!(
-        "{}…",
-        text.chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>()
-    )
 }
 
 #[cfg(test)]
@@ -4974,47 +4157,4 @@ mod tests {
         assert_eq!(refreshed.latest_message, "fix submit flicker");
         assert_eq!(display_group(refreshed.agent_state()), AgentState::Working);
     }
-}
-
-fn time_ago(instant: Instant) -> String {
-    let elapsed = instant.elapsed();
-    let seconds = elapsed.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 60 * 60 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 60 * 60 * 24 {
-        format!("{}h", seconds / 60 / 60)
-    } else {
-        format!("{}d", seconds / 60 / 60 / 24)
-    }
-}
-
-fn shell_quote(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
-
-fn is_complete_single_line_response(data: &[u8]) -> bool {
-    if !data.contains(&b'\n') {
-        return false;
-    }
-    let Ok(response) = std::str::from_utf8(data) else {
-        return false;
-    };
-    let normalized = response.trim();
-    if normalized.is_empty() || normalized.contains('\n') {
-        return false;
-    }
-    normalized == "OK"
-        || normalized == "PONG"
-        || normalized.starts_with("OK ")
-        || normalized.starts_with("ERROR:")
-        || serde_json::from_str::<Value>(normalized).is_ok()
 }
