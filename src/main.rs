@@ -737,6 +737,7 @@ impl App {
                     pinned: false,
                     statuses: HashMap::new(),
                     unread_notifications: 0,
+                    conversation: None,
                     updated_at: Some(Instant::now()),
                 });
                 Some(RefreshRequest::Workspace {
@@ -4056,12 +4057,9 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         let conversation = workspace_item_keys(&item)
             .iter()
             .find_map(|key| conversations_by_workspace.get(key));
-        if let Some(workspace) = workspace_from_list_item(
-            &mut client,
-            &item,
-            unread_notifications,
-            conversation,
-        ) {
+        if let Some(workspace) =
+            workspace_from_list_item(&mut client, &item, unread_notifications, conversation)
+        {
             next.push(workspace);
         }
     }
@@ -4082,29 +4080,30 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
-    let item = workspaces_payload
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .and_then(|workspaces| {
-            workspaces
+    let item = workspaces
+        .iter()
+        .find(|item| {
+            workspace_item_keys(item)
                 .iter()
-                .find(|item| workspace_item_keys(item).iter().any(|key| key == workspace_id))
-        });
+                .any(|key| key == workspace_id)
+        })
+        .cloned();
     let Some(item) = item else {
         return Ok(None);
     };
-    let unread_notifications = workspace_item_keys(item)
+    let conversations_by_workspace =
+        load_conversations_by_workspace(&mut client, std::slice::from_ref(&item));
+    let unread_notifications = workspace_item_keys(&item)
         .iter()
         .find_map(|key| unread_by_workspace.get(key))
         .copied()
         .unwrap_or(0);
-    let conversation = workspace_item_keys(item)
+    let conversation = workspace_item_keys(&item)
         .iter()
         .find_map(|key| conversations_by_workspace.get(key));
     Ok(workspace_from_list_item(
         &mut client,
-        item,
+        &item,
         unread_notifications,
         conversation,
     ))
@@ -4128,17 +4127,17 @@ fn workspace_from_list_item(
         .filter(|preview| !preview.is_empty())
         .or_else(|| {
             client
-        .v2(
-            "surface.read_text",
-            json!({
-                "workspace_id": id,
-                "lines": 60,
-                "scrollback": true,
-            }),
-        )
-        .ok()
-        .and_then(|payload| string_field(&payload, "text"))
-        .and_then(|screen| latest_message_from_screen(&screen))
+                .v2(
+                    "surface.read_text",
+                    json!({
+                        "workspace_id": id,
+                        "lines": 60,
+                        "scrollback": true,
+                    }),
+                )
+                .ok()
+                .and_then(|payload| string_field(&payload, "text"))
+                .and_then(|screen| latest_message_from_screen(&screen))
         })
         .or_else(|| description.clone())
         .unwrap_or_else(|| "standing by for task".to_string());
@@ -4160,6 +4159,396 @@ fn workspace_from_list_item(
         workspace.statuses = parse_sidebar_statuses(&sidebar);
     }
     Some(workspace)
+}
+
+fn workspace_primary_id(item: &Value) -> Option<String> {
+    string_field(item, "id").or_else(|| string_field(item, "ref"))
+}
+
+fn workspace_item_keys(item: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in ["id", "ref"] {
+        if let Some(value) = string_field(item, key) {
+            if !keys.contains(&value) {
+                keys.push(value);
+            }
+        }
+    }
+    keys
+}
+
+fn workspace_item_ref(item: &Value) -> Option<String> {
+    string_field(item, "ref").or_else(|| string_field(item, "id"))
+}
+
+fn workspace_item_cwd(item: &Value) -> Option<String> {
+    string_field(item, "current_directory").or_else(|| string_field(item, "cwd"))
+}
+
+#[derive(Default)]
+struct TopConversationRefs {
+    codex_sessions_by_workspace: HashMap<String, HashSet<String>>,
+    claude_workspaces: HashSet<String>,
+}
+
+fn load_conversations_by_workspace(
+    client: &mut CmuxClient,
+    workspaces: &[Value],
+) -> HashMap<String, ConversationSnapshot> {
+    let top_command = if workspaces.len() == 1 {
+        workspace_item_ref(&workspaces[0])
+            .map(|workspace_ref| {
+                format!("top --workspace {workspace_ref} --processes --format tsv")
+            })
+            .unwrap_or_else(|| "top --all --processes --format tsv".to_string())
+    } else {
+        "top --all --processes --format tsv".to_string()
+    };
+    let top = client.v1(&top_command).unwrap_or_default();
+    let top_refs = parse_top_conversation_refs(&top);
+    let mut conversations = HashMap::new();
+
+    let codex_conversations = load_codex_conversations(&top_refs.codex_sessions_by_workspace);
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        let Some(session_ids) = top_refs.codex_sessions_by_workspace.get(&workspace_ref) else {
+            continue;
+        };
+        let best = session_ids
+            .iter()
+            .filter_map(|session_id| codex_conversations.get(session_id))
+            .max_by_key(|snapshot| snapshot.modified_at);
+        if let Some(snapshot) = best.cloned() {
+            insert_conversation_for_workspace(item, snapshot, &mut conversations);
+        }
+    }
+
+    let mut claude_cwd_counts: HashMap<String, usize> = HashMap::new();
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        if !top_refs.claude_workspaces.contains(&workspace_ref) {
+            continue;
+        }
+        if let Some(cwd) = workspace_item_cwd(item) {
+            *claude_cwd_counts.entry(cwd).or_insert(0) += 1;
+        }
+    }
+
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        if !top_refs.claude_workspaces.contains(&workspace_ref) {
+            continue;
+        }
+        let Some(cwd) = workspace_item_cwd(item) else {
+            continue;
+        };
+        if claude_cwd_counts.get(&cwd).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if let Some(snapshot) = load_latest_claude_conversation_for_cwd(&cwd) {
+            insert_conversation_for_workspace(item, snapshot, &mut conversations);
+        }
+    }
+
+    conversations
+}
+
+fn insert_conversation_for_workspace(
+    item: &Value,
+    snapshot: ConversationSnapshot,
+    conversations: &mut HashMap<String, ConversationSnapshot>,
+) {
+    for key in workspace_item_keys(item) {
+        conversations.insert(key, snapshot.clone());
+    }
+}
+
+fn parse_top_conversation_refs(text: &str) -> TopConversationRefs {
+    let mut refs = TopConversationRefs::default();
+    for line in text.lines() {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols.len() < 6 {
+            continue;
+        }
+        let kind = cols[3];
+        let id = cols[4];
+        let parent = cols[5];
+        if kind != "tag" || !parent.starts_with("workspace:") {
+            continue;
+        }
+        if let Some(session_id) = extract_codex_session_id(id) {
+            refs.codex_sessions_by_workspace
+                .entry(parent.to_string())
+                .or_default()
+                .insert(session_id);
+        }
+        if id.contains(":tag:claude") {
+            refs.claude_workspaces.insert(parent.to_string());
+        }
+    }
+    refs
+}
+
+fn extract_codex_session_id(value: &str) -> Option<String> {
+    let (_, rest) = value.split_once("codex.")?;
+    let session_id = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-')
+        .collect::<String>();
+    (session_id.len() >= 32).then_some(session_id)
+}
+
+fn load_codex_conversations(
+    sessions_by_workspace: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, ConversationSnapshot> {
+    let wanted = sessions_by_workspace
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let mut paths_by_session = HashMap::new();
+    for root in codex_session_roots() {
+        collect_matching_session_files(&root, &wanted, &mut paths_by_session);
+    }
+    let mut conversations = HashMap::new();
+    for (session_id, path) in paths_by_session {
+        if let Some(snapshot) = parse_codex_conversation_file(&path) {
+            conversations.insert(session_id, snapshot);
+        }
+    }
+    conversations
+}
+
+fn codex_session_roots() -> Vec<PathBuf> {
+    let Some(codex_home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| user_home().map(|home| home.join(".codex")))
+    else {
+        return Vec::new();
+    };
+    vec![
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+    ]
+}
+
+fn collect_matching_session_files(
+    dir: &Path,
+    wanted: &HashSet<String>,
+    paths_by_session: &mut HashMap<String, PathBuf>,
+) {
+    if paths_by_session.len() == wanted.len() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_session_files(&path, wanted, paths_by_session);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for session_id in wanted {
+            if paths_by_session.contains_key(session_id) {
+                continue;
+            }
+            if file_name.contains(session_id) {
+                paths_by_session.insert(session_id.clone(), path.clone());
+            }
+        }
+    }
+}
+
+fn load_latest_claude_conversation_for_cwd(cwd: &str) -> Option<ConversationSnapshot> {
+    let claude_home = std::env::var_os("CLAUDE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| user_home().map(|home| home.join(".claude")))?;
+    let project_dir = claude_home
+        .join("projects")
+        .join(claude_project_dir_name(cwd));
+    let latest = latest_jsonl_file(&project_dir)?;
+    parse_claude_conversation_file(&latest)
+}
+
+fn claude_project_dir_name(cwd: &str) -> String {
+    cwd.chars()
+        .map(|ch| {
+            if ch == '/' || ch.is_whitespace() {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn latest_jsonl_file(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let modified_at = fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified_at, path))
+        })
+        .max_by_key(|(modified_at, _)| *modified_at)
+        .map(|(_, path)| path)
+}
+
+fn parse_codex_conversation_file(path: &Path) -> Option<ConversationSnapshot> {
+    parse_conversation_file(path, |value| {
+        let event_type = value.get("type").and_then(Value::as_str);
+        let payload = value.get("payload")?;
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        if event_type == Some("event_msg") && payload_type == Some("user_message") {
+            return Some((
+                ConversationActor::User,
+                payload
+                    .get("message")
+                    .and_then(value_preview)
+                    .or_else(|| payload.get("text_elements").and_then(value_preview))
+                    .unwrap_or_default(),
+            ));
+        }
+        if event_type == Some("response_item") && payload_type == Some("message") {
+            let role = payload.get("role").and_then(Value::as_str)?;
+            let actor = match role {
+                "user" => ConversationActor::User,
+                "assistant" => ConversationActor::Assistant,
+                _ => return None,
+            };
+            return Some((
+                actor,
+                payload
+                    .get("content")
+                    .and_then(value_preview)
+                    .unwrap_or_default(),
+            ));
+        }
+        None
+    })
+}
+
+fn parse_claude_conversation_file(path: &Path) -> Option<ConversationSnapshot> {
+    parse_conversation_file(path, |value| {
+        let role = value
+            .pointer("/message/role")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("type").and_then(Value::as_str))?;
+        let actor = match role {
+            "user" => ConversationActor::User,
+            "assistant" => ConversationActor::Assistant,
+            _ => return None,
+        };
+        let content = value
+            .pointer("/message/content")
+            .or_else(|| value.get("content"))?;
+        if actor == ConversationActor::User && claude_user_content_is_tool_result(content) {
+            return None;
+        }
+        let preview = value_preview(content).unwrap_or_default();
+        if actor == ConversationActor::Assistant && preview.is_empty() {
+            return None;
+        }
+        Some((actor, preview))
+    })
+}
+
+fn parse_conversation_file<F>(path: &Path, mut parse_line: F) -> Option<ConversationSnapshot>
+where
+    F: FnMut(&Value) -> Option<(ConversationActor, String)>,
+{
+    let modified_at = fs::metadata(path).ok()?.modified().ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut last_actor = None;
+    let mut last_preview = String::new();
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some((actor, preview)) = parse_line(&value) else {
+            continue;
+        };
+        last_actor = Some(actor);
+        if !preview.is_empty() {
+            last_preview = preview;
+        }
+    }
+    Some(ConversationSnapshot {
+        actor: last_actor?,
+        preview: last_preview,
+        modified_at,
+    })
+}
+
+fn value_preview(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_value_text(value, &mut parts);
+    let preview = parts.join(" ");
+    (!preview.trim().is_empty()).then(|| one_line_preview(&preview, 240))
+}
+
+fn collect_value_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_value_text(item, parts);
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "tool_result" | "tool_use" | "function_call"))
+            {
+                return;
+            }
+            for key in ["text", "content", "message"] {
+                if let Some(value) = object.get(key) {
+                    collect_value_text(value, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn claude_user_content_is_tool_result(value: &Value) -> bool {
+    let Value::Array(items) = value else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "tool_result")
+        })
+}
+
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn spawn_event_stream(socket_path: String, tx: Sender<UiEvent>) {
@@ -4418,6 +4807,54 @@ fn truncate(text: &str, max_chars: usize) -> String {
             .take(max_chars.saturating_sub(1))
             .collect::<String>()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_codex_session_ids_from_top_tags() {
+        let top = "\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:codex.019e266c-c7de-7052-b819-bcf5df17ada5\tworkspace:84\t\n\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:claude_code\tworkspace:40\tRunning\n";
+        let refs = parse_top_conversation_refs(top);
+
+        assert!(refs
+            .codex_sessions_by_workspace
+            .get("workspace:84")
+            .is_some_and(|sessions| sessions.contains("019e266c-c7de-7052-b819-bcf5df17ada5")));
+        assert!(refs.claude_workspaces.contains("workspace:40"));
+    }
+
+    #[test]
+    fn ignores_claude_tool_result_user_messages() {
+        let content = json!([
+            {
+                "type": "tool_result",
+                "content": "command output"
+            }
+        ]);
+
+        assert!(claude_user_content_is_tool_result(&content));
+        assert!(value_preview(&content).is_none());
+    }
+
+    #[test]
+    fn extracts_text_preview_from_message_content() {
+        let content = json!([
+            {
+                "type": "text",
+                "text": "hello\nworld"
+            },
+            {
+                "type": "tool_use",
+                "input": "ignored"
+            }
+        ]);
+
+        assert_eq!(value_preview(&content).as_deref(), Some("hello world"));
+    }
 }
 
 fn time_ago(instant: Instant) -> String {
