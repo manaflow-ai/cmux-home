@@ -106,6 +106,8 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [quitTap, setQuitTap] = useState<QuitTap | null>(null);
   const [spinnerTick, setSpinnerTick] = useState<number>(0);
+  const [destroyArmedVmId, setDestroyArmedVmId] = useState<string | null>(null);
+  const destroyArmTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [composerMode, setComposerMode] = useState<
     { kind: "new" } | { kind: "rename"; workspaceId: string }
   >({ kind: "new" });
@@ -728,7 +730,25 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     if (key.ctrl && input === "x") {
       const selectedVm = selectedVmRow();
       if (selectedVm) {
-        void destroyVm(selectedVm);
+        if (destroyArmedVmId === selectedVm.id) {
+          if (destroyArmTimerRef.current) {
+            clearTimeout(destroyArmTimerRef.current);
+            destroyArmTimerRef.current = null;
+          }
+          setDestroyArmedVmId(null);
+          void destroyVm(selectedVm);
+        } else {
+          setDestroyArmedVmId(selectedVm.id);
+          setStatusLine(
+            `press ctrl+x again within 3 s to destroy vm ${selectedVm.id.slice(0, 8)}`,
+          );
+          if (destroyArmTimerRef.current) clearTimeout(destroyArmTimerRef.current);
+          destroyArmTimerRef.current = setTimeout(() => {
+            setDestroyArmedVmId((armed) => (armed === selectedVm.id ? null : armed));
+            destroyArmTimerRef.current = null;
+            setStatusLine("");
+          }, 3_000);
+        }
       }
       return;
     }
