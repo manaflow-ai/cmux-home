@@ -1,16 +1,23 @@
 #!/usr/bin/env node
-// SSH into a Freestyle VM with reverse-forward to the local subrouter and
-// local-forwards for common dev ports.
+// SSH into a Freestyle VM and (by default) wire the VM to the user's
+// Tailscale-hosted Subrouter so codex inside the VM routes through the AI
+// gateway.
 //
-//   FREESTYLE_API_KEY=... freestyle-vm-ssh <vmId> [--user cmux]
-//                                          [--subrouter-port 31415]
-//                                          [--forward 3000 --forward 5173 ...]
-//                                          [--codex-config /absolute/or/relative/path]
-//                                          [--no-codex-config]
+//   FREESTYLE_API_KEY=... freestyle-vm-ssh <vmId>
+//     [--user cmux]
+//     [--subrouter-port 31415]
+//     [--subrouter-url <url>]            # default: http://subrouter-team.tail41290.ts.net:31415/v1
+//     [--reverse-subrouter]              # add -R; only works on non-Freestyle sshd
+//     [--forward 3000 --forward 5173 ...]
+//     [--codex-config /absolute/or/relative/path]
+//     [--no-codex-config]
+//     [--tailscale | --no-tailscale]     # default: --tailscale (install + join via tsadmin auth-key)
+//     [--tailscale-authkey <key>]        # explicit; else mint via `tsadmin api POST /tailnet/-/keys`
+//     [--tailscale-hostname <name>]      # default: fs-<vmid-short>
 //
 // On exit, the script revokes the freestyle identity it created.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -22,6 +29,10 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Freestyle } from "freestyle";
+
+const DEFAULT_TAILNET_SUBROUTER_URL = "http://subrouter-team.tail41290.ts.net:31415/v1";
+const DEFAULT_TAILSCALE_TAGS = ["tag:server"];
+const DEFAULT_TAILSCALE_PROXY_PORT = 1055;
 
 if (!process.env.FREESTYLE_API_KEY?.trim()) {
   // Search common dotenv-style files. We deliberately do NOT pull from
@@ -135,42 +146,83 @@ try {
 
   // Decide which subrouter URL to bake into the codex config inside the VM.
   // Priority:
-  //   1. --subrouter-url <url>  (explicit override; recommended for Tailscale
-  //                              or any reachable public/private gateway).
-  //   2. SUBROUTER_REMOTE_URL env (same idea, env-driven).
-  //   3. --reverse-subrouter    (try the SSH -R path: subrouter on the local
-  //                              mac, exposed inside the VM as
-  //                              http://127.0.0.1:<port>/v1).
-  //   4. Otherwise: skip writing codex config and warn the user.
+  //   1. --subrouter-url <url>  (explicit override).
+  //   2. SUBROUTER_REMOTE_URL env.
+  //   3. --reverse-subrouter    (try the SSH -R path; only works for non-
+  //                              Freestyle sshd).
+  //   4. --tailscale enabled    (default): use the well-known tailnet subrouter.
   const subrouterUrlForVm =
     args.subrouterUrl
       ?? process.env.SUBROUTER_REMOTE_URL?.trim()
-      ?? (args.useReverseForward ? `http://127.0.0.1:${args.subrouterPort}/v1` : null);
+      ?? (args.useReverseForward ? `http://127.0.0.1:${args.subrouterPort}/v1` : null)
+      ?? (args.tailscale ? DEFAULT_TAILNET_SUBROUTER_URL : null);
 
-  let remoteCommand = "";
+  // Mint a Tailscale ephemeral preauth key now so we can include it in the
+  // remote command. Done synchronously before spawning ssh.
+  let tailscaleAuthKey = null;
+  if (args.tailscale) {
+    tailscaleAuthKey =
+      args.tailscaleAuthkey
+      ?? process.env.TAILSCALE_AUTHKEY?.trim()
+      ?? mintTailscaleAuthKey({
+        tags: DEFAULT_TAILSCALE_TAGS,
+        description: `freestyle-vm ${args.vmId}`,
+      });
+    if (!tailscaleAuthKey) {
+      process.stderr.write(
+        "[freestyle-vm-ssh] could not mint a tailscale auth key; pass --no-tailscale to skip the join, --tailscale-authkey <key>, or set TAILSCALE_AUTHKEY in env\n",
+      );
+      args.tailscale = false;
+    }
+  }
+
+  const remoteSteps = [];
+  if (args.tailscale && tailscaleAuthKey) {
+    const tsHostname = args.tailscaleHostname ?? `fs-${args.vmId.slice(0, 8)}`;
+    const tsScript = buildTailscaleBootstrap({
+      authKey: tailscaleAuthKey,
+      hostname: tsHostname,
+      proxyPort: DEFAULT_TAILSCALE_PROXY_PORT,
+    });
+    const encoded = Buffer.from(tsScript, "utf8").toString("base64");
+    remoteSteps.push(
+      `printf '%s' ${shellQuote(encoded)} | base64 -d | sudo bash -e`,
+    );
+  }
   if (args.codexConfigPath !== null && subrouterUrlForVm) {
     const remoteConfigPath = args.codexConfigPath ?? "$HOME/.codex/config.toml";
-    const remoteConfigDir = "$HOME/.codex";
+    // Derive the dir from the path. Paths containing `$HOME` or other shell
+    // variables stay UNQUOTED so the remote shell expands them; literal
+    // absolute paths get single-quoted.
+    const needsExpand = /\$/.test(remoteConfigPath);
+    const remoteConfigDir = remoteConfigPath.replace(/\/[^/]+$/, "");
+    const pathRendered = needsExpand
+      ? `"${remoteConfigPath}"`
+      : shellQuote(remoteConfigPath);
+    const dirRendered = needsExpand
+      ? `"${remoteConfigDir}"`
+      : shellQuote(remoteConfigDir);
     const codexConfigBody =
       `# Written by freestyle-vm-ssh so codex routes through Subrouter.\n` +
       `openai_base_url = "${subrouterUrlForVm}"\n`;
     const encodedConfig = Buffer.from(codexConfigBody, "utf8").toString("base64");
-    remoteCommand =
-      `mkdir -p ${shellQuote(remoteConfigDir)} && ` +
-      `printf '%s' ${shellQuote(encodedConfig)} | base64 -d > ${shellQuote(remoteConfigPath)} && ` +
-      `chmod 600 ${shellQuote(remoteConfigPath)} && ` +
-      `printf '\\n[freestyle-vm-ssh] codex configured to use subrouter at ${subrouterUrlForVm}\\n' && ` +
-      `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n' && ` +
-      `exec bash -l`;
+    remoteSteps.push(
+      `mkdir -p ${dirRendered}`,
+      `printf '%s' ${shellQuote(encodedConfig)} | base64 -d > ${pathRendered}`,
+      `chmod 600 ${pathRendered}`,
+      `printf '\\n[freestyle-vm-ssh] codex configured to use subrouter at ${subrouterUrlForVm}\\n'`,
+    );
   } else {
     const note = args.codexConfigPath === null
-      ? "(codex config write disabled via --no-codex-config)"
-      : "(no subrouter URL: pass --subrouter-url <url>, set SUBROUTER_REMOTE_URL, or --reverse-subrouter on hosts that allow it)";
-    remoteCommand =
-      `printf '\\n[freestyle-vm-ssh] no codex routing configured ${note}.\\n' && ` +
-      `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n' && ` +
-      `exec bash -l`;
+      ? "codex config write disabled via --no-codex-config"
+      : "no subrouter URL configured";
+    remoteSteps.push(`printf '\\n[freestyle-vm-ssh] %s\\n' ${shellQuote(note)}`);
   }
+  remoteSteps.push(
+    `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n'`,
+    `exec bash -l`,
+  );
+  const remoteCommand = remoteSteps.join(" && ");
 
   const finalArgs = ["-e", "ssh", ...baseSshArgs, "-t", remoteHost, remoteCommand];
 
@@ -215,6 +267,9 @@ function parseArgs(argv) {
     useReverseForward: false,
     subrouterUrl: null,
     passwordFile: true,
+    tailscale: true,
+    tailscaleAuthkey: null,
+    tailscaleHostname: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -250,6 +305,18 @@ function parseArgs(argv) {
       case "--no-codex-config":
         out.codexConfigPath = null;
         break;
+      case "--tailscale":
+        out.tailscale = true;
+        break;
+      case "--no-tailscale":
+        out.tailscale = false;
+        break;
+      case "--tailscale-authkey":
+        out.tailscaleAuthkey = argv[++i] ?? null;
+        break;
+      case "--tailscale-hostname":
+        out.tailscaleHostname = argv[++i] ?? null;
+        break;
     }
   }
   if (out.forwardPorts.length === 0) {
@@ -265,30 +332,150 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+function mintTailscaleAuthKey({ tags, description }) {
+  // Shell out to `tsadmin api POST /tailnet/-/keys ...`. Requires tsadmin to
+  // be on PATH and the user to have logged in to it. Returns the key value
+  // or null on any failure.
+  const body = JSON.stringify({
+    capabilities: {
+      devices: {
+        create: {
+          reusable: false,
+          ephemeral: true,
+          preauthorized: true,
+          tags,
+        },
+      },
+    },
+    expirySeconds: 3600,
+    description,
+  });
+  const result = spawnSync(
+    "tsadmin",
+    ["api", "POST", "/tailnet/-/keys", body],
+    { encoding: "utf8" },
+  );
+  if (result.error || result.status !== 0) {
+    process.stderr.write(
+      `[freestyle-vm-ssh] tsadmin mint failed${result.error ? `: ${result.error.message}` : `: exit ${result.status}`}\n` +
+        (result.stderr ? `${result.stderr.trim()}\n` : ""),
+    );
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const key = typeof parsed.key === "string" ? parsed.key : null;
+    if (!key) {
+      process.stderr.write(
+        `[freestyle-vm-ssh] tsadmin response missing key field: ${result.stdout.slice(0, 200)}\n`,
+      );
+    }
+    return key;
+  } catch (err) {
+    process.stderr.write(
+      `[freestyle-vm-ssh] could not parse tsadmin response: ${err.message}\n${result.stdout.slice(0, 200)}\n`,
+    );
+    return null;
+  }
+}
+
+function buildTailscaleBootstrap({ authKey, hostname, proxyPort }) {
+  // Idempotent installer + join inside the freestyle VM. The cmux-freestyle
+  // snapshot ships the apt-managed tailscale package today, so we use the
+  // systemd unit. Freestyle VMs have no /dev/net/tun, so tailscaled runs
+  // with --tun=userspace-networking and exposes an HTTP proxy +
+  // SOCKS5 server on 127.0.0.1:<proxyPort>. We write /etc/profile.d
+  // so HTTP_PROXY/HTTPS_PROXY/NO_PROXY are set for every login shell.
+  const port = String(proxyPort);
+  return [
+    "set -e",
+    'export DEBIAN_FRONTEND=noninteractive',
+    'if ! command -v tailscale >/dev/null 2>&1; then',
+    '  echo "[freestyle-vm-ssh] installing tailscale (static tarball)…"',
+    "  mkdir -p /tmp/cmux-ts-install && cd /tmp/cmux-ts-install",
+    '  arch="$(uname -m)"',
+    '  case "$arch" in',
+    '    x86_64|amd64) tsarch="amd64" ;;',
+    '    aarch64|arm64) tsarch="arm64" ;;',
+    '    *) echo "[freestyle-vm-ssh] unsupported arch $arch" >&2; exit 1 ;;',
+    '  esac',
+    '  url="https://pkgs.tailscale.com/stable/tailscale_latest_${tsarch}.tgz"',
+    "  curl -fsSL --retry 5 -o ts.tgz \"$url\"",
+    "  tar -xzf ts.tgz --strip-components=1",
+    "  install -m 0755 tailscale /usr/sbin/tailscale",
+    "  install -m 0755 tailscaled /usr/sbin/tailscaled",
+    "  cp systemd/tailscaled.service /lib/systemd/system/tailscaled.service",
+    "  install -m 0644 systemd/tailscaled.defaults /etc/default/tailscaled",
+    "  cd / && rm -rf /tmp/cmux-ts-install",
+    "  systemctl daemon-reload",
+    "fi",
+    // Always ensure userspace networking + proxy listeners.
+    "touch /etc/default/tailscaled",
+    `if grep -q '^FLAGS=' /etc/default/tailscaled; then`,
+    `  sed -i 's|^FLAGS=.*|FLAGS="--tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:${port} --socks5-server=127.0.0.1:${port}"|' /etc/default/tailscaled`,
+    "else",
+    `  echo 'FLAGS="--tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:${port} --socks5-server=127.0.0.1:${port}"' >> /etc/default/tailscaled`,
+    "fi",
+    "systemctl reset-failed tailscaled >/dev/null 2>&1 || true",
+    "systemctl daemon-reload",
+    "systemctl restart tailscaled",
+    "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do",
+    "  if tailscale --socket=/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then break; fi",
+    "  sleep 1",
+    "done",
+    `if ! tailscale --socket=/run/tailscale/tailscaled.sock status --self=true --peers=false --json 2>/dev/null | grep -q '"Online": *true'; then`,
+    `  echo "[freestyle-vm-ssh] joining tailnet as ${hostname}…"`,
+    `  tailscale --socket=/run/tailscale/tailscaled.sock up --authkey=${shellQuote(authKey)} --hostname=${shellQuote(hostname)} --ssh=false --reset >/dev/null`,
+    "fi",
+    // System-wide proxy env so any login shell, codex, claude, etc. honour it.
+    `cat > /etc/profile.d/cmux-tailnet-proxy.sh <<'PROF'`,
+    `export HTTP_PROXY=http://127.0.0.1:${port}`,
+    `export HTTPS_PROXY=http://127.0.0.1:${port}`,
+    `export http_proxy=http://127.0.0.1:${port}`,
+    `export https_proxy=http://127.0.0.1:${port}`,
+    `export NO_PROXY=localhost,127.0.0.1,::1`,
+    `export no_proxy=localhost,127.0.0.1,::1`,
+    `PROF`,
+    "chmod 0644 /etc/profile.d/cmux-tailnet-proxy.sh",
+    `printf '[freestyle-vm-ssh] tailscale ip: %s\\n' "$(tailscale --socket=/run/tailscale/tailscaled.sock ip -4 2>/dev/null | head -1)"`,
+    `printf '[freestyle-vm-ssh] http proxy: 127.0.0.1:${port} (HTTP_PROXY exported via /etc/profile.d/cmux-tailnet-proxy.sh)\\n'`,
+  ].join("\n");
+}
+
 function printHelp() {
   process.stderr.write(
     [
       "freestyle-vm-ssh <vmId> [options]",
-      "  --user <name>            Linux user (default: cmux)",
-      "  --subrouter-port <port>  Local subrouter port (default: 31415, used",
-      "                           with --reverse-subrouter)",
-      "  --subrouter-url <url>    Subrouter base URL to bake into the VM's",
-      "                           codex config (e.g. http://100.x.y.z:31415/v1",
-      "                           for a tailnet-hosted gateway).",
-      "  --reverse-subrouter      Add `-R <port>:127.0.0.1:<port>` to forward",
-      "                           a local subrouter into the VM. Note: the",
-      "                           Freestyle SSH gateway currently rejects",
-      "                           reverse forwards, so this only works for",
-      "                           ordinary Linux/macOS sshd hosts.",
-      "  --forward <port>         Local-forward port; can be repeated.",
-      "                           Defaults to 3000 5173 8000 8080.",
-      "  --codex-config <path>    Path to write codex config inside the VM",
-      "                           (default: $HOME/.codex/config.toml).",
-      "  --no-codex-config        Don't touch codex config inside the VM.",
+      "  --user <name>             Linux user (default: cmux)",
+      "  --tailscale|--no-tailscale  Default: --tailscale. Installs tailscale",
+      "                            inside the VM (idempotent) and joins the",
+      "                            user's tailnet using an ephemeral preauth",
+      "                            key minted via `tsadmin api POST",
+      "                            /tailnet/-/keys`. With --no-tailscale,",
+      "                            skip the join entirely.",
+      "  --tailscale-authkey <k>   Explicit auth key; falls back to",
+      "                            $TAILSCALE_AUTHKEY then to a fresh tsadmin",
+      "                            mint with tags=tag:server.",
+      "  --tailscale-hostname <n>  Default: fs-<vmid[:8]>",
+      "  --subrouter-url <url>     Subrouter base URL written into the VM's",
+      `                            codex config. Default when --tailscale is`,
+      `                            on: ${DEFAULT_TAILNET_SUBROUTER_URL}`,
+      "  --subrouter-port <port>   Local subrouter port for --reverse-subrouter",
+      "                            (default: 31415)",
+      "  --reverse-subrouter       Add `-R <port>:127.0.0.1:<port>` for a",
+      "                            local subrouter. Note: the Freestyle SSH",
+      "                            gateway rejects this; only works for",
+      "                            ordinary Linux/macOS sshd hosts.",
+      "  --forward <port>          Local-forward port; can be repeated.",
+      "                            Defaults to 3000 5173 8000 8080.",
+      "  --codex-config <path>     Path to write codex config inside the VM",
+      "                            (default: $HOME/.codex/config.toml).",
+      "  --no-codex-config         Don't touch codex config inside the VM.",
       "",
       "Env:",
-      "  FREESTYLE_API_KEY        required",
-      "  SUBROUTER_REMOTE_URL     used as --subrouter-url when not provided",
+      "  FREESTYLE_API_KEY         required",
+      "  SUBROUTER_REMOTE_URL      used as --subrouter-url when not provided",
+      "  TAILSCALE_AUTHKEY         used as --tailscale-authkey when not provided",
       "",
     ].join("\n"),
   );
