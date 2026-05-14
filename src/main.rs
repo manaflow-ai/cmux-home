@@ -957,7 +957,7 @@ impl App {
                 "description": prompt,
                 "initial_command": command,
                 "cwd": self.workspace_cwd,
-                "focus": true,
+                "focus": false,
             }),
         )?;
         let workspace_id = string_field(&created, "workspace_id")
