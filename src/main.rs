@@ -1542,22 +1542,6 @@ impl App {
         }
     }
 
-    fn provider_toggle_label(&self) -> &'static str {
-        self.provider.toggle().label()
-    }
-
-    fn provider_toggle_kind(&self) -> AgentKind {
-        self.provider.toggle()
-    }
-
-    fn plan_toggle_label(&self) -> &'static str {
-        if self.plan_mode {
-            "build"
-        } else {
-            "plan"
-        }
-    }
-
     fn toggle_provider(&mut self) {
         self.provider = self.provider.toggle();
         self.status_line = format!("agent {}", self.agent_label());
@@ -3895,22 +3879,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
                     return;
                 }
-                let plan_label = app.plan_toggle_label();
-                let plan_style = if plan_label == "plan" {
-                    purple_style()
-                } else {
-                    muted_style()
-                };
-                let toggle_kind = app.provider_toggle_kind();
                 let mut help_spans = current_agent_mode_spans(app);
                 help_spans.extend([
-                    Span::styled(" · enter create · ctrl+s stash · tab ", muted_style()),
                     Span::styled(
-                        app.provider_toggle_label().to_string(),
-                        agent_style(toggle_kind, false),
+                        " · enter create · ctrl+s stash · tab switch agent",
+                        muted_style(),
                     ),
-                    Span::styled(" · shift+tab ", muted_style()),
-                    Span::styled(plan_label.to_string(), plan_style),
+                    Span::styled(" · shift+tab switch mode", muted_style()),
                     Span::styled(" · esc clear", muted_style()),
                 ]);
                 frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
@@ -3924,23 +3899,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "  enter to open · space to reply · ctrl+x to delete"
     };
-    let plan_label = app.plan_toggle_label();
-    let plan_style = if plan_label == "plan" {
-        purple_style()
-    } else {
-        muted_style()
-    };
-    let toggle_kind = app.provider_toggle_kind();
     let mut help_spans = current_agent_mode_spans(app);
     help_spans.extend([
         Span::styled(format!(" · {}", prefix.trim()), muted_style()),
-        Span::styled(" · tab ", muted_style()),
-        Span::styled(
-            app.provider_toggle_label().to_string(),
-            agent_style(toggle_kind, false),
-        ),
-        Span::styled(" · shift+tab ", muted_style()),
-        Span::styled(plan_label.to_string(), plan_style),
+        Span::styled(" · tab switch agent", muted_style()),
+        Span::styled(" · shift+tab switch mode", muted_style()),
         Span::styled(" · ? for shortcuts", muted_style()),
     ]);
     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
