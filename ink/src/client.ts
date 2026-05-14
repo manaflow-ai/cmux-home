@@ -269,6 +269,7 @@ function coerceWorkspace(raw: unknown): Workspace | null {
     statuses: coerceStatuses(obj),
     unreadNotifications: 0,
     latestMessage: description ?? "",
+    updatedAt: null,
   };
 }
 

@@ -13,6 +13,7 @@ export interface Workspace {
   statuses: Record<string, string>;
   unreadNotifications: number;
   latestMessage: string;
+  updatedAt: number | null;
 }
 
 export interface Notification {
