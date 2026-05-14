@@ -612,24 +612,21 @@ impl App {
         let previous = self
             .workspaces
             .iter()
-            .map(|workspace| {
-                (
-                    workspace.id.clone(),
-                    (workspace.fingerprint(), workspace.updated_at),
-                )
-            })
+            .map(|workspace| (workspace.id.clone(), workspace.clone()))
             .collect::<HashMap<_, _>>();
         self.workspaces = snapshot
             .workspaces
             .into_iter()
             .map(|mut workspace| {
-                workspace.updated_at = previous
-                    .get(&workspace.id)
-                    .and_then(|(fingerprint, updated_at)| {
-                        (fingerprint == &workspace.fingerprint()).then_some(*updated_at)
-                    })
-                    .flatten()
-                    .or(Some(snapshot.loaded_at));
+                if let Some(existing) = previous.get(&workspace.id) {
+                    preserve_optimistic_submission(existing, &mut workspace);
+                    workspace.updated_at = (existing.fingerprint() == workspace.fingerprint())
+                        .then_some(existing.updated_at)
+                        .flatten()
+                        .or(Some(snapshot.loaded_at));
+                } else {
+                    workspace.updated_at = Some(snapshot.loaded_at);
+                }
                 workspace
             })
             .collect();
@@ -676,13 +673,15 @@ impl App {
                     .workspaces
                     .iter()
                     .find(|workspace| workspace.id == refreshed.id);
-                refreshed.updated_at = previous
-                    .and_then(|workspace| {
-                        (workspace.fingerprint() == refreshed.fingerprint())
-                            .then_some(workspace.updated_at)
-                    })
-                    .flatten()
-                    .or(Some(snapshot.loaded_at));
+                if let Some(existing) = previous {
+                    preserve_optimistic_submission(existing, &mut refreshed);
+                    refreshed.updated_at = (existing.fingerprint() == refreshed.fingerprint())
+                        .then_some(existing.updated_at)
+                        .flatten()
+                        .or(Some(snapshot.loaded_at));
+                } else {
+                    refreshed.updated_at = Some(snapshot.loaded_at);
+                }
                 if let Some(existing) = self
                     .workspaces
                     .iter_mut()
@@ -690,7 +689,7 @@ impl App {
                 {
                     *existing = refreshed;
                 } else {
-                    self.workspaces.push(refreshed);
+                    self.workspaces.insert(0, refreshed);
                 }
             }
             None => {
@@ -723,23 +722,8 @@ impl App {
                 {
                     return None;
                 }
-                self.workspaces.push(WorkspaceStatus {
-                    id: workspace_id.to_string(),
-                    title: event_title(frame)
-                        .unwrap_or_else(|| workspace_id.chars().take(8).collect()),
-                    latest_message: event_description(frame)
-                        .unwrap_or_else(|| "standing by for task".to_string()),
-                    selected: frame
-                        .payload
-                        .get("selected")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    pinned: false,
-                    statuses: HashMap::new(),
-                    unread_notifications: 0,
-                    conversation: None,
-                    updated_at: Some(Instant::now()),
-                });
+                self.workspaces
+                    .insert(0, workspace_from_created_event(frame, workspace_id));
                 Some(RefreshRequest::Workspace {
                     workspace_id: workspace_id.to_string(),
                     reason: "workspace created".to_string(),
@@ -1049,7 +1033,7 @@ impl App {
         {
             *existing = workspace;
         } else {
-            self.workspaces.push(workspace);
+            self.workspaces.insert(0, workspace);
         }
     }
 
@@ -4669,6 +4653,74 @@ fn event_description(frame: &EventFrame) -> Option<String> {
         .map(str::to_string)
 }
 
+fn workspace_from_created_event(frame: &EventFrame, workspace_id: &str) -> WorkspaceStatus {
+    let title = event_title(frame).unwrap_or_else(|| workspace_id.chars().take(8).collect());
+    let latest_message = event_description(frame)
+        .filter(|description| !description.trim().is_empty())
+        .map(|description| one_line_preview(&description, 120))
+        .or_else(|| prompt_preview_from_title(&title))
+        .unwrap_or_else(|| "starting workspace".to_string());
+    WorkspaceStatus {
+        id: workspace_id.to_string(),
+        title,
+        latest_message: latest_message.clone(),
+        selected: frame
+            .payload
+            .get("selected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        pinned: false,
+        statuses: HashMap::new(),
+        unread_notifications: 0,
+        conversation: Some(ConversationSnapshot {
+            actor: ConversationActor::User,
+            preview: latest_message,
+            modified_at: SystemTime::now(),
+        }),
+        updated_at: Some(Instant::now()),
+    }
+}
+
+fn prompt_preview_from_title(title: &str) -> Option<String> {
+    let (_, prompt) = title.split_once(':')?;
+    let prompt = prompt.trim();
+    (!prompt.is_empty()).then(|| one_line_preview(prompt, 120))
+}
+
+fn preserve_optimistic_submission(existing: &WorkspaceStatus, refreshed: &mut WorkspaceStatus) {
+    if refreshed.conversation.is_some()
+        || refreshed.unread_notifications > 0
+        || has_agent_status(&refreshed.statuses)
+    {
+        return;
+    }
+    let Some(conversation) = existing.conversation.as_ref() else {
+        return;
+    };
+    if conversation.actor != ConversationActor::User
+        || conversation
+            .modified_at
+            .elapsed()
+            .unwrap_or(Duration::from_secs(0))
+            > Duration::from_secs(300)
+    {
+        return;
+    }
+    refreshed.conversation = Some(conversation.clone());
+    if refreshed.latest_message.trim().is_empty()
+        || refreshed.latest_message == "standing by for task"
+    {
+        refreshed.latest_message = existing.latest_message.clone();
+    }
+}
+
+fn has_agent_status(statuses: &HashMap<String, String>) -> bool {
+    statuses.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        key == "codex" || key == "claude" || key == "claude_code"
+    })
+}
+
 fn notification_is_unread(frame: &EventFrame) -> bool {
     frame
         .payload
@@ -4854,6 +4906,51 @@ mod tests {
         ]);
 
         assert_eq!(value_preview(&content).as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn created_workspace_event_starts_in_working_group() {
+        let frame = EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("workspace:1".to_string()),
+            payload: json!({
+                "workspace_id": "workspace:1",
+                "title": "codex: fix submit flicker",
+                "selected": false
+            }),
+        };
+
+        let workspace = workspace_from_created_event(&frame, "workspace:1");
+
+        assert_eq!(workspace.latest_message, "fix submit flicker");
+        assert_eq!(display_group(workspace.agent_state()), AgentState::Working);
+    }
+
+    #[test]
+    fn empty_refresh_preserves_recent_optimistic_submission() {
+        let existing = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix submit flicker".to_string(),
+            latest_message: "fix submit flicker".to_string(),
+            conversation: Some(ConversationSnapshot {
+                actor: ConversationActor::User,
+                preview: "fix submit flicker".to_string(),
+                modified_at: SystemTime::now(),
+            }),
+            ..WorkspaceStatus::default()
+        };
+        let mut refreshed = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix submit flicker".to_string(),
+            latest_message: "standing by for task".to_string(),
+            ..WorkspaceStatus::default()
+        };
+
+        preserve_optimistic_submission(&existing, &mut refreshed);
+
+        assert_eq!(refreshed.latest_message, "fix submit flicker");
+        assert_eq!(display_group(refreshed.agent_state()), AgentState::Working);
     }
 }
 
