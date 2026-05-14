@@ -3314,11 +3314,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             ComposerMode::NewWorkspace => {
                 if slash_command_query(app).is_some() {
-                    frame.render_widget(
-                        Paragraph::new("  enter run · tab complete · esc clear")
-                            .style(muted_style()),
-                        area,
-                    );
+                    let mut help_spans = current_agent_mode_spans(app);
+                    help_spans.push(Span::styled(
+                        " · enter run · tab complete · esc clear",
+                        muted_style(),
+                    ));
+                    frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
                     return;
                 }
                 let plan_label = app.plan_toggle_label();
@@ -3328,8 +3329,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     muted_style()
                 };
                 let toggle_kind = app.provider_toggle_kind();
-                let help = Line::from(vec![
-                    Span::styled("  enter create · ctrl+s stash · tab ", muted_style()),
+                let mut help_spans = current_agent_mode_spans(app);
+                help_spans.extend([
+                    Span::styled(" · enter create · ctrl+s stash · tab ", muted_style()),
                     Span::styled(
                         app.provider_toggle_label().to_string(),
                         agent_style(toggle_kind, false),
@@ -3338,7 +3340,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Span::styled(plan_label.to_string(), plan_style),
                     Span::styled(" · esc clear", muted_style()),
                 ]);
-                frame.render_widget(Paragraph::new(help), area);
+                frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
             }
         }
         return;
@@ -3356,8 +3358,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         muted_style()
     };
     let toggle_kind = app.provider_toggle_kind();
-    let help = Line::from(vec![
-        Span::styled(prefix.to_string(), muted_style()),
+    let mut help_spans = current_agent_mode_spans(app);
+    help_spans.extend([
+        Span::styled(format!(" · {}", prefix.trim()), muted_style()),
         Span::styled(" · tab ", muted_style()),
         Span::styled(
             app.provider_toggle_label().to_string(),
@@ -3367,7 +3370,26 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(plan_label.to_string(), plan_style),
         Span::styled(" · ? for shortcuts", muted_style()),
     ]);
-    frame.render_widget(Paragraph::new(help), area);
+    frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
+}
+
+fn current_agent_mode_spans(app: &App) -> Vec<Span<'static>> {
+    vec![
+        Span::styled("  ", muted_style()),
+        Span::styled(
+            app.provider.label().to_string(),
+            agent_style(app.provider, false),
+        ),
+        Span::styled(" ".to_string(), muted_style()),
+        Span::styled(
+            if app.plan_mode { "plan" } else { "build" }.to_string(),
+            if app.plan_mode {
+                purple_style()
+            } else {
+                muted_style()
+            },
+        ),
+    ]
 }
 
 fn purple_style() -> Style {
