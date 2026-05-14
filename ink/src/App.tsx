@@ -539,6 +539,69 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     }
   }, [freestyle, refreshFreestyle]);
 
+  const submitToNewCloudSandbox = useCallback(
+    async (prompt: string) => {
+      const trimmed = prompt.trim();
+      if (!trimmed) return;
+      if (!freestyle.isEnabled()) {
+        setStatusLine("FREESTYLE_API_KEY not set; can't spawn a cloud sandbox");
+        return;
+      }
+      const snapshotId = process.env.FREESTYLE_SANDBOX_SNAPSHOT?.trim();
+      if (!snapshotId) {
+        setStatusLine("set FREESTYLE_SANDBOX_SNAPSHOT to spawn a cloud sandbox");
+        return;
+      }
+      if (submitting) return;
+      setSubmitting(true);
+      try {
+        const preview = trimmed.slice(0, 48);
+        setStatusLine(`spawning cloud sandbox for "${preview}"…`);
+        const { vmId } = await freestyle.createFromSnapshot(snapshotId);
+        const shortId = vmId.slice(0, 8);
+        setStatusLine(`waiting for vm ${shortId} to be ready…`);
+        const ready = await waitForFreestyleHealthz(vmId, 120_000);
+        if (!ready) {
+          setStatusLine(`vm ${shortId} did not become ready in 120 s; opening workspace anyway`);
+        } else {
+          setStatusLine(`vm ${shortId} ready, opening workspace…`);
+        }
+        const cmd =
+          `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
+          `--clone-cmux ` +
+          `--codex-prompt ${shellQuote(trimmed)}`;
+        const workspaceId = await client.createWorkspace({
+          title: `task: ${preview}`,
+          description: `freestyle vm ${vmId} running codex with:\n${trimmed}`,
+          initialCommand: cmd,
+          cwd: resolvedCwd,
+          focus: false,
+        });
+        try {
+          await client.createBrowserPane({
+            workspaceId,
+            url: "http://127.0.0.1:3000",
+            direction: "right",
+            focus: false,
+          });
+        } catch (err) {
+          setStatusLine(
+            `task workspace open, browser pane failed: ${(err as Error).message}`,
+          );
+        }
+        setComposer(EMPTY_COMPOSER);
+        setComposerMode({ kind: "new" });
+        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        void refreshFreestyle();
+      } catch (err) {
+        setStatusLine(`submit failed: ${(err as Error).message}`);
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting],
+  );
+
   const submitRename = useCallback(
     async (workspaceId: string): Promise<void> => {
       const title = composer.lines.join(" ").trim();
@@ -576,7 +639,17 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           return;
         }
         if (composerHasText(composer)) {
-          void submit();
+          // Default enter spawns a fresh Freestyle cloud sandbox when the
+          // environment is wired for it; falls back to the local cmux
+          // workspace path otherwise.
+          const cloudReady =
+            freestyle.isEnabled() &&
+            !!process.env.FREESTYLE_SANDBOX_SNAPSHOT?.trim();
+          if (cloudReady) {
+            void submitToNewCloudSandbox(composer.lines.join("\n"));
+          } else {
+            void submit();
+          }
         }
         return;
       }
@@ -646,7 +719,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setComposer((c) => insertText(c, input));
       }
     },
-    [composer, composerMode, submit, submitRename],
+    [composer, composerMode, submit, submitRename, submitToNewCloudSandbox],
   );
 
   useInput((input, key) => {
@@ -828,6 +901,30 @@ function Separator({ width }: { width: number }): React.JSX.Element {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+async function waitForFreestyleHealthz(
+  vmId: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const url = `https://${vmId}.vm.freestyle.sh/healthz`;
+  while (Date.now() < deadline) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 3_000);
+      try {
+        const res = await fetch(url, { signal: ctrl.signal });
+        if (res.ok) return true;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      // not ready yet
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
+  }
+  return false;
 }
 
 function statusesEqual(

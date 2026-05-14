@@ -14,6 +14,7 @@
 //     [--tailscale | --no-tailscale]     # default: --tailscale (install + join via tsadmin auth-key)
 //     [--tailscale-authkey <key>]        # explicit; else mint via `tsadmin api POST /tailnet/-/keys`
 //     [--tailscale-hostname <name>]      # default: fs-<vmid-short>
+//     [--codex-prompt "<text>"]          # auto-launch interactive codex with this prompt
 //
 // On exit, the script revokes the freestyle identity it created.
 
@@ -270,11 +271,39 @@ try {
   }
   remoteSteps.push(
     `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n'`,
-    `exec bash -l`,
   );
+
+  let codexCwd = "$HOME";
+  if (args.cloneCmux) {
+    const cloneScript = buildCmuxCloneBootstrap();
+    const encodedClone = Buffer.from(cloneScript, "utf8").toString("base64");
+    remoteSteps.push(
+      `printf '%s' ${shellQuote(encodedClone)} | base64 -d | bash`,
+    );
+    codexCwd = "$HOME/cmux/web";
+  }
+
+  if (args.codexPrompt && args.codexPrompt.trim()) {
+    // Launch codex with the prompt pre-loaded, then drop into a login shell
+    // when codex exits so the user can keep iterating. `bash -lc 'codex "$@";
+    // exec bash -l' cmux <prompt>` puts the prompt in $1, expands cleanly,
+    // and the outer login shell sources /etc/profile.d/cmux-tailnet-proxy.sh
+    // so codex sees HTTP_PROXY.
+    const previewLine = `[freestyle-vm-ssh] launching codex with prompt: ${args.codexPrompt.slice(0, 120).replace(/\\/g, "\\\\").replace(/'/g, "'\\''").replace(/\n/g, " ")}`;
+    remoteSteps.push(
+      `printf '%s\\n\\n' ${shellQuote(previewLine)}`,
+      `cd ${codexCwd} && exec bash -lc 'cd "$1" && codex "$2" || true; exec bash -l' cmux-home ${codexCwd} ${shellQuote(args.codexPrompt)}`,
+    );
+  } else {
+    remoteSteps.push(`cd ${codexCwd} && exec bash -l`);
+  }
   const remoteCommand = remoteSteps.join(" && ");
 
-  const finalArgs = ["-e", "ssh", ...baseSshArgs, "-t", remoteHost, remoteCommand];
+  // Force TTY allocation. Single -t downgrades to no TTY when our stdin
+  // isn't a terminal (it isn't, when called from cmux's workspace
+  // initial_command since cmux pipes through). -tt forces it; the remote
+  // bash chain (and codex once running) expects a TTY.
+  const finalArgs = ["-e", "ssh", ...baseSshArgs, "-tt", remoteHost, remoteCommand];
 
   const reverseLog = args.useReverseForward
     ? `-R ${args.subrouterPort}:127.0.0.1:${args.subrouterPort} `
@@ -321,6 +350,8 @@ function parseArgs(argv) {
     tailscaleAuthkey: null,
     tailscaleHostname: null,
     subrouterAccountId: null,
+    codexPrompt: null,
+    cloneCmux: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -370,6 +401,12 @@ function parseArgs(argv) {
         break;
       case "--subrouter-account-id":
         out.subrouterAccountId = argv[++i] ?? null;
+        break;
+      case "--codex-prompt":
+        out.codexPrompt = argv[++i] ?? null;
+        break;
+      case "--clone-cmux":
+        out.cloneCmux = true;
         break;
     }
   }
@@ -431,6 +468,52 @@ function mintTailscaleAuthKey({ tags, description }) {
     );
     return null;
   }
+}
+
+function buildCmuxCloneBootstrap() {
+  // Idempotent: clones manaflow-ai/cmux into ~/cmux on the first run, then
+  // `git pull --ff-only` on every subsequent run. Writes a stub
+  // ~/.secrets/cmuxterm-dev.env so cmux's dev-local.sh script doesn't bail
+  // on missing secrets, runs `bun install` in web/, then launches `bun dev`
+  // on port 3000 in the background unless something is already listening.
+  return [
+    "set -e",
+    "if [ ! -d $HOME/cmux/.git ]; then",
+    '  echo "[freestyle-vm-ssh] cloning manaflow-ai/cmux…"',
+    "  git clone --depth 50 https://github.com/manaflow-ai/cmux.git $HOME/cmux",
+    "else",
+    '  echo "[freestyle-vm-ssh] git pull cmux"',
+    "  git -C $HOME/cmux fetch --quiet origin main",
+    "  git -C $HOME/cmux checkout --quiet main || true",
+    "  git -C $HOME/cmux pull --quiet --ff-only origin main || true",
+    "fi",
+    "mkdir -p $HOME/.secrets",
+    "if [ ! -f $HOME/.secrets/cmuxterm-dev.env ]; then",
+    "  cat > $HOME/.secrets/cmuxterm-dev.env <<'STUB'",
+    "# Stub written by freestyle-vm-ssh so cmux web's dev-local.sh proceeds.",
+    "# Most routes will 500 without real Stack Auth + Convex secrets, but the",
+    "# top-level Next.js dev server still binds and renders public pages.",
+    "STACK_SECRET_SERVER_KEY=stub",
+    "NEXT_PUBLIC_STACK_PROJECT_ID=stub",
+    "NEXT_PUBLIC_STACK_PUBLISHABLE_CLIENT_KEY=stub",
+    "STUB",
+    "fi",
+    'if ! ss -tnlp 2>/dev/null | grep -q ":3000 "; then',
+    '  echo "[freestyle-vm-ssh] starting cmux web dev server on port 3000…"',
+    "  cd $HOME/cmux/web && bun install --silent >/tmp/cmux-bun-install.log 2>&1 || true",
+    // cmux web's dev-local.sh prefers CMUX_PORT over PORT. Bind to 3000 so it
+    // lands on the SSH-forwarded port.
+    //
+    // setsid puts the dev server in its own session + process group so SIGHUP
+    // from the closing SSH session doesn't cascade into bun → bash → next.
+    // nohup alone isn't enough because the SIGHUP-ignore doesn't survive
+    // bun's `exec` of bash + dev-local.sh's child processes.
+    "  cd $HOME/cmux/web && setsid -f bash -c 'CMUX_PORT=3000 CMUX_DEV_START_DB=0 CMUX_DEV_STOP_DB_ON_EXIT=0 exec bun dev' </dev/null >/tmp/cmux-dev.log 2>&1",
+    '  printf "[freestyle-vm-ssh] dev server starting on :3000; log at /tmp/cmux-dev.log\\n"',
+    "else",
+    '  echo "[freestyle-vm-ssh] dev server already listening on :3000"',
+    "fi",
+  ].join("\n");
 }
 
 function buildTailscaleBootstrap({ authKey, hostname, proxyPort }) {
