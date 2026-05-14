@@ -718,6 +718,10 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         void launchVmSandbox(selectedVm);
         return;
       }
+      if (selectedRow?.kind === "vm-header") {
+        void createVmFromDefaultSnapshot();
+        return;
+      }
       return;
     }
     if (key.ctrl && input === "o") {
@@ -749,12 +753,6 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
             setStatusLine("");
           }, 3_000);
         }
-      }
-      return;
-    }
-    if (key.ctrl && input === "n") {
-      if (selectedRow?.kind === "vm-header") {
-        void createVmFromDefaultSnapshot();
       }
       return;
     }

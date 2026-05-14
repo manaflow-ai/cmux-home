@@ -120,41 +120,65 @@ try {
     "-o", "LogLevel=ERROR",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=4",
-    // Reverse-forward the local subrouter so the VM can reach the local
-    // AI gateway at 127.0.0.1:<subrouterPort>.
-    "-R", `${args.subrouterPort}:127.0.0.1:${args.subrouterPort}`,
   ];
+  if (args.useReverseForward) {
+    // Reverse-forward the local subrouter so the VM can reach the local
+    // AI gateway at 127.0.0.1:<subrouterPort>. The Freestyle SSH gateway
+    // currently rejects this (`remote port forwarding failed`); pass
+    // --reverse-subrouter to opt in on hosts that allow it (e.g. an
+    // ordinary cmux Linux/macOS box behind a normal sshd).
+    baseSshArgs.push("-R", `${args.subrouterPort}:127.0.0.1:${args.subrouterPort}`);
+  }
   for (const port of args.forwardPorts) {
     baseSshArgs.push("-L", `${port}:127.0.0.1:${port}`);
   }
 
+  // Decide which subrouter URL to bake into the codex config inside the VM.
+  // Priority:
+  //   1. --subrouter-url <url>  (explicit override; recommended for Tailscale
+  //                              or any reachable public/private gateway).
+  //   2. SUBROUTER_REMOTE_URL env (same idea, env-driven).
+  //   3. --reverse-subrouter    (try the SSH -R path: subrouter on the local
+  //                              mac, exposed inside the VM as
+  //                              http://127.0.0.1:<port>/v1).
+  //   4. Otherwise: skip writing codex config and warn the user.
+  const subrouterUrlForVm =
+    args.subrouterUrl
+      ?? process.env.SUBROUTER_REMOTE_URL?.trim()
+      ?? (args.useReverseForward ? `http://127.0.0.1:${args.subrouterPort}/v1` : null);
+
   let remoteCommand = "";
-  if (args.codexConfigPath !== null) {
+  if (args.codexConfigPath !== null && subrouterUrlForVm) {
     const remoteConfigPath = args.codexConfigPath ?? "$HOME/.codex/config.toml";
     const remoteConfigDir = "$HOME/.codex";
     const codexConfigBody =
-      `# Written by freestyle-vm-ssh so codex routes through the local subrouter\n` +
-      `# via the SSH reverse forward on 127.0.0.1:${args.subrouterPort}.\n` +
-      `openai_base_url = "http://127.0.0.1:${args.subrouterPort}/v1"\n`;
+      `# Written by freestyle-vm-ssh so codex routes through Subrouter.\n` +
+      `openai_base_url = "${subrouterUrlForVm}"\n`;
     const encodedConfig = Buffer.from(codexConfigBody, "utf8").toString("base64");
     remoteCommand =
       `mkdir -p ${shellQuote(remoteConfigDir)} && ` +
       `printf '%s' ${shellQuote(encodedConfig)} | base64 -d > ${shellQuote(remoteConfigPath)} && ` +
       `chmod 600 ${shellQuote(remoteConfigPath)} && ` +
-      `printf '\\n[freestyle-vm-ssh] codex configured to use subrouter at 127.0.0.1:${args.subrouterPort}\\n' && ` +
+      `printf '\\n[freestyle-vm-ssh] codex configured to use subrouter at ${subrouterUrlForVm}\\n' && ` +
       `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n' && ` +
       `exec bash -l`;
   } else {
-    remoteCommand = "exec bash -l";
+    const note = args.codexConfigPath === null
+      ? "(codex config write disabled via --no-codex-config)"
+      : "(no subrouter URL: pass --subrouter-url <url>, set SUBROUTER_REMOTE_URL, or --reverse-subrouter on hosts that allow it)";
+    remoteCommand =
+      `printf '\\n[freestyle-vm-ssh] no codex routing configured ${note}.\\n' && ` +
+      `printf '[freestyle-vm-ssh] forwarded local ports: ${args.forwardPorts.join(",")}\\n\\n' && ` +
+      `exec bash -l`;
   }
 
   const finalArgs = ["-e", "ssh", ...baseSshArgs, "-t", remoteHost, remoteCommand];
 
-  process.stderr.write(
-    `[freestyle-vm-ssh] ssh -R ${args.subrouterPort}:127.0.0.1:${args.subrouterPort} ` +
-      args.forwardPorts.map((p) => `-L ${p}:127.0.0.1:${p}`).join(" ") +
-      ` ${remoteHost}\n`,
-  );
+  const reverseLog = args.useReverseForward
+    ? `-R ${args.subrouterPort}:127.0.0.1:${args.subrouterPort} `
+    : "";
+  const forwardLog = args.forwardPorts.map((p) => `-L ${p}:127.0.0.1:${p}`).join(" ");
+  process.stderr.write(`[freestyle-vm-ssh] ssh ${reverseLog}${forwardLog} ${remoteHost}\n`);
 
   const child = spawn("sshpass", finalArgs, {
     stdio: "inherit",
@@ -188,6 +212,8 @@ function parseArgs(argv) {
     subrouterPort: 31415,
     forwardPorts: [],
     codexConfigPath: undefined,
+    useReverseForward: false,
+    subrouterUrl: null,
     passwordFile: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -202,6 +228,12 @@ function parseArgs(argv) {
         break;
       case "--subrouter-port":
         out.subrouterPort = Number.parseInt(argv[++i] ?? "31415", 10) || 31415;
+        break;
+      case "--subrouter-url":
+        out.subrouterUrl = argv[++i] ?? null;
+        break;
+      case "--reverse-subrouter":
+        out.useReverseForward = true;
         break;
       case "--forward":
       case "-L": {
@@ -238,15 +270,25 @@ function printHelp() {
     [
       "freestyle-vm-ssh <vmId> [options]",
       "  --user <name>            Linux user (default: cmux)",
-      "  --subrouter-port <port>  Local subrouter port (default: 31415)",
-      "  --forward <port>         Forward local port; can be repeated.",
+      "  --subrouter-port <port>  Local subrouter port (default: 31415, used",
+      "                           with --reverse-subrouter)",
+      "  --subrouter-url <url>    Subrouter base URL to bake into the VM's",
+      "                           codex config (e.g. http://100.x.y.z:31415/v1",
+      "                           for a tailnet-hosted gateway).",
+      "  --reverse-subrouter      Add `-R <port>:127.0.0.1:<port>` to forward",
+      "                           a local subrouter into the VM. Note: the",
+      "                           Freestyle SSH gateway currently rejects",
+      "                           reverse forwards, so this only works for",
+      "                           ordinary Linux/macOS sshd hosts.",
+      "  --forward <port>         Local-forward port; can be repeated.",
       "                           Defaults to 3000 5173 8000 8080.",
       "  --codex-config <path>    Path to write codex config inside the VM",
-      "                           (default: $HOME/.codex/config.toml)",
-      "  --no-codex-config        Don't touch codex config inside the VM",
+      "                           (default: $HOME/.codex/config.toml).",
+      "  --no-codex-config        Don't touch codex config inside the VM.",
       "",
       "Env:",
       "  FREESTYLE_API_KEY        required",
+      "  SUBROUTER_REMOTE_URL     used as --subrouter-url when not provided",
       "",
     ].join("\n"),
   );

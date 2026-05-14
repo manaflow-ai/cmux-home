@@ -116,7 +116,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
       <Box>
         <CurrentMode provider={props.provider} planMode={props.planMode} />
         <Text color={COLORS.muted}>
-          {" · ctrl+n new VM from FREESTYLE_SANDBOX_SNAPSHOT · ? for shortcuts"}
+          {" · enter new VM from FREESTYLE_SANDBOX_SNAPSHOT · ? for shortcuts"}
         </Text>
       </Box>
     );
