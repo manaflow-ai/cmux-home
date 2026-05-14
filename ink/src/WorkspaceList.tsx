@@ -94,7 +94,7 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
   );
 }
 
-function HeaderRow({
+const HeaderRow = React.memo(function HeaderRow({
   label,
   selected,
   width,
@@ -118,9 +118,9 @@ function HeaderRow({
       <Text color={COLORS.muted}>{text}</Text>
     </Box>
   );
-}
+});
 
-function WorkspaceRow({
+const WorkspaceRow = React.memo(function WorkspaceRow({
   workspace,
   selected,
   width,
@@ -181,7 +181,7 @@ function WorkspaceRow({
       </Text>
     </Box>
   );
-}
+});
 
 export function selectableRowBefore(rows: ListRow[], selected: number): number {
   for (let i = selected - 1; i >= 0; i -= 1) {

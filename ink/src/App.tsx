@@ -8,7 +8,13 @@ import React, {
 import { Box, Text, useApp, useInput, useStdout } from "ink";
 import type { Key } from "ink";
 import { CmuxClient, defaultSocketPath } from "./client.js";
-import { COLORS, SPINNER_INTERVAL_MS } from "./format.js";
+import {
+  COLORS,
+  SPINNER_FRAMES,
+  SPINNER_INTERVAL_MS,
+  agentState,
+  displayGroup,
+} from "./format.js";
 import type { AgentKind, AgentState, Workspace } from "./types.js";
 import {
   buildVisibleRows,
@@ -77,7 +83,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [selected, setSelected] = useState<number>(0);
   const [listScroll, setListScroll] = useState<number>(0);
   const [showShortcuts, setShowShortcuts] = useState<boolean>(false);
-  const [statusLine, setStatusLine] = useState<string>("starting");
+  const [statusLine, setStatusLine] = useState<string>("");
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [quitTap, setQuitTap] = useState<QuitTap | null>(null);
   const [spinnerTick, setSpinnerTick] = useState<number>(0);
@@ -104,14 +110,24 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     };
   }, [stdout]);
 
-  // Spinner tick.
+  // Spinner only ticks when there is at least one workspace in the
+  // "working" group; otherwise it would cause a full re-render every
+  // SPINNER_INTERVAL_MS for no visible change.
+  const hasWorkingWorkspace = useMemo(
+    () =>
+      workspaces.some(
+        (ws) => agentState(ws) === "working" || displayGroup(agentState(ws)) === "working",
+      ),
+    [workspaces],
+  );
   useEffect(() => {
+    if (!hasWorkingWorkspace) return;
     const id = setInterval(
-      () => setSpinnerTick((t) => (t + 1) % 1000),
+      () => setSpinnerTick((t) => (t + 1) % SPINNER_FRAMES.length),
       SPINNER_INTERVAL_MS,
     );
     return () => clearInterval(id);
-  }, []);
+  }, [hasWorkingWorkspace]);
 
   // Live data + event stream.
   const refresh = useCallback(
@@ -128,15 +144,41 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         }
         const now = Date.now();
         setWorkspaces((prev) => {
-          const prevByIdx = new Map<string, number>();
-          for (const ws of prev) prevByIdx.set(ws.id, ws.updatedAt ?? now);
-          return list.map((ws) => ({
-            ...ws,
-            unreadNotifications: counts.get(ws.id) ?? 0,
-            updatedAt: prevByIdx.get(ws.id) ?? now,
-          }));
+          const prevById = new Map<string, Workspace>();
+          for (const ws of prev) prevById.set(ws.id, ws);
+          const next: Workspace[] = list.map((ws) => {
+            const previous = prevById.get(ws.id);
+            const unread = counts.get(ws.id) ?? 0;
+            const updatedAt = previous?.updatedAt ?? now;
+            // Reuse the previous object identity when nothing user-visible changed
+            // so React/ink can skip re-rendering memoized row components.
+            if (
+              previous &&
+              previous.title === ws.title &&
+              previous.description === ws.description &&
+              previous.pinned === ws.pinned &&
+              previous.index === ws.index &&
+              previous.currentDirectory === ws.currentDirectory &&
+              previous.unreadNotifications === unread &&
+              statusesEqual(previous.statuses, ws.statuses)
+            ) {
+              return previous;
+            }
+            return { ...ws, unreadNotifications: unread, updatedAt };
+          });
+          // If every element is identical to prev (same ids in same order, same refs),
+          // return prev to keep the array reference stable too.
+          if (
+            next.length === prev.length &&
+            next.every((ws, i) => ws === prev[i])
+          ) {
+            return prev;
+          }
+          return next;
         });
-        setStatusLine(`${reason} · ${list.length} workspaces`);
+        // Don't update statusLine for routine refreshes; that would force the
+        // HelpBar to re-render on every cmux event even though its visible
+        // content never depends on the refresh reason.
       } catch (err) {
         setStatusLine(`refresh failed: ${(err as Error).message}`);
       }
@@ -486,6 +528,11 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       : "composer"
     : "workspace";
 
+  // Only forward a status override when it's the "press ctrl+X to quit"
+  // hint that the HelpBar actually displays. This keeps the HelpBar props
+  // stable across routine state changes so it can stay memoized.
+  const statusOverride = statusLine.startsWith("press ctrl+") ? statusLine : null;
+
   return (
     <Box flexDirection="column" width={cols} height={rows}>
       <Box flexDirection="column" flexGrow={1} overflow="hidden">
@@ -517,7 +564,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           composerSlashActive={false}
           selectedIsGroup={selectedIsGroup}
           showShortcuts={showShortcuts}
-          statusOverride={statusLine}
+          statusOverride={statusOverride}
         />
       </Box>
     </Box>
@@ -530,6 +577,17 @@ function Separator({ width }: { width: number }): React.JSX.Element {
       <Text color={COLORS.muted}>{"─".repeat(Math.max(0, width))}</Text>
     </Box>
   );
+}
+
+function statusesEqual(
+  a: Record<string, string>,
+  b: Record<string, string>,
+): boolean {
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) if (a[k] !== b[k]) return false;
+  return true;
 }
 
 function composerVisualLineCount(state: ComposerState, width: number): number {

@@ -44,7 +44,9 @@ function CurrentMode({
   );
 }
 
-export function HelpBar(props: HelpBarProps): React.JSX.Element {
+export const HelpBar = React.memo(HelpBarBase);
+
+function HelpBarBase(props: HelpBarProps): React.JSX.Element {
   if (props.showShortcuts) {
     return (
       <Box flexDirection="column">

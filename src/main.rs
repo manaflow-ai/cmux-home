@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -233,6 +233,28 @@ impl AgentState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConversationActor {
+    User,
+    Assistant,
+}
+
+impl ConversationActor {
+    fn label(self) -> &'static str {
+        match self {
+            ConversationActor::User => "user",
+            ConversationActor::Assistant => "assistant",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConversationSnapshot {
+    actor: ConversationActor,
+    preview: String,
+    modified_at: SystemTime,
+}
+
 #[derive(Clone, Debug, Default)]
 struct WorkspaceStatus {
     id: String,
@@ -242,6 +264,7 @@ struct WorkspaceStatus {
     pinned: bool,
     statuses: HashMap<String, String>,
     unread_notifications: usize,
+    conversation: Option<ConversationSnapshot>,
     updated_at: Option<Instant>,
 }
 
@@ -252,6 +275,7 @@ impl WorkspaceStatus {
         }
 
         let mut saw_status = false;
+        let mut saw_idle = false;
         for (key, value) in &self.statuses {
             let key = key.to_ascii_lowercase();
             let value = value.to_ascii_lowercase();
@@ -272,8 +296,18 @@ impl WorkspaceStatus {
                 return AgentState::Working;
             }
             if contains_any(&value, &["idle", "done", "complete", "completed"]) {
-                return AgentState::Idle;
+                saw_idle = true;
             }
+        }
+
+        match self.conversation.as_ref().map(|snapshot| snapshot.actor) {
+            Some(ConversationActor::Assistant) => return AgentState::NeedsAttention,
+            Some(ConversationActor::User) => return AgentState::Working,
+            None => {}
+        }
+
+        if saw_idle {
+            return AgentState::Idle;
         }
 
         if saw_status {
@@ -291,11 +325,15 @@ impl WorkspaceStatus {
             .collect::<Vec<_>>();
         statuses.sort();
         format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             self.title,
             self.latest_message,
             self.agent_state().label(),
             self.unread_notifications,
+            self.conversation
+                .as_ref()
+                .map(|snapshot| snapshot.actor.label())
+                .unwrap_or("none"),
             statuses.join("|")
         )
     }
@@ -991,11 +1029,16 @@ impl App {
         let workspace = WorkspaceStatus {
             id: workspace_id.clone(),
             title,
-            latest_message,
+            latest_message: latest_message.clone(),
             selected: false,
             pinned: false,
             statuses: HashMap::new(),
             unread_notifications: 0,
+            conversation: Some(ConversationSnapshot {
+                actor: ConversationActor::User,
+                preview: latest_message.clone(),
+                modified_at: SystemTime::now(),
+            }),
             updated_at: Some(Instant::now()),
         };
         if let Some(existing) = self
@@ -3996,22 +4039,28 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
-
-    let mut next = Vec::new();
     let workspaces = workspaces_payload
         .get("workspaces")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
 
+    let mut next = Vec::new();
     for item in workspaces {
+        let unread_notifications = workspace_item_keys(&item)
+            .iter()
+            .find_map(|key| unread_by_workspace.get(key))
+            .copied()
+            .unwrap_or(0);
+        let conversation = workspace_item_keys(&item)
+            .iter()
+            .find_map(|key| conversations_by_workspace.get(key));
         if let Some(workspace) = workspace_from_list_item(
             &mut client,
             &item,
-            unread_by_workspace
-                .get(string_field(&item, "id").as_deref().unwrap_or(""))
-                .copied()
-                .unwrap_or(0),
+            unread_notifications,
+            conversation,
         ) {
             next.push(workspace);
         }
@@ -4028,21 +4077,36 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
+    let workspaces = workspaces_payload
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
     let item = workspaces_payload
         .get("workspaces")
         .and_then(Value::as_array)
         .and_then(|workspaces| {
             workspaces
                 .iter()
-                .find(|item| string_field(item, "id").as_deref() == Some(workspace_id))
+                .find(|item| workspace_item_keys(item).iter().any(|key| key == workspace_id))
         });
     let Some(item) = item else {
         return Ok(None);
     };
+    let unread_notifications = workspace_item_keys(item)
+        .iter()
+        .find_map(|key| unread_by_workspace.get(key))
+        .copied()
+        .unwrap_or(0);
+    let conversation = workspace_item_keys(item)
+        .iter()
+        .find_map(|key| conversations_by_workspace.get(key));
     Ok(workspace_from_list_item(
         &mut client,
         item,
-        unread_by_workspace.get(workspace_id).copied().unwrap_or(0),
+        unread_notifications,
+        conversation,
     ))
 }
 
@@ -4050,13 +4114,20 @@ fn workspace_from_list_item(
     client: &mut CmuxClient,
     item: &Value,
     unread_notifications: usize,
+    conversation: Option<&ConversationSnapshot>,
 ) -> Option<WorkspaceStatus> {
-    let id = string_field(item, "id").unwrap_or_default();
+    let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
         return None;
     }
     let description = string_field(item, "description");
-    let latest_message = client
+    let conversation = conversation.cloned();
+    let latest_message = conversation
+        .as_ref()
+        .map(|snapshot| snapshot.preview.clone())
+        .filter(|preview| !preview.is_empty())
+        .or_else(|| {
+            client
         .v2(
             "surface.read_text",
             json!({
@@ -4068,6 +4139,7 @@ fn workspace_from_list_item(
         .ok()
         .and_then(|payload| string_field(&payload, "text"))
         .and_then(|screen| latest_message_from_screen(&screen))
+        })
         .or_else(|| description.clone())
         .unwrap_or_else(|| "standing by for task".to_string());
     let mut workspace = WorkspaceStatus {
@@ -4081,6 +4153,7 @@ fn workspace_from_list_item(
         pinned: item.get("pinned").and_then(Value::as_bool).unwrap_or(false),
         statuses: HashMap::new(),
         unread_notifications,
+        conversation,
         updated_at: None,
     };
     if let Ok(sidebar) = client.v1(&format!("sidebar_state --tab={id}")) {
