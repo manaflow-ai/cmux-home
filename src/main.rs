@@ -33,6 +33,7 @@ use tui_textarea::{CursorMove, TextArea};
 const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
 const COMPOSER_CONTINUATION_PROMPT: &str = "  ";
+const MAX_AUTOCOMPLETE_ROWS: usize = 8;
 const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
     CommandSuggestion {
         command: "/history",
@@ -52,6 +53,93 @@ const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
 struct CommandSuggestion {
     command: &'static str,
     detail: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SkillEntry {
+    name: String,
+    description: String,
+    sources: Vec<String>,
+    priority: usize,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutocompleteKind {
+    Command,
+    Skill,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutocompleteItem {
+    kind: AutocompleteKind,
+    label: String,
+    insert_text: String,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusTarget {
+    MainContent,
+    Autocomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutocompleteMarker {
+    Slash,
+    Dollar,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutocompleteQuery {
+    marker: AutocompleteMarker,
+    raw: String,
+    search: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionState {
+    selected: usize,
+    scroll: usize,
+}
+
+impl SelectionState {
+    fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(len.saturating_sub(1));
+        self.scroll = self.scroll.min(len.saturating_sub(1));
+    }
+
+    fn select_previous(&mut self, len: usize) {
+        self.clamp(len);
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn select_next(&mut self, len: usize) {
+        self.clamp(len);
+        self.selected = self.selected.saturating_add(1).min(len.saturating_sub(1));
+    }
+
+    fn ensure_visible(&mut self, viewport_height: usize, len: usize) {
+        self.clamp(len);
+        let height = viewport_height.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll.saturating_add(height) {
+            self.scroll = self.selected.saturating_add(1).saturating_sub(height);
+        }
+        self.scroll = self.scroll.min(len.saturating_sub(height));
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -262,12 +350,15 @@ struct App {
     claude_plan_template: String,
     claude_submit_template: Option<String>,
     rename_template: Option<String>,
+    skills: Vec<SkillEntry>,
     provider: AgentKind,
     plan_mode: bool,
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     selected: usize,
     list_scroll: usize,
+    focus_target: FocusTarget,
+    autocomplete: SelectionState,
     view_mode: ViewMode,
     image_paths: Vec<String>,
     selected_image: Option<ImageSelection>,
@@ -383,6 +474,7 @@ impl App {
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
         let config = load_config(args.config.as_ref());
+        let skills = load_skill_entries(&workspace_cwd);
         let mut app = Self {
             socket_path,
             workspace_cwd,
@@ -401,12 +493,15 @@ impl App {
                 .unwrap_or(args.claude_plan_command),
             claude_submit_template: config.agents.claude.submit_command,
             rename_template: config.rename.command,
+            skills,
             provider: AgentKind::Codex,
             plan_mode: false,
             show_shortcuts: false,
             workspaces: Vec::new(),
             selected: 0,
             list_scroll: 0,
+            focus_target: FocusTarget::MainContent,
+            autocomplete: SelectionState::default(),
             view_mode: ViewMode::Workspaces,
             image_paths: Vec::new(),
             selected_image: None,
@@ -995,6 +1090,7 @@ impl App {
         self.image_paths.clear();
         self.selected_image = None;
         self.composer_mode = ComposerMode::NewWorkspace;
+        self.sync_focus_after_composer_change();
     }
 
     fn stash_current_draft(&mut self) {
@@ -1037,6 +1133,7 @@ impl App {
         self.view_mode = ViewMode::Stashes;
         self.selected = self.selected.min(self.stashes.len().saturating_sub(1));
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = format!("{} stashes", self.stashes.len());
     }
 
@@ -1044,6 +1141,7 @@ impl App {
         self.view_mode = ViewMode::History;
         self.selected = self.selected.min(self.history.len().saturating_sub(1));
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = format!("{} prompts", self.history.len());
     }
 
@@ -1051,6 +1149,7 @@ impl App {
         self.view_mode = ViewMode::Workspaces;
         self.selected = 0;
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = "main".to_string();
     }
 
@@ -1061,6 +1160,7 @@ impl App {
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
+        self.sync_focus_after_composer_change();
     }
 
     fn record_prompt_history(&mut self, prompt: &str, images: &[String]) {
@@ -1176,6 +1276,157 @@ impl App {
         self.composer_has_input() || matches!(self.composer_mode, ComposerMode::RenameWorkspace(_))
     }
 
+    fn autocomplete_query(&self) -> Option<AutocompleteQuery> {
+        if self.composer_mode != ComposerMode::NewWorkspace {
+            return None;
+        }
+        let text = self.composer.lines().join("\n");
+        let trimmed = text.trim_start();
+        let marker = if trimmed.starts_with('/') {
+            AutocompleteMarker::Slash
+        } else if trimmed.starts_with('$') {
+            AutocompleteMarker::Dollar
+        } else {
+            return None;
+        };
+        if trimmed.contains('\n') {
+            return None;
+        }
+        if trimmed.chars().last().is_some_and(char::is_whitespace) {
+            return None;
+        }
+        Some(AutocompleteQuery {
+            marker,
+            raw: trimmed.to_string(),
+            search: trimmed.chars().skip(1).collect::<String>(),
+        })
+    }
+
+    fn autocomplete_items(&self) -> Vec<AutocompleteItem> {
+        let Some(query) = self.autocomplete_query() else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        if query.marker == AutocompleteMarker::Slash {
+            items.extend(
+                command_suggestions_for_query(&query.raw)
+                    .into_iter()
+                    .map(|suggestion| {
+                        let insert_text = if suggestion.command == "/stash save" {
+                            "/stash save ".to_string()
+                        } else {
+                            suggestion.command.to_string()
+                        };
+                        AutocompleteItem {
+                            kind: AutocompleteKind::Command,
+                            label: suggestion.command.to_string(),
+                            insert_text,
+                            detail: suggestion.detail.to_string(),
+                        }
+                    }),
+            );
+        }
+        items.extend(self.skill_autocomplete_items(&query));
+        items
+    }
+
+    fn skill_autocomplete_items(&self, query: &AutocompleteQuery) -> Vec<AutocompleteItem> {
+        let search = query.search.trim().to_ascii_lowercase();
+        if search.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let mut matches = self
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let name = skill.name.to_ascii_lowercase();
+                let description = skill.description.to_ascii_lowercase();
+                let is_match = search.is_empty()
+                    || name.starts_with(&search)
+                    || name.contains(&search)
+                    || description.contains(&search);
+                is_match.then(|| {
+                    let source_match = skill
+                        .sources
+                        .iter()
+                        .any(|source| source.contains(self.provider.label()));
+                    let prefix_match = search.is_empty() || name.starts_with(&search);
+                    (source_match, prefix_match, skill)
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(
+            |(source_a, prefix_a, skill_a), (source_b, prefix_b, skill_b)| {
+                source_b
+                    .cmp(source_a)
+                    .then_with(|| prefix_b.cmp(prefix_a))
+                    .then_with(|| skill_a.priority.cmp(&skill_b.priority))
+                    .then_with(|| skill_a.name.cmp(&skill_b.name))
+            },
+        );
+        matches
+            .into_iter()
+            .map(|(_, _, skill)| {
+                let source = skill.sources.join(", ");
+                let detail = if skill.description.is_empty() {
+                    format!("skill · {source}")
+                } else {
+                    format!("skill · {source} · {}", skill.description)
+                };
+                AutocompleteItem {
+                    kind: AutocompleteKind::Skill,
+                    label: format!("${}", skill.name),
+                    insert_text: format!("${} ", skill.name),
+                    detail,
+                }
+            })
+            .collect()
+    }
+
+    fn autocomplete_is_active(&self) -> bool {
+        self.autocomplete_query().is_some()
+    }
+
+    fn sync_focus_after_composer_change(&mut self) {
+        if self.autocomplete_is_active() {
+            self.focus_target = FocusTarget::Autocomplete;
+            self.clamp_autocomplete_selection();
+        } else if self.focus_target == FocusTarget::Autocomplete {
+            self.focus_target = FocusTarget::MainContent;
+            self.autocomplete = SelectionState::default();
+        }
+    }
+
+    fn clamp_autocomplete_selection(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.clamp(len);
+    }
+
+    fn select_previous_autocomplete(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.select_previous(len);
+    }
+
+    fn select_next_autocomplete(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.select_next(len);
+    }
+
+    fn move_focused_selection(&mut self, direction: SelectionDirection) -> bool {
+        if self.focus_target == FocusTarget::Autocomplete && self.autocomplete_is_active() {
+            match direction {
+                SelectionDirection::Previous => self.select_previous_autocomplete(),
+                SelectionDirection::Next => self.select_next_autocomplete(),
+            }
+            return true;
+        }
+        match direction {
+            SelectionDirection::Previous => self.select_previous_main(),
+            SelectionDirection::Next => self.select_next_main(),
+        }
+        true
+    }
+
     fn composer_height(&self, screen_height: u16, screen_width: u16) -> u16 {
         if self.composer_is_active() {
             let max_height = ((u32::from(screen_height) * 3) / 4).max(1) as u16;
@@ -1198,6 +1449,14 @@ impl App {
     }
 
     fn select_previous(&mut self) {
+        self.move_focused_selection(SelectionDirection::Previous);
+    }
+
+    fn select_next(&mut self) {
+        self.move_focused_selection(SelectionDirection::Next);
+    }
+
+    fn select_previous_main(&mut self) {
         if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self.selected.saturating_sub(1);
             return;
@@ -1206,7 +1465,7 @@ impl App {
         self.selected = selectable_row_before(&rows, self.selected).unwrap_or(self.selected);
     }
 
-    fn select_next(&mut self) {
+    fn select_next_main(&mut self) {
         if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self
                 .selected
@@ -1487,6 +1746,215 @@ fn load_config(path: Option<&PathBuf>) -> AppConfig {
     path.and_then(|path| fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+fn load_skill_entries(workspace_cwd: &str) -> Vec<SkillEntry> {
+    let mut by_name = HashMap::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let workspace = PathBuf::from(workspace_cwd);
+
+    scan_skill_root(
+        &workspace.join(".codex/skills"),
+        "codex project",
+        0,
+        &mut by_name,
+    );
+    scan_skill_root(
+        &workspace.join(".claude/skills"),
+        "claude project",
+        0,
+        &mut by_name,
+    );
+    scan_skill_root(
+        &workspace.join(".agents/skills"),
+        "agents project",
+        1,
+        &mut by_name,
+    );
+    scan_skill_root(&workspace.join("skills"), "project", 1, &mut by_name);
+
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".codex")));
+    if let Some(codex_home) = codex_home {
+        scan_skill_root(&codex_home.join("skills"), "codex", 2, &mut by_name);
+        scan_skill_root(
+            &codex_home.join("skills/.system"),
+            "codex system",
+            4,
+            &mut by_name,
+        );
+        scan_plugin_skill_roots(
+            &codex_home.join("plugins/cache"),
+            "codex plugin",
+            5,
+            &mut by_name,
+        );
+    }
+
+    if let Some(home) = home.as_ref() {
+        scan_skill_root(&home.join(".agents/skills"), "agents", 3, &mut by_name);
+    }
+
+    let claude_home = std::env::var_os("CLAUDE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")));
+    if let Some(claude_home) = claude_home {
+        scan_skill_root(&claude_home.join("skills"), "claude", 2, &mut by_name);
+        scan_plugin_skill_roots(
+            &claude_home.join("plugins/cache"),
+            "claude plugin",
+            5,
+            &mut by_name,
+        );
+        scan_plugin_skill_roots(
+            &claude_home.join("plugins/marketplaces"),
+            "claude marketplace",
+            5,
+            &mut by_name,
+        );
+    }
+
+    let mut skills = by_name.into_values().collect::<Vec<SkillEntry>>();
+    skills.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    skills
+}
+
+fn scan_plugin_skill_roots(
+    root: &PathBuf,
+    source: &str,
+    priority: usize,
+    by_name: &mut HashMap<String, SkillEntry>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        scan_skill_root(&path.join("skills"), source, priority, by_name);
+        scan_skill_root(&path, source, priority + 1, by_name);
+    }
+}
+
+fn scan_skill_root(
+    root: &PathBuf,
+    source: &str,
+    priority: usize,
+    by_name: &mut HashMap<String, SkillEntry>,
+) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_path = path.join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        if let Some(skill) = parse_skill_entry(&skill_path, source, priority) {
+            merge_skill_entry(by_name, skill);
+        }
+    }
+}
+
+fn merge_skill_entry(by_name: &mut HashMap<String, SkillEntry>, skill: SkillEntry) {
+    let key = skill.name.to_ascii_lowercase();
+    if let Some(existing) = by_name.get_mut(&key) {
+        for source in skill.sources {
+            if !existing.sources.contains(&source) {
+                existing.sources.push(source);
+            }
+        }
+        if skill.priority < existing.priority
+            || (existing.description.is_empty() && !skill.description.is_empty())
+        {
+            existing.description = skill.description;
+            existing.priority = skill.priority;
+            existing.path = skill.path;
+        }
+        return;
+    }
+    by_name.insert(key, skill);
+}
+
+fn parse_skill_entry(path: &PathBuf, source: &str, priority: usize) -> Option<SkillEntry> {
+    let body = fs::read_to_string(path).ok()?;
+    let fallback_name = path.parent()?.file_name()?.to_string_lossy().to_string();
+    let mut name = String::new();
+    let mut description = String::new();
+
+    if let Some(frontmatter) = markdown_frontmatter(&body) {
+        for line in frontmatter.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let value = unquote_yaml_scalar(value.trim());
+            match key.trim() {
+                "name" if !value.is_empty() => name = value,
+                "description" if !value.is_empty() => description = value,
+                _ => {}
+            }
+        }
+    }
+
+    if name.is_empty() {
+        name = fallback_name;
+    }
+    if description.is_empty() {
+        description = markdown_first_text_line(&body).unwrap_or_default();
+    }
+    description = one_line_preview(&description, 120);
+
+    Some(SkillEntry {
+        name,
+        description,
+        sources: vec![source.to_string()],
+        priority,
+        path: path.clone(),
+    })
+}
+
+fn markdown_frontmatter(body: &str) -> Option<&str> {
+    let rest = body.strip_prefix("---\n")?;
+    let (frontmatter, _) = rest.split_once("\n---")?;
+    Some(frontmatter)
+}
+
+fn markdown_first_text_line(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && *line != "---"
+                && !line.starts_with('#')
+                && !line.starts_with("name:")
+                && !line.starts_with("description:")
+        })
+        .map(str::to_string)
+        .next()
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+    value.to_string()
 }
 
 fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
@@ -1825,6 +2293,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             app.composer.insert_newline();
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::Tab, ..
@@ -1838,7 +2307,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            if !complete_command_suggestion(app) {
+            if !complete_autocomplete_selection(app) {
                 app.toggle_provider();
             }
         }
@@ -1849,9 +2318,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_before_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1861,9 +2332,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_after_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1956,6 +2429,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
+            app.sync_focus_after_composer_change();
         }
     }
     Ok(KeyAction::Continue)
@@ -1969,6 +2443,9 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => match app.composer_mode.clone() {
             ComposerMode::NewWorkspace if app.composer_has_text() => {
+                if complete_autocomplete_selection(app) {
+                    return Ok(KeyAction::Continue);
+                }
                 if handle_composer_command(app) {
                     return Ok(KeyAction::Continue);
                 }
@@ -1992,6 +2469,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             app.composer.insert_newline();
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::BackTab,
@@ -2016,7 +2494,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            if !complete_command_suggestion(app) {
+            if !complete_autocomplete_selection(app) {
                 app.toggle_provider();
             }
         }
@@ -2032,9 +2510,11 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_before_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2044,9 +2524,11 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_after_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2074,6 +2556,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             app.selected_image = None;
             app.composer.input(key);
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::Char(' '),
@@ -2084,7 +2567,34 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
                 app.selected_image = None;
                 app.composer.input(key);
                 normalize_composer_image_paths(app);
+                app.sync_focus_after_composer_change();
             }
+        }
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if app.autocomplete_is_active() => {
+            app.focus_target = FocusTarget::Autocomplete;
+            app.select_previous_autocomplete();
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if app.autocomplete_is_active() => {
+            app.focus_target = FocusTarget::Autocomplete;
+            app.select_next_autocomplete();
         }
         KeyEvent {
             code: KeyCode::Char('a'),
@@ -2104,6 +2614,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
+            app.sync_focus_after_composer_change();
         }
     }
     Ok(KeyAction::Continue)
@@ -2150,8 +2661,8 @@ fn handle_composer_command(app: &mut App) -> bool {
         return true;
     }
 
-    if text.starts_with('/') {
-        if complete_command_suggestion(app) {
+    if text.starts_with('/') || text.starts_with('$') {
+        if complete_autocomplete_selection(app) {
             return true;
         }
         app.status_line = "unknown command".to_string();
@@ -2161,36 +2672,30 @@ fn handle_composer_command(app: &mut App) -> bool {
     false
 }
 
-fn complete_command_suggestion(app: &mut App) -> bool {
-    let Some(query) = slash_command_query(app) else {
-        return false;
-    };
-    let Some(suggestion) = command_suggestions_for_query(&query).into_iter().next() else {
-        return false;
-    };
-    let current = query.trim_end();
-    if current == suggestion.command {
+fn complete_autocomplete_selection(app: &mut App) -> bool {
+    if !app.autocomplete_is_active() {
         return false;
     }
-    let text = if suggestion.command == "/stash save" {
-        "/stash save ".to_string()
-    } else {
-        suggestion.command.to_string()
+    let items = app.autocomplete_items();
+    let Some(item) = items.get(app.autocomplete.selected).cloned() else {
+        return false;
     };
-    app.composer = composer_from_lines(vec![text]);
+    let current = app.composer.lines().join("\n").trim().to_string();
+    if item.kind == AutocompleteKind::Command && current == item.insert_text.trim_end() {
+        return false;
+    }
+    if current == item.insert_text {
+        return false;
+    }
+    app.composer = composer_from_lines(vec![item.insert_text.clone()]);
     app.composer.move_cursor(CursorMove::End);
     app.selected_image = None;
-    app.status_line = format!("command {}", suggestion.command);
+    app.status_line = match item.kind {
+        AutocompleteKind::Command => format!("command {}", item.label),
+        AutocompleteKind::Skill => format!("skill {}", item.label),
+    };
+    app.sync_focus_after_composer_change();
     true
-}
-
-fn slash_command_query(app: &App) -> Option<String> {
-    if app.composer_mode != ComposerMode::NewWorkspace {
-        return None;
-    }
-    let text = app.composer.lines().join("\n");
-    let trimmed = text.trim_start();
-    trimmed.starts_with('/').then(|| trimmed.to_string())
 }
 
 fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
@@ -2208,21 +2713,45 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
     if mouse.row >= workspace_end {
         return;
     }
+    let autocomplete_rows = autocomplete_height(app, workspace_end);
+    let autocomplete_start = workspace_end.saturating_sub(autocomplete_rows);
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.scroll_list(-3, workspace_end);
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                app.autocomplete.scroll = app.autocomplete.scroll.saturating_sub(3);
+            } else {
+                app.scroll_list(-3, autocomplete_start);
+            }
         }
         MouseEventKind::ScrollDown => {
-            app.scroll_list(3, workspace_end);
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                let len = app.autocomplete_items().len();
+                app.autocomplete.scroll = app.autocomplete.scroll.saturating_add(3).min(len);
+            } else {
+                app.scroll_list(3, autocomplete_start);
+            }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                let relative = usize::from(mouse.row.saturating_sub(autocomplete_start));
+                if relative > 0 {
+                    let index = app.autocomplete.scroll.saturating_add(relative - 1);
+                    let len = app.autocomplete_items().len();
+                    if index < len {
+                        app.autocomplete.selected = index;
+                        app.focus_target = FocusTarget::Autocomplete;
+                    }
+                }
+                return;
+            }
             if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) {
                 if mouse.row > 0 {
                     let row = app
                         .list_scroll
                         .saturating_add(usize::from(mouse.row.saturating_sub(1)));
                     app.selected = row.min(app.active_draft_list_len().saturating_sub(1));
+                    app.focus_target = FocusTarget::MainContent;
                 }
                 return;
             }
@@ -2234,6 +2763,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
                 Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
             ) {
                 app.selected = visible_index;
+                app.focus_target = FocusTarget::MainContent;
             }
         }
         _ => {}
@@ -2264,6 +2794,7 @@ fn handle_paste(app: &mut App, text: &str) {
         app.selected_image = None;
         app.composer.insert_str(text);
     }
+    app.sync_focus_after_composer_change();
 }
 
 fn normalize_composer_image_paths(app: &mut App) {
@@ -2907,10 +3438,10 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
         return;
     }
-    if slash_command_query(app).is_some() {
-        let suggestions_height = command_suggestions_height(app, area.height);
+    if app.autocomplete_is_active() {
+        let suggestions_height = autocomplete_height(app, area.height);
         if suggestions_height == 0 || suggestions_height >= area.height {
-            draw_command_suggestions(frame, area, app);
+            draw_autocomplete(frame, area, app);
             return;
         }
         let areas = Layout::default()
@@ -2918,7 +3449,7 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .constraints([Constraint::Min(1), Constraint::Length(suggestions_height)])
             .split(area);
         draw_workspace_list(frame, areas[0], app);
-        draw_command_suggestions(frame, areas[1], app);
+        draw_autocomplete(frame, areas[1], app);
         return;
     }
     draw_workspace_list(frame, area, app);
@@ -2948,37 +3479,79 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn command_suggestions_height(app: &App, available_height: u16) -> u16 {
-    let Some(query) = slash_command_query(app) else {
+fn autocomplete_height(app: &App, available_height: u16) -> u16 {
+    if !app.autocomplete_is_active() {
         return 0;
-    };
-    let row_count = command_suggestions_for_query(&query).len().max(1);
-    let desired = (row_count + 1).min(4) as u16;
+    }
+    let row_count = app.autocomplete_items().len().max(1);
+    let desired = (row_count + 1).min(MAX_AUTOCOMPLETE_ROWS + 1) as u16;
     desired.min(available_height.saturating_sub(1))
 }
 
-fn draw_command_suggestions(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let query = slash_command_query(app).unwrap_or_default();
-    let suggestions = command_suggestions_for_query(&query);
-    let mut lines = vec![Line::from(Span::styled("Commands", muted_style()))];
-    if suggestions.is_empty() {
-        lines.push(Line::from(Span::styled("  no commands", muted_style())));
+fn draw_autocomplete(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let items = app.autocomplete_items();
+    let viewport = area.height.saturating_sub(1) as usize;
+    app.autocomplete.ensure_visible(viewport, items.len());
+    let title = if app
+        .autocomplete_query()
+        .is_some_and(|query| query.marker == AutocompleteMarker::Dollar)
+    {
+        "Skills"
+    } else {
+        "Commands and skills"
+    };
+    let mut lines = vec![Line::from(Span::styled(title, muted_style()))];
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled("  no matches", muted_style())));
     } else {
         lines.extend(
-            suggestions
+            items
                 .into_iter()
-                .take(area.height.saturating_sub(1) as usize)
-                .map(|suggestion| {
-                    Line::from(vec![
-                        Span::styled("  ", muted_style()),
-                        Span::styled(suggestion.command.to_string(), input_style()),
-                        Span::styled("  ", muted_style()),
-                        Span::styled(suggestion.detail.to_string(), muted_style()),
-                    ])
+                .enumerate()
+                .skip(app.autocomplete.scroll)
+                .take(viewport)
+                .map(|(index, item)| {
+                    render_autocomplete_row(
+                        &item,
+                        index == app.autocomplete.selected,
+                        area.width as usize,
+                    )
                 }),
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_autocomplete_row(item: &AutocompleteItem, selected: bool, width: usize) -> Line<'static> {
+    let marker = match item.kind {
+        AutocompleteKind::Command => "cmd",
+        AutocompleteKind::Skill => "skill",
+    };
+    let label_width = 24;
+    let marker_width = 7;
+    let detail_width = width.saturating_sub(label_width + marker_width).max(8);
+    let label = format!("{:<label_width$}", truncate(&item.label, label_width));
+    let detail = truncate(&item.detail, detail_width);
+    let content_width = marker_width + label_width + detail.chars().count();
+    let trailing = width.saturating_sub(content_width);
+    let base_style = if selected {
+        selected_style()
+    } else {
+        muted_style()
+    };
+    Line::from(vec![
+        Span::styled(format!("  {marker:<4} "), base_style),
+        Span::styled(
+            label,
+            if selected {
+                selected_title_style()
+            } else {
+                input_style()
+            },
+        ),
+        Span::styled(detail, base_style),
+        Span::styled(" ".repeat(trailing), base_style),
+    ])
 }
 
 fn draw_draft_list(
@@ -3313,10 +3886,10 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 );
             }
             ComposerMode::NewWorkspace => {
-                if slash_command_query(app).is_some() {
+                if app.autocomplete_is_active() {
                     let mut help_spans = current_agent_mode_spans(app);
                     help_spans.push(Span::styled(
-                        " · enter run · tab complete · esc clear",
+                        " · enter/tab complete · ctrl+n/p select · esc clear",
                         muted_style(),
                     ));
                     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
