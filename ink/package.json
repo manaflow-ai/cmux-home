@@ -1,0 +1,30 @@
+{
+  "name": "cmux-home",
+  "version": "0.1.0",
+  "description": "TUI for browsing cmux workspaces and starting Claude/Codex tasks.",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "bin": {
+    "cmux-home": "bin/cmux-home.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/index.tsx",
+    "start": "tsx src/index.tsx",
+    "typecheck": "tsc -p .",
+    "build": "tsc -p . --outDir dist --noEmit false --declaration false"
+  },
+  "dependencies": {
+    "ink": "^5.1.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
