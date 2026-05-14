@@ -842,7 +842,8 @@ impl App {
     fn submit_new_workspace(&mut self) -> Result<()> {
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let images = self.image_paths.clone();
-        let command = self.render_agent_command(&images);
+        let start_prompt = self.agent_start_prompt(&prompt, &images);
+        let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
         let latest_message = if prompt.is_empty() {
             "standing by for task".to_string()
         } else {
@@ -868,7 +869,9 @@ impl App {
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
         self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
         self.select_workspace_by_id(&workspace_id);
-        self.spawn_submit_hook(&workspace_id, &prompt, &title, &images);
+        if !command_accepts_prompt {
+            self.spawn_submit_hook(&workspace_id, &prompt, &title, &images);
+        }
         self.spawn_rename_hook(&workspace_id, &prompt, &title);
         if !prompt.is_empty() || !images.is_empty() {
             let _ = client.v2(
@@ -1306,23 +1309,40 @@ impl App {
         self.status_line = format!("mode {}", self.agent_label());
     }
 
-    fn render_agent_command(&self, images: &[String]) -> String {
+    fn agent_start_prompt(&self, prompt: &str, images: &[String]) -> String {
+        let mut message = prompt.to_string();
+        if self.provider != AgentKind::Codex && !images.is_empty() {
+            if !message.is_empty() {
+                message.push_str("\n\n");
+            }
+            message.push_str("Attached images:");
+            for image in images {
+                message.push('\n');
+                message.push_str(image);
+            }
+        }
+        message
+    }
+
+    fn render_agent_command(&self, images: &[String], prompt: &str) -> (String, bool) {
         let template = match self.provider {
             AgentKind::Codex if self.plan_mode => &self.codex_plan_template,
             AgentKind::Codex => &self.codex_template,
             AgentKind::Claude if self.plan_mode => &self.claude_plan_template,
             AgentKind::Claude => &self.claude_template,
         };
+        let accepts_prompt = template.contains("{prompt}");
         let image_args = images
             .iter()
             .map(|path| format!("--image {}", shell_quote(path)))
             .collect::<Vec<_>>()
             .join(" ");
-        render_command_template_parts(
+        let command = render_command_template_parts(
             template,
-            &[("workspace_cwd", &self.workspace_cwd)],
+            &[("workspace_cwd", &self.workspace_cwd), ("prompt", prompt)],
             &[("image_args", &image_args)],
-        )
+        );
+        (command, accepts_prompt)
     }
 
     fn submit_template(&self) -> Option<&str> {
