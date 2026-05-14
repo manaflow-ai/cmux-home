@@ -6,6 +6,7 @@ import {
   GROUP_DEFINITIONS,
   SPINNER_FRAMES,
   agentState,
+  cellWidth,
   displayGroup,
   padEnd,
   timeAgo,
@@ -144,14 +145,14 @@ function WorkspaceRow({
         : "∙";
 
   const titleWidth = 28;
-  const unreadWidth = [...unreadText].length;
-  const markerWidth = [...marker].length + 1; // marker + space
-  const ageLen = [...age].length;
+  const unreadWidth = cellWidth(unreadText);
+  const markerWidth = cellWidth(marker) + 1; // marker + space
+  const ageLen = cellWidth(age);
   const fixedWidth = unreadWidth + markerWidth + titleWidth + 2 + ageLen;
   const messageWidth = Math.max(8, width - fixedWidth);
   const title = padEnd(truncate(workspace.title, titleWidth), titleWidth);
   const message = truncate(workspace.latestMessage, messageWidth);
-  const messageLen = [...message].length;
+  const messageLen = cellWidth(message);
   const gap = Math.max(
     1,
     width - (unreadWidth + markerWidth + titleWidth + 1 + messageLen) - ageLen,

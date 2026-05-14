@@ -1,3 +1,4 @@
+import stringWidth from "string-width";
 import type { AgentKind, AgentState, Workspace } from "./types.js";
 
 export const COLORS = {
@@ -89,22 +90,41 @@ function matches(value: string, needles: ReadonlyArray<string>): boolean {
   return needles.some((needle) => value.includes(needle));
 }
 
-export function oneLinePreview(text: string, maxChars: number): string {
+export function oneLinePreview(text: string, maxWidth: number): string {
   const collapsed = text.replace(/\s+/g, " ").trim();
-  return truncate(collapsed, maxChars);
+  return truncate(collapsed, maxWidth);
 }
 
-export function truncate(text: string, maxChars: number): string {
-  const chars = [...text];
-  if (chars.length <= maxChars) return chars.join("");
-  if (maxChars <= 1) return "…";
-  return `${chars.slice(0, Math.max(0, maxChars - 1)).join("")}…`;
+/**
+ * Truncate `text` so its terminal display width does not exceed `maxWidth`.
+ * Adds an ellipsis when truncation happens.
+ */
+export function truncate(text: string, maxWidth: number): string {
+  if (cellWidth(text) <= maxWidth) return text;
+  if (maxWidth <= 1) return "…";
+  const ellipsisWidth = cellWidth("…");
+  const target = Math.max(0, maxWidth - ellipsisWidth);
+  let acc = "";
+  let width = 0;
+  for (const ch of text) {
+    const w = cellWidth(ch);
+    if (width + w > target) break;
+    acc += ch;
+    width += w;
+  }
+  return `${acc}…`;
 }
 
+/** Pad `text` with spaces on the right so its display width equals `width`. */
 export function padEnd(text: string, width: number): string {
-  const chars = [...text];
-  if (chars.length >= width) return chars.join("");
-  return chars.join("") + " ".repeat(width - chars.length);
+  const w = cellWidth(text);
+  if (w >= width) return text;
+  return text + " ".repeat(width - w);
+}
+
+/** Display width of `text` in terminal cells (handles wide unicode). */
+export function cellWidth(text: string): number {
+  return stringWidth(text);
 }
 
 export function timeAgo(timestampMs: number | null): string {
