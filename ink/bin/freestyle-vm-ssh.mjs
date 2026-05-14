@@ -105,14 +105,32 @@ const installCleanup = () => {
 try {
   installCleanup();
 
-  process.stderr.write(`[freestyle-vm-ssh] minting identity for ${args.vmId}…\n`);
-  const created = await fs.identities.create({});
-  identityId = created.identityId;
-  const identity = created.identity;
-  await identity.permissions.vms.grant({ vmId: args.vmId, allowedUsers: [args.user] });
-  const tok = await identity.tokens.create();
-  const token = typeof tok === "string" ? tok : tok.token;
-  if (!token) throw new Error("failed to mint freestyle token");
+  process.stderr.write(`[freestyle-vm-ssh] minting credentials for ${args.vmId}…\n`);
+
+  // Mint the Freestyle SSH credentials and the Tailscale preauth key in
+  // parallel. Each independent SDK call is ~200-400ms; doing them serially
+  // costs ~1s, in parallel it costs ~the longer of the two.
+  const freestyleP = (async () => {
+    const created = await fs.identities.create({});
+    identityId = created.identityId;
+    const identity = created.identity;
+    await identity.permissions.vms.grant({ vmId: args.vmId, allowedUsers: [args.user] });
+    const tok = await identity.tokens.create();
+    const token = typeof tok === "string" ? tok : tok.token;
+    if (!token) throw new Error("failed to mint freestyle token");
+    return token;
+  })();
+
+  let tailscalePreauthKeyP = Promise.resolve(null);
+  if (args.tailscale && !args.tailscaleAuthkey && !process.env.TAILSCALE_AUTHKEY?.trim()) {
+    tailscalePreauthKeyP = Promise.resolve().then(() =>
+      mintTailscaleAuthKey({
+        tags: DEFAULT_TAILSCALE_TAGS,
+        description: `freestyle-vm ${args.vmId}`,
+      }),
+    );
+  }
+  const [token, mintedTailscaleKey] = await Promise.all([freestyleP, tailscalePreauthKeyP]);
 
   tmpDir = mkdtempSync(join(tmpdir(), "freestyle-vm-ssh-"));
   const passFile = join(tmpDir, "pass");
@@ -157,17 +175,14 @@ try {
       ?? (args.useReverseForward ? `http://127.0.0.1:${args.subrouterPort}/v1` : null)
       ?? (args.tailscale ? DEFAULT_TAILNET_SUBROUTER_URL : null);
 
-  // Mint a Tailscale ephemeral preauth key now so we can include it in the
-  // remote command. Done synchronously before spawning ssh.
+  // Resolve the tailscale auth key, preferring (in order) the explicit flag,
+  // env, then the key we minted in parallel above.
   let tailscaleAuthKey = null;
   if (args.tailscale) {
     tailscaleAuthKey =
       args.tailscaleAuthkey
       ?? process.env.TAILSCALE_AUTHKEY?.trim()
-      ?? mintTailscaleAuthKey({
-        tags: DEFAULT_TAILSCALE_TAGS,
-        description: `freestyle-vm ${args.vmId}`,
-      });
+      ?? mintedTailscaleKey;
     if (!tailscaleAuthKey) {
       process.stderr.write(
         "[freestyle-vm-ssh] could not mint a tailscale auth key; pass --no-tailscale to skip the join, --tailscale-authkey <key>, or set TAILSCALE_AUTHKEY in env\n",
@@ -381,12 +396,18 @@ function mintTailscaleAuthKey({ tags, description }) {
 
 function buildTailscaleBootstrap({ authKey, hostname, proxyPort }) {
   // Idempotent installer + join inside the freestyle VM. The cmux-freestyle
-  // snapshot ships the apt-managed tailscale package today, so we use the
-  // systemd unit. Freestyle VMs have no /dev/net/tun, so tailscaled runs
-  // with --tun=userspace-networking and exposes an HTTP proxy +
-  // SOCKS5 server on 127.0.0.1:<proxyPort>. We write /etc/profile.d
-  // so HTTP_PROXY/HTTPS_PROXY/NO_PROXY are set for every login shell.
+  // snapshot ships the apt-managed tailscale package today. Freestyle VMs
+  // have no /dev/net/tun, so tailscaled runs with --tun=userspace-networking
+  // and exposes an HTTP proxy + SOCKS5 server on 127.0.0.1:<proxyPort>. We
+  // write /etc/profile.d so HTTP_PROXY/HTTPS_PROXY/NO_PROXY are set for every
+  // login shell.
+  //
+  // Warm-path fast: if tailscaled is already running with the expected FLAGS
+  // and the node is already Online with the same hostname, the only work
+  // we do is re-write the profile.d shim and the codex config (in the outer
+  // chain). This brings sub-second re-attach.
   const port = String(proxyPort);
+  const wantFlags = `--tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:${port} --socks5-server=127.0.0.1:${port}`;
   return [
     "set -e",
     'export DEBIAN_FRONTEND=noninteractive',
@@ -409,25 +430,41 @@ function buildTailscaleBootstrap({ authKey, hostname, proxyPort }) {
     "  cd / && rm -rf /tmp/cmux-ts-install",
     "  systemctl daemon-reload",
     "fi",
-    // Always ensure userspace networking + proxy listeners.
+    // Conditionally update FLAGS in /etc/default/tailscaled. Only restart
+    // tailscaled when the file actually changes; otherwise we're paying ~1s
+    // for nothing on warm sessions.
     "touch /etc/default/tailscaled",
-    `if grep -q '^FLAGS=' /etc/default/tailscaled; then`,
-    `  sed -i 's|^FLAGS=.*|FLAGS="--tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:${port} --socks5-server=127.0.0.1:${port}"|' /etc/default/tailscaled`,
-    "else",
-    `  echo 'FLAGS="--tun=userspace-networking --outbound-http-proxy-listen=127.0.0.1:${port} --socks5-server=127.0.0.1:${port}"' >> /etc/default/tailscaled`,
+    `WANT_FLAGS='${wantFlags}'`,
+    `CUR_FLAGS=\"$(grep '^FLAGS=' /etc/default/tailscaled | head -1 | sed 's|^FLAGS=||' | tr -d '\"')\"`,
+    `if [ \"$CUR_FLAGS\" != \"$WANT_FLAGS\" ]; then`,
+    `  if grep -q '^FLAGS=' /etc/default/tailscaled; then`,
+    `    sed -i 's|^FLAGS=.*|FLAGS=\"'\"$WANT_FLAGS\"'\"|' /etc/default/tailscaled`,
+    "  else",
+    `    echo 'FLAGS=\"'\"$WANT_FLAGS\"'\"' >> /etc/default/tailscaled`,
+    "  fi",
+    "  systemctl reset-failed tailscaled >/dev/null 2>&1 || true",
+    "  systemctl restart tailscaled",
+    "elif ! pidof tailscaled >/dev/null 2>&1; then",
+    "  systemctl reset-failed tailscaled >/dev/null 2>&1 || true",
+    "  systemctl start tailscaled",
     "fi",
-    "systemctl reset-failed tailscaled >/dev/null 2>&1 || true",
-    "systemctl daemon-reload",
-    "systemctl restart tailscaled",
-    "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do",
+    // Tighter backend-ready loop: 60 × 100ms ≤ 6s. Most of the time the
+    // backend is up in 1-2 iterations on warm path.
+    "for i in $(seq 1 60); do",
     "  if tailscale --socket=/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then break; fi",
-    "  sleep 1",
+    "  sleep 0.1",
     "done",
-    `if ! tailscale --socket=/run/tailscale/tailscaled.sock status --self=true --peers=false --json 2>/dev/null | grep -q '"Online": *true'; then`,
-    `  echo "[freestyle-vm-ssh] joining tailnet as ${hostname}…"`,
-    `  tailscale --socket=/run/tailscale/tailscaled.sock up --authkey=${shellQuote(authKey)} --hostname=${shellQuote(hostname)} --ssh=false --reset >/dev/null`,
+    // Decide whether we need `tailscale up`. Skip it entirely if we're
+    // already Online AND the configured hostname matches. Otherwise bring
+    // up without --reset so we don't blow away existing state.
+    `TS_STATUS_JSON=$(tailscale --socket=/run/tailscale/tailscaled.sock status --self=true --peers=false --json 2>/dev/null || echo '{}')`,
+    `TS_ONLINE=$(printf '%s' "$TS_STATUS_JSON" | grep -o '\"Online\": *true' | head -1 || true)`,
+    `TS_HOST=$(printf '%s' "$TS_STATUS_JSON" | grep -o '\"HostName\": *\"[^\"]*\"' | head -1 | sed -E 's/.*\"HostName\": *\"([^\"]*)\".*/\\1/' || true)`,
+    `if [ -z \"$TS_ONLINE\" ] || [ \"$TS_HOST\" != \"${hostname}\" ]; then`,
+    `  echo \"[freestyle-vm-ssh] joining tailnet as ${hostname}…\"`,
+    `  tailscale --socket=/run/tailscale/tailscaled.sock up --authkey=${shellQuote(authKey)} --hostname=${shellQuote(hostname)} --ssh=false >/dev/null`,
     "fi",
-    // System-wide proxy env so any login shell, codex, claude, etc. honour it.
+    // Write the proxy shim every time (cheap, idempotent).
     `cat > /etc/profile.d/cmux-tailnet-proxy.sh <<'PROF'`,
     `export HTTP_PROXY=http://127.0.0.1:${port}`,
     `export HTTPS_PROXY=http://127.0.0.1:${port}`,
