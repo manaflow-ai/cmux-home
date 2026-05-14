@@ -15,6 +15,11 @@ import {
   agentState,
   displayGroup,
 } from "./format.js";
+import {
+  FreestyleClient,
+  defaultFreestyleApiKey,
+  type FreestyleSummary,
+} from "./freestyle-client.js";
 import type { AgentKind, AgentState, Workspace } from "./types.js";
 import {
   buildVisibleRows,
@@ -73,7 +78,15 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   }
   const client = clientRef.current;
 
+  const freestyleRef = useRef<FreestyleClient | null>(null);
+  if (!freestyleRef.current) {
+    freestyleRef.current = new FreestyleClient(defaultFreestyleApiKey());
+  }
+  const freestyle = freestyleRef.current;
+
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [freestyleSummary, setFreestyleSummary] = useState<FreestyleSummary | null>(null);
+  const [freestyleError, setFreestyleError] = useState<string | null>(null);
   const [collapsedGroups, setCollapsedGroups] = useState<Set<AgentState>>(
     () => new Set(),
   );
@@ -217,11 +230,79 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     };
   }, [client, refresh]);
 
+  const refreshFreestyle = useCallback(async (): Promise<void> => {
+    if (!freestyle.isEnabled()) return;
+    try {
+      const summary = await freestyle.list();
+      if (!summary) return;
+      setFreestyleSummary((prev) => {
+        if (
+          prev &&
+          prev.totalCount === summary.totalCount &&
+          prev.runningCount === summary.runningCount &&
+          prev.startingCount === summary.startingCount &&
+          prev.suspendedCount === summary.suspendedCount &&
+          prev.stoppedCount === summary.stoppedCount &&
+          prev.vms.length === summary.vms.length &&
+          prev.vms.every((vm, i) => {
+            const next = summary.vms[i]!;
+            return (
+              vm.id === next.id &&
+              vm.state === next.state &&
+              vm.snapshotId === next.snapshotId &&
+              vm.lastActivityMs === next.lastActivityMs &&
+              vm.persistence === next.persistence
+            );
+          })
+        ) {
+          return prev;
+        }
+        return summary;
+      });
+      setFreestyleError(null);
+    } catch (err) {
+      setFreestyleError((err as Error).message);
+    }
+  }, [freestyle]);
+
+  useEffect(() => {
+    if (!freestyle.isEnabled()) return;
+    void refreshFreestyle();
+    const id = setInterval(() => {
+      void refreshFreestyle();
+    }, 10_000);
+    return () => clearInterval(id);
+  }, [freestyle, refreshFreestyle]);
+
   // Visible rows + selection clamp.
-  const visibleRows: ListRow[] = useMemo(
+  const workspaceRows: ListRow[] = useMemo(
     () => buildVisibleRows(workspaces, collapsedGroups),
     [workspaces, collapsedGroups],
   );
+  const vms = freestyleSummary?.vms ?? [];
+  const vmsById = useMemo(() => {
+    const map = new Map<string, FreestyleSummary["vms"][number]>();
+    for (const vm of vms) map.set(vm.id, vm);
+    return map;
+  }, [vms]);
+  const vmHeaderLabel = useMemo(() => {
+    if (!freestyle.isEnabled()) return "";
+    if (freestyleError) return `Freestyle VMs (error)`;
+    const total = freestyleSummary?.totalCount ?? vms.length;
+    const running = freestyleSummary?.runningCount ?? 0;
+    return running > 0
+      ? `Freestyle VMs (${total}, ${running} running)`
+      : `Freestyle VMs (${total})`;
+  }, [freestyle, freestyleSummary, freestyleError, vms.length]);
+  const visibleRows: ListRow[] = useMemo(() => {
+    const rows = workspaceRows.slice();
+    if (freestyle.isEnabled()) {
+      if (rows.length > 0) rows.push({ kind: "blank" });
+      rows.push({ kind: "vm-header" });
+      for (const vm of vms) rows.push({ kind: "vm", vmId: vm.id });
+    }
+    return rows;
+  }, [workspaceRows, freestyle, vms]);
 
   const composerActive =
     composerHasInput(composer) || composerMode.kind === "rename";
@@ -539,6 +620,8 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         <WorkspaceList
           rows={visibleRows}
           workspaces={workspaces}
+          vmsById={vmsById}
+          vmHeaderLabel={vmHeaderLabel}
           selectedIndex={selected}
           scroll={listScroll}
           height={listHeight}

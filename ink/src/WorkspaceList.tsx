@@ -16,6 +16,8 @@ import {
 export type ListRow =
   | { kind: "header"; state: AgentState; label: string }
   | { kind: "workspace"; workspaceIndex: number }
+  | { kind: "vm-header" }
+  | { kind: "vm"; vmId: string }
   | { kind: "blank" };
 
 export function buildVisibleRows(
@@ -44,12 +46,29 @@ export function buildVisibleRows(
 }
 
 export function isSelectableRow(row: ListRow | undefined): boolean {
-  return !!row && (row.kind === "header" || row.kind === "workspace");
+  return (
+    !!row &&
+    (row.kind === "header" ||
+      row.kind === "workspace" ||
+      row.kind === "vm-header" ||
+      row.kind === "vm")
+  );
+}
+
+export interface VmRowEntry {
+  readonly id: string;
+  readonly state: "starting" | "running" | "suspending" | "suspended" | "stopped" | "lost";
+  readonly snapshotId: string | null;
+  readonly lastActivityMs: number | null;
+  readonly createdAtMs: number | null;
+  readonly persistence: "sticky" | "ephemeral" | "persistent" | null;
 }
 
 export interface WorkspaceListProps {
   readonly rows: ListRow[];
   readonly workspaces: ReadonlyArray<Workspace>;
+  readonly vmsById: ReadonlyMap<string, VmRowEntry>;
+  readonly vmHeaderLabel: string;
   readonly selectedIndex: number;
   readonly scroll: number;
   readonly height: number;
@@ -79,6 +98,29 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
             />
           );
         }
+        if (row.kind === "vm-header") {
+          return (
+            <HeaderRow
+              key={`vh-${index}`}
+              label={props.vmHeaderLabel}
+              selected={selected}
+              width={props.width}
+            />
+          );
+        }
+        if (row.kind === "vm") {
+          const vm = props.vmsById.get(row.vmId);
+          if (!vm) return null;
+          return (
+            <VmRow
+              key={`vm-${vm.id}-${index}`}
+              vm={vm}
+              selected={selected}
+              width={props.width}
+              spinnerTick={props.spinnerTick}
+            />
+          );
+        }
         const ws = props.workspaces[row.workspaceIndex]!;
         return (
           <WorkspaceRow
@@ -92,6 +134,78 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
       })}
     </Box>
   );
+}
+
+const VM_STATE_GLYPH: Record<VmRowEntry["state"], string> = {
+  starting: "·",
+  running: "●",
+  suspending: "·",
+  suspended: "◐",
+  stopped: "○",
+  lost: "?",
+};
+
+const VM_STATE_COLOR: Record<VmRowEntry["state"], string> = {
+  starting: COLORS.purple,
+  running: COLORS.codex,
+  suspending: COLORS.muted,
+  suspended: COLORS.muted,
+  stopped: COLORS.muted,
+  lost: COLORS.unread,
+};
+
+const VmRow = React.memo(function VmRow({
+  vm,
+  selected,
+  width,
+  spinnerTick,
+}: {
+  vm: VmRowEntry;
+  selected: boolean;
+  width: number;
+  spinnerTick: number;
+}): React.JSX.Element {
+  const baseBg = selected ? COLORS.selectedBg : undefined;
+  const baseColor = COLORS.muted;
+  const titleColor = selected ? COLORS.selectedTitleFg : COLORS.muted;
+  const stateColor = VM_STATE_COLOR[vm.state];
+  const isMoving = vm.state === "starting" || vm.state === "suspending";
+  const marker = isMoving
+    ? SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length]!
+    : VM_STATE_GLYPH[vm.state];
+
+  const idWidth = 22;
+  const stateWidth = 11;
+  const snapshotWidth = 24;
+  const ageLen = 4;
+  const id = padEnd(truncate(vm.id, idWidth), idWidth);
+  const stateLabel = padEnd(vm.state, stateWidth);
+  const snapshotLabel = padEnd(
+    truncate(vm.snapshotId ?? "no snapshot", snapshotWidth),
+    snapshotWidth,
+  );
+  const age = padStart(timeAgo(vm.lastActivityMs ?? vm.createdAtMs), ageLen);
+  const tailSegment = ` ${stateLabel} ${snapshotLabel} ${age}`;
+  const prefixWidth = 3 + 2 + idWidth; // unread (3) + marker+space (2) + id
+  const trailing = Math.max(0, width - prefixWidth - cellWidth(tailSegment));
+
+  return (
+    <Box>
+      <Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{"   "}</Text>
+        <Text color={stateColor} backgroundColor={baseBg}>{`${marker} `}</Text>
+        <Text color={titleColor} backgroundColor={baseBg}>{id}</Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{tailSegment}</Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{" ".repeat(trailing)}</Text>
+      </Text>
+    </Box>
+  );
+});
+
+function padStart(text: string, width: number): string {
+  const w = cellWidth(text);
+  if (w >= width) return text;
+  return " ".repeat(width - w) + text;
 }
 
 const HeaderRow = React.memo(function HeaderRow({
