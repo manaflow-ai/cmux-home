@@ -117,6 +117,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
+  // Monotonic mac-side port allocator for SSH -L forwards. Each spawned
+  // task / fork gets its own port so concurrent VMs don't fight over 3000.
+  const nextDevPortRef = useRef<number>(30000);
+  const allocDevPort = useCallback((): number => {
+    const p = nextDevPortRef.current;
+    nextDevPortRef.current = p + 1;
+    return p;
+  }, []);
 
   const commands = useMemo(defaultAgentCommands, []);
 
@@ -642,9 +650,11 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         const promptArg = prompt && prompt.trim()
           ? ` --codex-prompt ${shellQuote(prompt.trim())}`
           : "";
+        const devPort = allocDevPort();
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
-          `--clone-cmux` +
+          `--clone-cmux ` +
+          `--dev-server-mac-port ${devPort}` +
           promptArg;
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
         const workspaceId = await client.createWorkspace({
@@ -657,7 +667,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         try {
           await client.createBrowserPane({
             workspaceId,
-            url: "http://127.0.0.1:3000",
+            url: `http://127.0.0.1:${devPort}`,
             direction: "right",
             focus: false,
           });
@@ -676,7 +686,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting],
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, allocDevPort],
   );
 
   const createVmFromDefaultSnapshot = useCallback(async () => {
@@ -722,9 +732,11 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         } else {
           setStatusLine(`vm ${shortId} ready, opening workspace…`);
         }
+        const devPort = allocDevPort();
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
           `--clone-cmux ` +
+          `--dev-server-mac-port ${devPort} ` +
           `--codex-prompt ${shellQuote(trimmed)}`;
         const workspaceId = await client.createWorkspace({
           title: `task: ${preview}`,
@@ -736,7 +748,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         try {
           await client.createBrowserPane({
             workspaceId,
-            url: "http://127.0.0.1:3000",
+            url: `http://127.0.0.1:${devPort}`,
             direction: "right",
             focus: false,
           });
@@ -747,7 +759,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         }
         setComposer(EMPTY_COMPOSER);
         setComposerMode({ kind: "new" });
-        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId} (dev :${devPort})`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);
@@ -755,7 +767,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting],
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, allocDevPort],
   );
 
   const submitRename = useCallback(

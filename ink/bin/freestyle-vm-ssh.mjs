@@ -159,8 +159,15 @@ try {
     // ordinary cmux Linux/macOS box behind a normal sshd).
     baseSshArgs.push("-R", `${args.subrouterPort}:127.0.0.1:${args.subrouterPort}`);
   }
-  for (const port of args.forwardPorts) {
-    baseSshArgs.push("-L", `${port}:127.0.0.1:${port}`);
+  if (args.devServerMacPort) {
+    // Only forward the dev server, on a per-VM-unique mac port. Skips the
+    // default 3000/5173/8000/8080 cluster so two concurrent VMs don't fight
+    // over the same local sockets.
+    baseSshArgs.push("-L", `${args.devServerMacPort}:127.0.0.1:3000`);
+  } else {
+    for (const port of args.forwardPorts) {
+      baseSshArgs.push("-L", `${port}:127.0.0.1:${port}`);
+    }
   }
 
   // Decide which subrouter URL to bake into the codex config inside the VM.
@@ -352,6 +359,7 @@ function parseArgs(argv) {
     subrouterAccountId: null,
     codexPrompt: null,
     cloneCmux: false,
+    devServerMacPort: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -408,6 +416,14 @@ function parseArgs(argv) {
       case "--clone-cmux":
         out.cloneCmux = true;
         break;
+      case "--dev-server-mac-port": {
+        const v = argv[++i];
+        const n = v ? Number.parseInt(v, 10) : NaN;
+        if (Number.isInteger(n) && n > 0 && n < 65536) {
+          out.devServerMacPort = n;
+        }
+        break;
+      }
     }
   }
   if (out.forwardPorts.length === 0) {
