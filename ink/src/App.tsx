@@ -111,6 +111,12 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [composerMode, setComposerMode] = useState<
     { kind: "new" } | { kind: "rename"; workspaceId: string }
   >({ kind: "new" });
+  // Local map of forked VM id → parent VM id. Reset on TUI restart.
+  // Encoded into the fork's snapshot name so we can also recover after a
+  // restart via VM list metadata.
+  const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
+    () => new Map(),
+  );
 
   const commands = useMemo(defaultAgentCommands, []);
 
@@ -331,6 +337,18 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       ? `Freestyle VMs (${total}, ${running} running)`
       : `Freestyle VMs (${total})`;
   }, [freestyle, freestyleSummary, freestyleError, vms.length]);
+  // Build the parent → children map for forked VMs. A VM with no parent in
+  // forkParents (and no name-based parent hint) is treated as a root.
+  const forkChildren = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const [child, parent] of forkParents.entries()) {
+      const bucket = map.get(parent) ?? [];
+      bucket.push(child);
+      map.set(parent, bucket);
+    }
+    return map;
+  }, [forkParents]);
+
   const visibleRows: ListRow[] = useMemo(() => {
     const topRows: ListRow[] = workspaceRows.filter((row) => {
       if (row.kind !== "workspace") return true;
@@ -341,15 +359,31 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     if (freestyle.isEnabled()) {
       if (rows.length > 0) rows.push({ kind: "blank" });
       rows.push({ kind: "vm-header" });
-      for (const vm of vms) {
-        rows.push({ kind: "vm", vmId: vm.id });
+      const emittedVm = new Set<string>();
+      const emitVm = (vm: FreestyleSummary["vms"][number], depth = 0): void => {
+        if (emittedVm.has(vm.id)) return;
+        emittedVm.add(vm.id);
+        rows.push({ kind: "vm", vmId: vm.id, depth });
         const children = workspacesByVmId.get(vm.id) ?? [];
         for (const ws of children) {
           const idx = workspaces.findIndex((w) => w.id === ws.id);
           if (idx >= 0) {
-            rows.push({ kind: "workspace", workspaceIndex: idx, depth: 1 });
+            rows.push({ kind: "workspace", workspaceIndex: idx, depth: depth + 1 });
           }
         }
+        const forks = forkChildren.get(vm.id) ?? [];
+        for (const forkId of forks) {
+          const forkVm = vmsById.get(forkId);
+          if (forkVm) emitVm(forkVm, depth + 1);
+        }
+      };
+      for (const vm of vms) {
+        if (forkParents.has(vm.id)) continue;
+        emitVm(vm, 0);
+      }
+      // Surface any forked VMs whose parent isn't in the list (defensive).
+      for (const vm of vms) {
+        if (!emittedVm.has(vm.id)) emitVm(vm, 0);
       }
     }
     return rows;
@@ -359,7 +393,10 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     groupedWorkspaceIds,
     freestyle,
     vms,
+    vmsById,
     workspacesByVmId,
+    forkParents,
+    forkChildren,
   ]);
 
   const composerActive =
@@ -571,6 +608,75 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       }
     },
     [freestyle, refreshFreestyle],
+  );
+
+  const forkSelectedVm = useCallback(
+    async (parentVmId: string, prompt: string | null) => {
+      if (!freestyle.isEnabled()) {
+        setStatusLine("FREESTYLE_API_KEY not set; can't fork");
+        return;
+      }
+      if (submitting) return;
+      const shortParent = parentVmId.slice(0, 8);
+      setSubmitting(true);
+      try {
+        setStatusLine(`snapshotting vm ${shortParent} for fork…`);
+        const snapshotName = `cmux-home-fork-${parentVmId}-${Date.now()}`;
+        const { vmId, snapshotId } = await freestyle.forkVm(
+          parentVmId,
+          snapshotName,
+        );
+        setForkParents((prev) => {
+          const next = new Map(prev);
+          next.set(vmId, parentVmId);
+          return next;
+        });
+        const shortChild = vmId.slice(0, 8);
+        setStatusLine(`fork ${shortChild} of ${shortParent} (snap ${snapshotId.slice(0, 8)}); waiting…`);
+        const ready = await waitForFreestyleHealthz(vmId, 120_000);
+        if (!ready) {
+          setStatusLine(`fork ${shortChild} did not become ready in 120 s; opening workspace anyway`);
+        } else {
+          setStatusLine(`fork ${shortChild} ready, opening workspace…`);
+        }
+        const promptArg = prompt && prompt.trim()
+          ? ` --codex-prompt ${shellQuote(prompt.trim())}`
+          : "";
+        const cmd =
+          `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
+          `--clone-cmux` +
+          promptArg;
+        const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
+        const workspaceId = await client.createWorkspace({
+          title: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
+          description: `freestyle vm ${vmId} forked from ${parentVmId}; codex with:\n${prompt ?? "(no prompt)"}`,
+          initialCommand: cmd,
+          cwd: resolvedCwd,
+          focus: false,
+        });
+        try {
+          await client.createBrowserPane({
+            workspaceId,
+            url: "http://127.0.0.1:3000",
+            direction: "right",
+            focus: false,
+          });
+        } catch (err) {
+          setStatusLine(`fork workspace open, browser pane failed: ${(err as Error).message}`);
+        }
+        if (prompt && prompt.trim()) {
+          setComposer(EMPTY_COMPOSER);
+          setComposerMode({ kind: "new" });
+        }
+        setStatusLine(`fork ${shortChild} of ${shortParent} ready (workspace ${workspaceId.slice(0, 8)})`);
+        void refreshFreestyle();
+      } catch (err) {
+        setStatusLine(`fork failed: ${(err as Error).message}`);
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting],
   );
 
   const createVmFromDefaultSnapshot = useCallback(async () => {
@@ -851,6 +957,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       const selectedVm = selectedVmRow();
       if (selectedVm) {
         void launchVmOutside(selectedVm);
+      }
+      return;
+    }
+    if (key.ctrl && input === "f") {
+      const selectedVm = selectedVmRow();
+      if (selectedVm) {
+        const prompt = composer.lines.join("\n").trim();
+        void forkSelectedVm(selectedVm.id, prompt ? prompt : null);
       }
       return;
     }

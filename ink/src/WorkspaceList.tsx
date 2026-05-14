@@ -17,7 +17,7 @@ export type ListRow =
   | { kind: "header"; state: AgentState; label: string }
   | { kind: "workspace"; workspaceIndex: number; depth?: number }
   | { kind: "vm-header" }
-  | { kind: "vm"; vmId: string }
+  | { kind: "vm"; vmId: string; depth?: number }
   | { kind: "blank" };
 
 export function buildVisibleRows(
@@ -118,6 +118,7 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
               selected={selected}
               width={props.width}
               spinnerTick={props.spinnerTick}
+              depth={row.depth ?? 0}
             />
           );
         }
@@ -160,11 +161,13 @@ const VmRow = React.memo(function VmRow({
   selected,
   width,
   spinnerTick,
+  depth = 0,
 }: {
   vm: VmRowEntry;
   selected: boolean;
   width: number;
   spinnerTick: number;
+  depth?: number;
 }): React.JSX.Element {
   const baseBg = selected ? COLORS.selectedBg : undefined;
   const baseColor = COLORS.muted;
@@ -175,7 +178,9 @@ const VmRow = React.memo(function VmRow({
     ? SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length]!
     : VM_STATE_GLYPH[vm.state];
 
-  const idWidth = 22;
+  const indent = depth > 0 ? "  ".repeat(depth) + "└ " : "";
+  const indentWidth = cellWidth(indent);
+  const idWidth = Math.max(8, 22 - indentWidth);
   const stateWidth = 11;
   const snapshotWidth = 24;
   const ageLen = 4;
@@ -187,7 +192,7 @@ const VmRow = React.memo(function VmRow({
   );
   const age = padStart(timeAgo(vm.lastActivityMs ?? vm.createdAtMs), ageLen);
   const tailSegment = ` ${stateLabel} ${snapshotLabel} ${age}`;
-  const prefixWidth = 3 + 2 + idWidth; // unread (3) + marker+space (2) + id
+  const prefixWidth = 3 + 2 + indentWidth + idWidth;
   const trailing = Math.max(0, width - prefixWidth - cellWidth(tailSegment));
 
   return (
@@ -195,6 +200,9 @@ const VmRow = React.memo(function VmRow({
       <Text>
         <Text color={baseColor} backgroundColor={baseBg}>{"   "}</Text>
         <Text color={stateColor} backgroundColor={baseBg}>{`${marker} `}</Text>
+        {indent ? (
+          <Text color={baseColor} backgroundColor={baseBg}>{indent}</Text>
+        ) : null}
         <Text color={titleColor} backgroundColor={baseBg}>{id}</Text>
         <Text color={baseColor} backgroundColor={baseBg}>{tailSegment}</Text>
         <Text color={baseColor} backgroundColor={baseBg}>{" ".repeat(trailing)}</Text>

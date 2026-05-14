@@ -106,7 +106,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
       <Box>
         <CurrentMode provider={props.provider} planMode={props.planMode} />
         <Text color={COLORS.muted}>
-          {" · enter open sandbox (ssh + subrouter) · ctrl+o open local workspace · ctrl+x destroy · ? for shortcuts"}
+          {" · enter open sandbox · ctrl+f fork · ctrl+o local workspace · ctrl+x destroy · ? for shortcuts"}
         </Text>
       </Box>
     );

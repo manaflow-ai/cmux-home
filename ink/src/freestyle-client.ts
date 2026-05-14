@@ -77,6 +77,28 @@ export class FreestyleClient {
     if (!created.vmId) throw new Error("freestyle vms.create did not return vmId");
     return { vmId: created.vmId };
   }
+
+  /**
+   * Fork a running VM by snapshotting it and creating a new VM from that
+   * snapshot. Returns the new VM id plus the snapshot id (so callers can
+   * track parent/child relationships).
+   */
+  async forkVm(
+    parentVmId: string,
+    snapshotName?: string,
+  ): Promise<{ vmId: string; snapshotId: string }> {
+    if (!this.fs) throw new Error("FREESTYLE_API_KEY is not set");
+    const ref = this.fs.vms.ref({ vmId: parentVmId });
+    const snap = (await ref.snapshot({
+      name: snapshotName ?? `fork-${parentVmId.slice(0, 8)}-${Date.now()}`,
+    } as Parameters<typeof ref.snapshot>[0])) as { snapshotId?: string };
+    const snapshotId = snap.snapshotId ?? "";
+    if (!snapshotId) {
+      throw new Error("freestyle snapshot did not return snapshotId");
+    }
+    const { vmId } = await this.createFromSnapshot(snapshotId);
+    return { vmId, snapshotId };
+  }
 }
 
 export function defaultFreestyleApiKey(): string | null {
