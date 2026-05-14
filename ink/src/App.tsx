@@ -896,10 +896,24 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           ? "vm-header"
           : "workspace";
 
-  // Only forward a status override when it's the "press ctrl+X to quit"
-  // hint that the HelpBar actually displays. This keeps the HelpBar props
-  // stable across routine state changes so it can stay memoized.
-  const statusOverride = statusLine.startsWith("press ctrl+") ? statusLine : null;
+  // Forward the status line to the help bar when it carries something the
+  // user needs to see (quit prompts, in-flight cloud submit progress, error
+  // messages). Keeps the override null otherwise so the HelpBar stays stable
+  // across routine state changes.
+  const statusOverride = useMemo(() => {
+    const s = statusLine.trim();
+    if (!s) return null;
+    if (s.startsWith("press ctrl+")) return s;
+    if (
+      submitting ||
+      /^(spawning|waiting|opening|creating|destroying|task workspace|destroyed|created vm|started)/i.test(s) ||
+      / failed:/.test(s) ||
+      s.startsWith("rename")
+    ) {
+      return s;
+    }
+    return null;
+  }, [statusLine, submitting]);
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>

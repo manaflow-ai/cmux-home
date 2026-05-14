@@ -64,7 +64,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
     );
   }
 
-  if (props.statusOverride && props.statusOverride.startsWith("press ctrl+")) {
+  if (props.statusOverride) {
     return (
       <Box>
         <Text color={COLORS.muted}>{`  ${props.statusOverride}`}</Text>
