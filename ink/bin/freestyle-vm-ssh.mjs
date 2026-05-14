@@ -217,9 +217,39 @@ try {
     const dirRendered = needsExpand
       ? `"${remoteConfigDir}"`
       : shellQuote(remoteConfigDir);
+    // Build a codex config that defines a custom `subrouter` provider. This
+    // matters because (1) it uses the wire-protocol Subrouter expects
+    // (`responses`) and (2) it gives us a place to set HTTP headers, which is
+    // the only way to force a specific Subrouter account from inside the VM
+    // (the `subrouter codex` wrapper isn't available here).
+    const forcedAccount =
+      args.subrouterAccountId
+      ?? process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
+      ?? null;
+    const headerLines = [];
+    if (forcedAccount) {
+      headerLines.push(
+        `X-Subrouter-Account-ID = ${JSON.stringify(forcedAccount)}`,
+      );
+    }
+    if (process.env.SUBROUTER_CODEX_USER_EMAIL?.trim()) {
+      headerLines.push(
+        `X-Subrouter-User-Email = ${JSON.stringify(process.env.SUBROUTER_CODEX_USER_EMAIL.trim())}`,
+      );
+    }
+    const headersBlock =
+      headerLines.length === 0
+        ? ""
+        : `\n[model_providers.subrouter.http_headers]\n${headerLines.join("\n")}\n`;
     const codexConfigBody =
       `# Written by freestyle-vm-ssh so codex routes through Subrouter.\n` +
-      `openai_base_url = "${subrouterUrlForVm}"\n`;
+      `model_provider = "subrouter"\n` +
+      `\n` +
+      `[model_providers.subrouter]\n` +
+      `name = "Subrouter"\n` +
+      `base_url = ${JSON.stringify(subrouterUrlForVm)}\n` +
+      `wire_api = "responses"\n` +
+      headersBlock;
     const encodedConfig = Buffer.from(codexConfigBody, "utf8").toString("base64");
     remoteSteps.push(
       `mkdir -p ${dirRendered}`,
@@ -227,6 +257,11 @@ try {
       `chmod 600 ${pathRendered}`,
       `printf '\\n[freestyle-vm-ssh] codex configured to use subrouter at ${subrouterUrlForVm}\\n'`,
     );
+    if (forcedAccount) {
+      remoteSteps.push(
+        `printf '[freestyle-vm-ssh] codex forced subrouter account: ${forcedAccount}\\n'`,
+      );
+    }
   } else {
     const note = args.codexConfigPath === null
       ? "codex config write disabled via --no-codex-config"
@@ -285,6 +320,7 @@ function parseArgs(argv) {
     tailscale: true,
     tailscaleAuthkey: null,
     tailscaleHostname: null,
+    subrouterAccountId: null,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -331,6 +367,9 @@ function parseArgs(argv) {
         break;
       case "--tailscale-hostname":
         out.tailscaleHostname = argv[++i] ?? null;
+        break;
+      case "--subrouter-account-id":
+        out.subrouterAccountId = argv[++i] ?? null;
         break;
     }
   }
@@ -497,6 +536,12 @@ function printHelp() {
       "  --subrouter-url <url>     Subrouter base URL written into the VM's",
       `                            codex config. Default when --tailscale is`,
       `                            on: ${DEFAULT_TAILNET_SUBROUTER_URL}`,
+      "  --subrouter-account-id <id>",
+      "                            Force a specific Subrouter codex account",
+      "                            (e.g. apikey:lawrence-codex-1). Written",
+      "                            into the codex provider's http_headers as",
+      "                            X-Subrouter-Account-ID. Without this,",
+      "                            Subrouter auto-selects an account.",
       "  --subrouter-port <port>   Local subrouter port for --reverse-subrouter",
       "                            (default: 31415)",
       "  --reverse-subrouter       Add `-R <port>:127.0.0.1:<port>` for a",
@@ -512,6 +557,8 @@ function printHelp() {
       "Env:",
       "  FREESTYLE_API_KEY         required",
       "  SUBROUTER_REMOTE_URL      used as --subrouter-url when not provided",
+      "  SUBROUTER_CODEX_ACCOUNT_ID used as --subrouter-account-id when not provided",
+      "  SUBROUTER_CODEX_USER_EMAIL added as X-Subrouter-User-Email header",
       "  TAILSCALE_AUTHKEY         used as --tailscale-authkey when not provided",
       "",
     ].join("\n"),
