@@ -3922,10 +3922,14 @@ fn current_agent_mode_spans(app: &App) -> Vec<Span<'static>> {
             if app.plan_mode {
                 purple_style()
             } else {
-                muted_style()
+                build_style()
             },
         ),
     ]
+}
+
+fn build_style() -> Style {
+    Style::default().fg(Color::Rgb(124, 189, 107))
 }
 
 fn purple_style() -> Style {
