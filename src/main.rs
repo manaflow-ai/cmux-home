@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -232,6 +233,12 @@ enum KeyAction {
 struct App {
     socket_path: String,
     workspace_cwd: String,
+    home_workspace_id: Option<String>,
+    codex_bin: String,
+    claude_bin: String,
+    terminal_path: Option<String>,
+    codex_env_args: String,
+    claude_env_args: String,
     codex_template: String,
     codex_plan_template: String,
     codex_submit_template: Option<String>,
@@ -298,13 +305,25 @@ impl App {
                     .map(|path| path.display().to_string())
             })
             .unwrap_or_else(|| ".".to_string());
+        let home_workspace_id = std::env::var("CMUX_WORKSPACE_ID").ok();
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
         let config = load_config(args.config.as_ref());
         let skills = load_skill_entries(&workspace_cwd);
+        let codex_bin = resolve_agent_executable("codex", "CMUX_HOME_CODEX_BIN");
+        let claude_bin = resolve_agent_executable("claude", "CMUX_HOME_CLAUDE_BIN");
+        let terminal_path = std::env::var("PATH").ok();
+        let codex_env_args = env_args(&["CODEX_HOME"]);
+        let claude_env_args = env_args(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"]);
         let mut app = Self {
             socket_path,
             workspace_cwd,
+            home_workspace_id,
+            codex_bin,
+            claude_bin,
+            terminal_path,
+            codex_env_args,
+            claude_env_args,
             codex_template: config.agents.codex.command.unwrap_or(args.codex_command),
             codex_plan_template: config
                 .agents
@@ -761,19 +780,23 @@ impl App {
             format!("{}: {}", self.agent_label(), one_line_preview(&prompt, 42))
         };
         let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
+        let mut params = json!({
+            "title": title,
+            "description": prompt,
+            "initial_command": command,
+            "cwd": self.workspace_cwd,
+            "focus": true,
+        });
+        if let Some(path) = self.terminal_path.as_deref() {
+            params["initial_env"] = json!({ "PATH": path });
+        }
         let mut client = CmuxClient::new(self.socket_path.clone());
-        let created = client.v2(
-            "workspace.create",
-            json!({
-                "title": title,
-                "description": prompt,
-                "initial_command": command,
-                "cwd": self.workspace_cwd,
-                "focus": false,
-            }),
-        )?;
+        let created = client.v2("workspace.create", params)?;
         let workspace_id = string_field(&created, "workspace_id")
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+        let workspace_ref =
+            string_field(&created, "workspace_ref").unwrap_or_else(|| workspace_id.clone());
+        self.restore_home_workspace_focus_after_start(&workspace_id, &workspace_ref);
         self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
         self.select_workspace_by_id(&workspace_id);
         if !command_accepts_prompt {
@@ -792,6 +815,42 @@ impl App {
         self.composer_mode = ComposerMode::NewWorkspace;
         self.status_line = format!("started {} workspace", self.agent_label());
         Ok(())
+    }
+
+    fn restore_home_workspace_focus_after_start(
+        &self,
+        created_workspace_id: &str,
+        created_workspace_ref: &str,
+    ) {
+        let Some(home_workspace_id) = self.home_workspace_id.as_deref() else {
+            return;
+        };
+        if home_workspace_id == created_workspace_id {
+            return;
+        }
+        let socket_path = self.socket_path.clone();
+        let home_workspace_id = home_workspace_id.to_string();
+        let created_workspace_ref = created_workspace_ref.to_string();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let mut client = CmuxClient::new(socket_path.clone());
+                if client
+                    .v1(&format!("read-screen --workspace {created_workspace_ref} --lines 1"))
+                    .is_ok()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            let mut client = CmuxClient::new(socket_path);
+            let _ = client.v2(
+                "workspace.select",
+                json!({
+                    "workspace_id": home_workspace_id,
+                }),
+            );
+        });
     }
 
     fn upsert_optimistic_workspace(
@@ -1392,8 +1451,21 @@ impl App {
             .join(" ");
         let command = render_command_template_parts(
             template,
-            &[("workspace_cwd", &self.workspace_cwd), ("prompt", prompt)],
-            &[("image_args", &image_args)],
+            &[
+                ("workspace_cwd", &self.workspace_cwd),
+                ("prompt", prompt),
+                ("codex_bin", &self.codex_bin),
+                ("claude_bin", &self.claude_bin),
+                (
+                    "terminal_path",
+                    self.terminal_path.as_deref().unwrap_or_default(),
+                ),
+            ],
+            &[
+                ("image_args", &image_args),
+                ("codex_env", &self.codex_env_args),
+                ("claude_env", &self.claude_env_args),
+            ],
         );
         (command, accepts_prompt)
     }
@@ -1489,6 +1561,60 @@ fn configure_composer(mut composer: TextArea<'static>) -> TextArea<'static> {
     composer.set_placeholder_text("");
     composer.set_cursor_line_style(Style::default());
     composer
+}
+
+fn resolve_agent_executable(name: &str, override_env: &str) -> String {
+    if let Some(value) = std::env::var_os(override_env) {
+        let path = PathBuf::from(value);
+        if is_executable_file(&path) {
+            return path.display().to_string();
+        }
+    }
+    if name == "claude" {
+        if let Some(path) = resolve_executable_with_filter(name, |path| {
+            !path
+                .to_string_lossy()
+                .contains("/Applications/cmux.app/Contents/Resources/bin/")
+        }) {
+            return path;
+        }
+    }
+    resolve_executable_with_filter(name, |_| true).unwrap_or_else(|| name.to_string())
+}
+
+fn resolve_executable_with_filter<F>(name: &str, filter: F) -> Option<String>
+where
+    F: Fn(&Path) -> bool,
+{
+    if name.contains('/') {
+        let path = Path::new(name);
+        return (is_executable_file(path) && filter(path)).then(|| name.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) && filter(&candidate) {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn env_args(names: &[&str]) -> String {
+    names
+        .iter()
+        .filter_map(|name| {
+            let value = std::env::var(name).ok()?;
+            (!value.is_empty()).then(|| format!("{name}={}", shell_quote(&value)))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn non_empty_lines(mut lines: Vec<String>) -> Vec<String> {
