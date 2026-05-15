@@ -30,15 +30,15 @@ function toggleAgent(kind: AgentKind): AgentKind {
 function vmHintText(state: NonNullable<HelpBarProps["selectedVmState"]> | null): string {
   switch (state) {
     case "running":
-      return " · enter cmux ssh in · ctrl+f fork into new VM · ctrl+o local workspace · ctrl+x destroy · type a task above to spawn another";
+      return " · enter ssh in (codex + dev server) · ctrl+f fork into new VM · ctrl+o local workspace · ctrl+x destroy · type a task above to spawn another";
     case "starting":
       return " · vm is starting… · ctrl+x destroy (cancel) · type a task above to spawn another";
     case "suspending":
       return " · vm is suspending… · type a task above to spawn another";
     case "suspended":
-      return " · enter to resume + cmux ssh in · ctrl+x destroy · type a task above to spawn another";
+      return " · enter to resume + ssh in · ctrl+x destroy · type a task above to spawn another";
     case "stopped":
-      return " · enter to start + cmux ssh in · ctrl+x destroy · type a task above to spawn another";
+      return " · enter to start + ssh in · ctrl+x destroy · type a task above to spawn another";
     case "lost":
       return " · vm is lost (gateway unreachable) · ctrl+x destroy · type a task above to spawn another";
     default:
