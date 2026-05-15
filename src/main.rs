@@ -112,11 +112,23 @@ enum AutocompleteMarker {
     Dollar,
 }
 
+impl AutocompleteMarker {
+    fn as_char(self) -> char {
+        match self {
+            Self::Slash => '/',
+            Self::Dollar => '$',
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AutocompleteQuery {
     marker: AutocompleteMarker,
     raw: String,
     search: String,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1108,26 +1120,7 @@ impl App {
         if self.composer_mode != ComposerMode::NewWorkspace {
             return None;
         }
-        let text = self.composer.lines().join("\n");
-        let trimmed = text.trim_start();
-        let marker = if trimmed.starts_with('/') {
-            AutocompleteMarker::Slash
-        } else if trimmed.starts_with('$') {
-            AutocompleteMarker::Dollar
-        } else {
-            return None;
-        };
-        if trimmed.contains('\n') {
-            return None;
-        }
-        if trimmed.chars().last().is_some_and(char::is_whitespace) {
-            return None;
-        }
-        Some(AutocompleteQuery {
-            marker,
-            raw: trimmed.to_string(),
-            search: trimmed.chars().skip(1).collect::<String>(),
-        })
+        autocomplete_query_at_cursor(&self.composer)
     }
 
     fn autocomplete_items(&self) -> Vec<AutocompleteItem> {
@@ -1192,6 +1185,7 @@ impl App {
                     .then_with(|| skill_a.name.cmp(&skill_b.name))
             },
         );
+        let marker = query.marker.as_char();
         matches
             .into_iter()
             .map(|(_, _, skill)| {
@@ -1203,8 +1197,8 @@ impl App {
                 };
                 AutocompleteItem {
                     kind: AutocompleteKind::Skill,
-                    label: format!("${}", skill.name),
-                    insert_text: format!("${} ", skill.name),
+                    label: format!("{marker}{}", skill.name),
+                    insert_text: format!("{marker}{} ", skill.name),
                     detail,
                 }
             })
@@ -1520,6 +1514,35 @@ fn configure_composer(mut composer: TextArea<'static>) -> TextArea<'static> {
     composer.set_placeholder_text("");
     composer.set_cursor_line_style(Style::default());
     composer
+}
+
+fn autocomplete_query_at_cursor(textarea: &TextArea<'static>) -> Option<AutocompleteQuery> {
+    let (line, row, col) = composer_line_at_cursor(textarea)?;
+    let chars = line.chars().collect::<Vec<_>>();
+    let cursor = col.min(chars.len());
+    if cursor == 0 {
+        return None;
+    }
+
+    let mut start_col = cursor;
+    while start_col > 0 && !chars[start_col - 1].is_whitespace() {
+        start_col -= 1;
+    }
+    let raw = chars[start_col..cursor].iter().collect::<String>();
+    let marker = match raw.chars().next()? {
+        '/' => AutocompleteMarker::Slash,
+        '$' => AutocompleteMarker::Dollar,
+        _ => return None,
+    };
+
+    Some(AutocompleteQuery {
+        marker,
+        search: raw.chars().skip(1).collect::<String>(),
+        raw,
+        row,
+        start_col,
+        end_col: cursor,
+    })
 }
 
 fn resolve_agent_executable(name: &str, override_env: &str) -> String {
@@ -1864,6 +1887,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1873,6 +1897,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2056,6 +2081,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2065,6 +2091,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2190,22 +2217,39 @@ fn handle_composer_command(app: &mut App) -> bool {
 }
 
 fn complete_autocomplete_selection(app: &mut App) -> bool {
-    if !app.autocomplete_is_active() {
+    let Some(query) = app.autocomplete_query() else {
         return false;
-    }
+    };
     let items = app.autocomplete_items();
     let Some(item) = items.get(app.autocomplete.selected).cloned() else {
         return false;
     };
-    let current = app.composer.lines().join("\n").trim().to_string();
-    if item.kind == AutocompleteKind::Command && current == item.insert_text.trim_end() {
+    let current_text = app.composer.lines().join("\n").trim().to_string();
+    if item.kind == AutocompleteKind::Command && current_text == item.insert_text.trim_end() {
         return false;
     }
-    if current == item.insert_text {
+    let mut lines = app.composer.lines().to_vec();
+    let Some(line) = lines.get_mut(query.row) else {
         return false;
+    };
+    let chars = line.chars().collect::<Vec<_>>();
+    let start_col = query.start_col.min(chars.len());
+    let end_col = query.end_col.min(chars.len()).max(start_col);
+    let before = chars[..start_col].iter().collect::<String>();
+    let mut after = chars[end_col..].iter().collect::<String>();
+    if item.insert_text.ends_with(' ') && after.chars().next().is_some_and(char::is_whitespace) {
+        after = after.chars().skip(1).collect::<String>();
     }
-    app.composer = composer_from_lines(vec![item.insert_text.clone()]);
-    app.composer.move_cursor(CursorMove::End);
+    *line = format!("{before}{}{after}", item.insert_text);
+
+    let cursor_col = start_col + item.insert_text.chars().count();
+    app.composer = composer_from_lines(lines);
+    for _ in 0..query.row {
+        app.composer.move_cursor(CursorMove::Down);
+    }
+    for _ in 0..cursor_col {
+        app.composer.move_cursor(CursorMove::Forward);
+    }
     app.selected_image = None;
     app.status_line = match item.kind {
         AutocompleteKind::Command => format!("command {}", item.label),
@@ -4255,8 +4299,18 @@ mod tests {
             claude_plan_command: "claude --permission-mode plan".to_string(),
         });
         app.history = vec![
-            draft_from_parts(vec!["first".to_string()], Vec::new(), AgentKind::Codex, false),
-            draft_from_parts(vec!["second".to_string()], Vec::new(), AgentKind::Codex, false),
+            draft_from_parts(
+                vec!["first".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+            draft_from_parts(
+                vec!["second".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
         ];
         app.selected = 7;
         app.list_scroll = 4;
@@ -4266,5 +4320,78 @@ mod tests {
         assert_eq!(app.view_mode, ViewMode::History);
         assert_eq!(app.selected, 0);
         assert_eq!(app.list_scroll, 0);
+    }
+
+    #[test]
+    fn autocomplete_query_works_inside_non_empty_composer() {
+        let mut composer = composer_from_lines(vec!["please use $ver".to_string()]);
+        composer.move_cursor(CursorMove::End);
+
+        let query = autocomplete_query_at_cursor(&composer).expect("query");
+
+        assert_eq!(query.marker, AutocompleteMarker::Dollar);
+        assert_eq!(query.raw, "$ver");
+        assert_eq!(query.search, "ver");
+        assert_eq!(query.row, 0);
+        assert_eq!(query.start_col, 11);
+        assert_eq!(query.end_col, 15);
+    }
+
+    #[test]
+    fn skill_completion_replaces_current_token_only() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "verify".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/verify/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec!["please use $ver now".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        for _ in 0..4 {
+            app.composer.move_cursor(CursorMove::Back);
+        }
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(
+            app.composer.lines(),
+            &["please use $verify now".to_string()]
+        );
+    }
+
+    #[test]
+    fn slash_skill_completion_uses_slash_prefix_inline() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "review".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/review/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec!["run /rev".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(app.composer.lines(), &["run /review ".to_string()]);
     }
 }
