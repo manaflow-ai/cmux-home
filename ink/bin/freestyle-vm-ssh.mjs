@@ -249,6 +249,14 @@ try {
       headerLines.length === 0
         ? ""
         : `\n[model_providers.subrouter.http_headers]\n${headerLines.join("\n")}\n`;
+    // Pre-trust the directories the helper sets cwd to so codex doesn't
+    // halt at the "Do you trust the contents of this directory?" prompt
+    // every time we exec it. Trusts the cmux repo root (when --clone-cmux
+    // is set) and the user's home dir as a defensive default.
+    const trustedPaths = ["/home/cmux", "/home/cmux/cmux"];
+    const trustBlock = trustedPaths
+      .map((p) => `\n[projects."${p}"]\ntrust_level = "trusted"\n`)
+      .join("");
     const codexConfigBody =
       `# Written by freestyle-vm-ssh so codex routes through Subrouter.\n` +
       `model_provider = "subrouter"\n` +
@@ -257,7 +265,8 @@ try {
       `name = "Subrouter"\n` +
       `base_url = ${JSON.stringify(subrouterUrlForVm)}\n` +
       `wire_api = "responses"\n` +
-      headersBlock;
+      headersBlock +
+      trustBlock;
     const encodedConfig = Buffer.from(codexConfigBody, "utf8").toString("base64");
     remoteSteps.push(
       `mkdir -p ${dirRendered}`,
