@@ -190,39 +190,43 @@ export class CmuxClient {
    * param — passing a ref like "surface:42" falls through to the
    * focused pane's UUID parse path and silently splits the wrong pane.
    *
-   * Also returns ref + title so the caller can pick by type/title if
-   * needed.
+   * pane.list already returns selected_surface_id + ref per pane so we
+   * don't need the per-pane pane.surfaces round trip.
    */
   async listPaneSurfaces(
     workspaceId: string,
-  ): Promise<Array<{ surfaceId: string; surfaceRef: string; title: string; type: string | null }>> {
+  ): Promise<Array<{ surfaceId: string; surfaceRef: string; paneId: string; paneRef: string }>> {
     const result = (await this.rpc("pane.list", {
       workspace_id: workspaceId,
-    })) as { panes?: Array<{ pane_id?: string }> } | undefined;
-    const panes = result?.panes ?? [];
-    const out: Array<{ surfaceId: string; surfaceRef: string; title: string; type: string | null }> = [];
+    })) as {
+      panes?: Array<{
+        id?: string;
+        ref?: string;
+        focused?: boolean;
+        selected_surface_id?: string;
+        selected_surface_ref?: string;
+      }>;
+    } | undefined;
+    const panes = (result?.panes ?? []).slice().sort((a, b) => {
+      // focused first
+      const af = a.focused ? 0 : 1;
+      const bf = b.focused ? 0 : 1;
+      return af - bf;
+    });
+    const out: Array<{ surfaceId: string; surfaceRef: string; paneId: string; paneRef: string }> = [];
     for (const p of panes) {
-      if (!p.pane_id) continue;
-      const sf = (await this.rpc("pane.surfaces", {
-        workspace_id: workspaceId,
-        pane_id: p.pane_id,
-      })) as {
-        surfaces?: Array<{
-          id?: string;
-          ref?: string;
-          title?: string;
-          type?: string;
-        }>;
-      } | undefined;
-      for (const s of sf?.surfaces ?? []) {
-        if (s.id && s.ref) {
-          out.push({
-            surfaceId: s.id,
-            surfaceRef: s.ref,
-            title: s.title ?? "",
-            type: s.type ?? null,
-          });
-        }
+      if (
+        p.id &&
+        p.ref &&
+        p.selected_surface_id &&
+        p.selected_surface_ref
+      ) {
+        out.push({
+          paneId: p.id,
+          paneRef: p.ref,
+          surfaceId: p.selected_surface_id,
+          surfaceRef: p.selected_surface_ref,
+        });
       }
     }
     return out;
