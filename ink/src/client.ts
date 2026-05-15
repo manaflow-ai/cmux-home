@@ -172,6 +172,26 @@ export class CmuxClient {
     await this.rpc("workspace.select", { workspace_id: workspaceId });
   }
 
+  /** Return surface refs in the workspace in pane-order (focused first). */
+  async listPaneSurfaces(workspaceId: string): Promise<string[]> {
+    const result = (await this.rpc("pane.list", {
+      workspace_id: workspaceId,
+    })) as { panes?: Array<{ pane_ref?: string }> } | undefined;
+    const panes = result?.panes ?? [];
+    const surfaces: string[] = [];
+    for (const p of panes) {
+      if (!p.pane_ref) continue;
+      const sf = (await this.rpc("pane.surfaces", {
+        workspace_id: workspaceId,
+        pane_id: p.pane_ref,
+      })) as { surfaces?: Array<{ surface_ref?: string }> } | undefined;
+      for (const s of sf?.surfaces ?? []) {
+        if (s.surface_ref) surfaces.push(s.surface_ref);
+      }
+    }
+    return surfaces;
+  }
+
   async submitPrompt(workspaceId: string, message: string): Promise<void> {
     await this.rpc("workspace.prompt_submit", {
       workspace_id: workspaceId,

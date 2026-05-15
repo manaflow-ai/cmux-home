@@ -19,12 +19,6 @@ export interface CmuxSshOptions {
   readonly name: string;
   /** Pass true to NOT switch focus to the new workspace. */
   readonly noFocus?: boolean;
-  /**
-   * Remote command to exec after the ssh handshake. Wrapped as
-   * `bash -l -c '<remoteCommand>'` so the user's login PATH and
-   * /etc/profile.d sourcing kick in.
-   */
-  readonly remoteCommand?: string;
 }
 
 export interface CmuxSshResult {
@@ -37,10 +31,17 @@ export interface CmuxSshResult {
 
 /**
  * Invoke `cmux ssh` to create a new workspace whose main pane is an
- * ssh session to a forwarding-only gateway (Freestyle's russh, etc).
- * Requires the cmux build to have `--no-daemon-bootstrap` (see
- * manaflow-ai/cmux#feat-ssh-no-daemon-bootstrap). Returns the new
- * workspace ref.
+ * **interactive** ssh shell into a forwarding-only gateway
+ * (Freestyle's russh, etc). Requires the cmux build to have
+ * `--no-daemon-bootstrap` (see manaflow-ai/cmux#feat-ssh-no-daemon-bootstrap).
+ *
+ * IMPORTANT: we do NOT pass `-- <remote-command>` here. The russh
+ * freestyle gateway forwards "shell-request" channels (interactive
+ * shells) but rejects "exec" channels (ssh + remote command), even
+ * with `RequestTTY=force`. Trying it gives an infinite
+ *   `exec request failed on channel 0; reconnecting (attempt N/20)`
+ * loop. Instead we open an interactive shell, then send the bootstrap
+ * as typed text via surface.send_text once the workspace exists.
  */
 export async function openCmuxSshWorkspace(
   opts: CmuxSshOptions,
@@ -66,7 +67,6 @@ export async function openCmuxSshWorkspace(
   ];
   if (opts.noFocus) args.push("--no-focus");
   args.push(opts.destination);
-  if (opts.remoteCommand) args.push("--", "bash", "-l", "-c", opts.remoteCommand);
 
   const result = await runCmd(cli, args, 30_000);
   if (result.code !== 0) {

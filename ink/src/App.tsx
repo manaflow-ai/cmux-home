@@ -1236,24 +1236,45 @@ async function openTaskWorkspace(opts: {
     subrouterAccountId,
   });
 
-  // 2. cmux ssh as the workspace creator. This gives the codex pane the
-  //    first-class cmux ssh integration (ssh:connected status, auto
-  //    reconnect, etc).
+  // 2. cmux ssh as the workspace creator. Opens an INTERACTIVE shell on
+  //    the remote (no `-- <cmd>`). The russh freestyle gateway accepts
+  //    shell-request channels but rejects exec-request channels; passing
+  //    a remote command produces `exec request failed on channel 0` and
+  //    cmux loops on reconnect.
   setStatusLine(`cmux ssh into ${vmId.slice(0, 8)}…`);
   const ssh = await openCmuxSshWorkspace({
     destination: bootstrap.destination,
     name,
     noFocus: false,
-    remoteCommand: bootstrap.remoteCommand,
   });
   const workspaceRef = ssh.workspaceRef;
 
-  // 3. Add the three auxiliary panes. cmux ssh leaves a focused
+  // 3. Send the bootstrap to the interactive shell. cmux's SSH bootstrap
+  //    already allocates the PTY before we get a workspace_id back, so
+  //    surface.send_text lands inside the live shell. We pre-pend a
+  //    single CR so any pre-prompt buffered input gets flushed first,
+  //    and append a trailing CR to actually submit the chain.
+  try {
+    const surfaces = await client.listPaneSurfaces(workspaceRef);
+    const firstTerm = surfaces[0];
+    if (firstTerm) {
+      // The bootstrap chain already ends with `exec bash -l`, so when
+      // it finishes (or codex exits), the user keeps an interactive
+      // shell instead of cmux's reconnect loop kicking in.
+      const payload = `\n${bootstrap.remoteCommand}\n`;
+      await client.sendText(firstTerm, payload);
+    } else {
+      setStatusLine(`opened cmux ssh, but no surface to send bootstrap to`);
+    }
+  } catch (err) {
+    setStatusLine(`opened cmux ssh, bootstrap send failed: ${(err as Error).message}`);
+  }
+
+  // 4. Add the three auxiliary panes. cmux ssh leaves a focused
   //    workspace with one terminal panel, so pane.create has a target.
   const tailCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-tail`;
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
-    // Right side, top: browser to dev server.
     await client.createPane({
       workspaceId: workspaceRef,
       type: "browser",
@@ -1261,21 +1282,13 @@ async function openTaskWorkspace(opts: {
       url: devUrl,
       focus: false,
     });
-    // Bottom-right: dev log tail. Splits the browser pane down.
-    // We split the browser by using direction=down on the focused pane,
-    // which is whatever cmux focused last. Pass the browser surface
-    // explicitly to be safe.
-    const browserPane = (await client.createPane({
+    await client.createPane({
       workspaceId: workspaceRef,
       type: "terminal",
       direction: "down",
       initialCommand: tailCmd,
       focus: false,
-    })) ?? null;
-    if (!browserPane) {
-      setStatusLine(`browser/dev-log pane creation returned null`);
-    }
-    // Bottom-left: bash shell in the VM. Splits the codex pane down.
+    });
     await client.createPane({
       workspaceId: workspaceRef,
       type: "terminal",
