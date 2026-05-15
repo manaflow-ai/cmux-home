@@ -1015,7 +1015,7 @@ impl App {
 
     fn open_history_view(&mut self) {
         self.view_mode = ViewMode::History;
-        self.selected = self.selected.min(self.history.len().saturating_sub(1));
+        self.selected = 0;
         self.list_scroll = 0;
         self.focus_target = FocusTarget::MainContent;
         self.status_line = format!("{} prompts", self.history.len());
@@ -4282,5 +4282,30 @@ mod tests {
 
         assert_eq!(refreshed.latest_message, "fix submit flicker");
         assert_eq!(display_group(refreshed.agent_state()), AgentState::Working);
+    }
+
+    #[test]
+    fn opening_history_selects_first_prompt() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.history = vec![
+            draft_from_parts(vec!["first".to_string()], Vec::new(), AgentKind::Codex, false),
+            draft_from_parts(vec!["second".to_string()], Vec::new(), AgentKind::Codex, false),
+        ];
+        app.selected = 7;
+        app.list_scroll = 4;
+
+        app.open_history_view();
+
+        assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.list_scroll, 0);
     }
 }
