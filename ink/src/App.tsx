@@ -566,36 +566,43 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const launchVmSandbox = useCallback(
     async (vm: FreestyleSummary["vms"][number]) => {
       const shortId = vm.id.slice(0, 8);
+      // If we already have a task workspace pointing at this VM, just
+      // focus that one. Avoids piling up duplicate workspaces every time
+      // the user hits enter on the same VM row.
+      const existing = workspacesByVmId.get(vm.id);
+      const reuseTarget =
+        existing?.find((w) => /\btask:|\bfork:/.test(w.title ?? "")) ??
+        existing?.[0];
+      if (reuseTarget) {
+        try {
+          await client.selectWorkspace(reuseTarget.id);
+          setStatusLine(
+            `focused existing workspace ${reuseTarget.id.slice(0, 8)} for vm ${shortId}`,
+          );
+        } catch (err) {
+          setStatusLine(`focus failed: ${(err as Error).message}`);
+        }
+        return;
+      }
       setStatusLine(`opening sandbox for ${shortId}…`);
       try {
-        // The helper script reads FREESTYLE_API_KEY from process env, falling
-        // back to ~/.secrets/cmux*.env. Don't bake the key into the command
-        // string or it leaks into cmux logs and ps listings.
-        const cmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vm.id)}`;
         const workspaceId = await client.createWorkspace({
           title: `vm:${shortId}`,
-          description: `cmux ssh + subrouter into freestyle vm ${vm.id}`,
-          initialCommand: cmd,
+          description: `freestyle vm ${vm.id} interactive shell`,
+          layout: buildTaskLayout({
+            vmId: vm.id,
+            prompt: null,
+            devUrl: tailnetUrlForVm(vm.id),
+          }),
           cwd: resolvedCwd,
-          focus: false,
+          focus: true,
         });
-        try {
-          await client.createBrowserPane({
-            workspaceId,
-            url: "http://127.0.0.1:3000",
-            direction: "right",
-            focus: false,
-          });
-        } catch (err) {
-          setStatusLine(`opened ssh, browser pane failed: ${(err as Error).message}`);
-          return;
-        }
-        setStatusLine(`opened sandbox workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        setStatusLine(`opened workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
       } catch (err) {
         setStatusLine(`launch failed: ${(err as Error).message}`);
       }
     },
-    [client, freestyle, resolvedCwd],
+    [client, freestyle, resolvedCwd, tailnetUrlForVm, workspacesByVmId],
   );
 
   const launchVmOutside = useCallback(
@@ -666,14 +673,10 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           return next;
         });
         const shortChild = vmId.slice(0, 8);
-        setStatusLine(`fork ${shortChild} of ${shortParent} (snap ${snapshotId.slice(0, 8)}); waiting…`);
-        const ready = await waitForFreestyleHealthz(vmId, 120_000);
-        if (!ready) {
-          setStatusLine(`fork ${shortChild} did not become ready in 120 s; opening workspace anyway`);
-        } else {
-          setStatusLine(`fork ${shortChild} ready, opening workspace…`);
-        }
+        setStatusLine(`fork ${shortChild} of ${shortParent} (snap ${snapshotId.slice(0, 8)})`);
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
+        // Skip the healthz wait and open the workspace immediately. The
+        // codex pane will show the SSH/codex bootstrap progress live.
         const workspaceId = await client.createWorkspace({
           title: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
           description: `freestyle vm ${vmId} forked from ${parentVmId}; codex with:\n${prompt ?? "(no prompt)"}`,
@@ -683,7 +686,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
             devUrl: tailnetUrlForVm(vmId),
           }),
           cwd: resolvedCwd,
-          focus: false,
+          focus: true,
         });
         if (prompt && prompt.trim()) {
           setComposer(EMPTY_COMPOSER);
@@ -731,18 +734,23 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       }
       if (submitting) return;
       setSubmitting(true);
+      // Clear composer + reset its mode synchronously so the user sees the
+      // submit registered the moment they hit enter, before we even await
+      // the freestyle SDK round-trip.
+      setComposer(EMPTY_COMPOSER);
+      setComposerMode({ kind: "new" });
       try {
         const preview = trimmed.slice(0, 48);
         setStatusLine(`spawning cloud sandbox for "${preview}"…`);
+        // 1. Mint the VM (fast: ~400-800ms).
         const { vmId } = await freestyle.createFromSnapshot(snapshotId);
         const shortId = vmId.slice(0, 8);
-        setStatusLine(`waiting for vm ${shortId} to be ready…`);
-        const ready = await waitForFreestyleHealthz(vmId, 120_000);
-        if (!ready) {
-          setStatusLine(`vm ${shortId} did not become ready in 120 s; opening workspace anyway`);
-        } else {
-          setStatusLine(`vm ${shortId} ready, opening workspace…`);
-        }
+        // 2. Create the focused workspace immediately. We don't wait for
+        //    healthz here: the codex pane's bootstrap (in
+        //    freestyle-vm-ssh.mjs) already polls / retries the SSH
+        //    connection while the gateway is warming up, so the user sees
+        //    the panes laid out right away with live boot logs instead of
+        //    staring at the spawning message for 10-90s.
         const workspaceId = await client.createWorkspace({
           title: `task: ${preview}`,
           description: `freestyle vm ${vmId} running codex with:\n${trimmed}`,
@@ -752,11 +760,9 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
             devUrl: tailnetUrlForVm(vmId),
           }),
           cwd: resolvedCwd,
-          focus: false,
+          focus: true,
         });
-        setComposer(EMPTY_COMPOSER);
-        setComposerMode({ kind: "new" });
-        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        setStatusLine(`opened task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);

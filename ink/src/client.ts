@@ -143,6 +143,10 @@ export class CmuxClient {
     await this.rpc("surface.send_text", { surface: surfaceRef, text });
   }
 
+  async selectWorkspace(workspaceId: string): Promise<void> {
+    await this.rpc("workspace.select", { workspace_id: workspaceId });
+  }
+
   async submitPrompt(workspaceId: string, message: string): Promise<void> {
     await this.rpc("workspace.prompt_submit", {
       workspace_id: workspaceId,
