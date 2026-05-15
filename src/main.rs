@@ -24,7 +24,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
@@ -86,6 +86,13 @@ struct CommandSuggestion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandSuggestionMatch {
+    command: &'static str,
+    detail: &'static str,
+    positions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum AutocompleteKind {
     Command,
     File,
@@ -96,8 +103,16 @@ enum AutocompleteKind {
 struct AutocompleteItem {
     kind: AutocompleteKind,
     label: String,
+    label_match_positions: Vec<usize>,
     insert_text: String,
     detail: String,
+    detail_match_positions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FuzzyMatch {
+    score: u32,
+    positions: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1156,8 +1171,10 @@ impl App {
                         AutocompleteItem {
                             kind: AutocompleteKind::Command,
                             label: suggestion.command.to_string(),
+                            label_match_positions: suggestion.positions,
                             insert_text,
                             detail: suggestion.detail.to_string(),
+                            detail_match_positions: Vec::new(),
                         }
                     },
                 ));
@@ -1178,6 +1195,7 @@ impl App {
         let pattern = fuzzy_pattern(search);
         let mut matcher = fuzzy_matcher(false);
         let mut buf = Vec::new();
+        let mut positions = Vec::new();
         let mut matches = self
             .skills
             .iter()
@@ -1187,7 +1205,20 @@ impl App {
                 } else {
                     format!("{} {}", skill.name, skill.description)
                 };
-                let score = pattern.score(Utf32Str::new(&candidate, &mut buf), &mut matcher)?;
+                let full_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &candidate,
+                    &mut buf,
+                    &mut positions,
+                )?;
+                let title_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &skill.name,
+                    &mut buf,
+                    &mut positions,
+                );
                 let name = skill.name.to_ascii_lowercase();
                 let search = search.to_ascii_lowercase();
                 let source_match = skill
@@ -1195,11 +1226,14 @@ impl App {
                     .iter()
                     .any(|source| source.contains(self.provider.label()));
                 let prefix_match = search.is_empty() || name.starts_with(&search);
-                Some((score, source_match, prefix_match, skill))
+                let title_score = title_match.as_ref().map(|item| item.score).unwrap_or(0);
+                let score = full_match.score + title_score.saturating_mul(3);
+                Some((score, source_match, prefix_match, title_match, skill))
             })
             .collect::<Vec<_>>();
         matches.sort_by(
-            |(score_a, source_a, prefix_a, skill_a), (score_b, source_b, prefix_b, skill_b)| {
+            |(score_a, source_a, prefix_a, _, skill_a),
+             (score_b, source_b, prefix_b, _, skill_b)| {
                 score_b
                     .cmp(score_a)
                     .then_with(|| source_b.cmp(source_a))
@@ -1211,7 +1245,7 @@ impl App {
         let marker = query.marker.as_char();
         matches
             .into_iter()
-            .map(|(_, _, _, skill)| {
+            .map(|(_, _, _, title_match, skill)| {
                 let source = skill.sources.join(", ");
                 let detail = if skill.description.is_empty() {
                     format!("skill · {source}")
@@ -1221,8 +1255,12 @@ impl App {
                 AutocompleteItem {
                     kind: AutocompleteKind::Skill,
                     label: format!("{marker}{}", skill.name),
+                    label_match_positions: title_match
+                        .map(|item| shift_positions(&item.positions, 1))
+                        .unwrap_or_default(),
                     insert_text: format!("{marker}{} ", skill.name),
                     detail,
+                    detail_match_positions: Vec::new(),
                 }
             })
             .collect()
@@ -1236,27 +1274,61 @@ impl App {
         let pattern = fuzzy_pattern(search);
         let mut matcher = fuzzy_matcher(true);
         let mut buf = Vec::new();
+        let mut positions = Vec::new();
         let mut matches = self
             .file_references
             .iter()
             .filter_map(|file| {
-                let score = pattern.score(Utf32Str::new(&file.path, &mut buf), &mut matcher)?;
-                Some((score, file))
+                let path_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &file.path,
+                    &mut buf,
+                    &mut positions,
+                )?;
+                let title = file_reference_title(&file.path);
+                let title_match =
+                    fuzzy_match_candidate(&pattern, &mut matcher, title, &mut buf, &mut positions);
+                let title_lower = title.to_ascii_lowercase();
+                let search_lower = search.to_ascii_lowercase();
+                let mut score = path_match.score;
+                if let Some(title_match) = title_match.as_ref() {
+                    score = score.saturating_add(title_match.score.saturating_mul(5));
+                    if !search_lower.is_empty() && title_lower == search_lower {
+                        score = score.saturating_add(20_000);
+                    } else if !search_lower.is_empty() && title_lower.starts_with(&search_lower) {
+                        score = score.saturating_add(10_000);
+                    } else if !search_lower.is_empty() && title_lower.contains(&search_lower) {
+                        score = score.saturating_add(5_000);
+                    }
+                }
+                Some((score, path_match, title_match, file))
             })
             .collect::<Vec<_>>();
-        matches.sort_by(|(score_a, file_a), (score_b, file_b)| {
-            score_b
-                .cmp(score_a)
-                .then_with(|| file_a.path.cmp(&file_b.path))
-        });
+        matches.sort_by(
+            |(score_a, _, title_a, file_a), (score_b, _, title_b, file_b)| {
+                score_b
+                    .cmp(score_a)
+                    .then_with(|| title_b.is_some().cmp(&title_a.is_some()))
+                    .then_with(|| file_a.path.len().cmp(&file_b.path.len()))
+                    .then_with(|| file_a.path.cmp(&file_b.path))
+            },
+        );
         matches
             .into_iter()
             .take(MAX_AUTOCOMPLETE_ITEMS)
-            .map(|(_, file)| AutocompleteItem {
-                kind: AutocompleteKind::File,
-                label: format!("@{}", file.path),
-                insert_text: format!("@{} ", file.path),
-                detail: "file".to_string(),
+            .map(|(_, path_match, title_match, file)| {
+                let title = file_reference_title(&file.path);
+                AutocompleteItem {
+                    kind: AutocompleteKind::File,
+                    label: format!("@{title}"),
+                    label_match_positions: title_match
+                        .map(|item| shift_positions(&item.positions, 1))
+                        .unwrap_or_default(),
+                    insert_text: format!("@{} ", file.path),
+                    detail: file.path.clone(),
+                    detail_match_positions: path_match.positions,
+                }
             })
             .collect()
     }
@@ -1659,6 +1731,37 @@ fn fuzzy_matcher(path_mode: bool) -> FuzzyMatcher {
         config.prefer_prefix = true;
     }
     FuzzyMatcher::new(config)
+}
+
+fn fuzzy_match_candidate(
+    pattern: &Pattern,
+    matcher: &mut FuzzyMatcher,
+    candidate: &str,
+    buf: &mut Vec<char>,
+    positions: &mut Vec<u32>,
+) -> Option<FuzzyMatch> {
+    positions.clear();
+    let score = pattern.indices(Utf32Str::new(candidate, buf), matcher, positions)?;
+    positions.sort_unstable();
+    positions.dedup();
+    Some(FuzzyMatch {
+        score,
+        positions: positions
+            .iter()
+            .map(|position| *position as usize)
+            .collect(),
+    })
+}
+
+fn shift_positions(positions: &[usize], offset: usize) -> Vec<usize> {
+    positions
+        .iter()
+        .map(|position| position.saturating_add(offset))
+        .collect()
+}
+
+fn file_reference_title(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 fn resolve_agent_executable(name: &str, override_env: &str) -> String {
@@ -2376,21 +2479,23 @@ fn complete_autocomplete_selection(app: &mut App) -> bool {
     true
 }
 
-fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
+fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestionMatch> {
     let search = query.trim_start().trim_start_matches('/').trim();
     let pattern = fuzzy_pattern(search);
     let mut matcher = fuzzy_matcher(false);
     let mut buf = Vec::new();
+    let mut positions = Vec::new();
     let mut matches = COMMAND_SUGGESTIONS
         .iter()
         .copied()
         .filter_map(|suggestion| {
             let candidate = suggestion.command.trim_start_matches('/');
-            let score = pattern.score(Utf32Str::new(&candidate, &mut buf), &mut matcher)?;
-            Some((score, suggestion))
+            let match_item =
+                fuzzy_match_candidate(&pattern, &mut matcher, candidate, &mut buf, &mut positions)?;
+            Some((match_item.score, match_item.positions, suggestion))
         })
         .collect::<Vec<_>>();
-    matches.sort_by(|(score_a, suggestion_a), (score_b, suggestion_b)| {
+    matches.sort_by(|(score_a, _, suggestion_a), (score_b, _, suggestion_b)| {
         score_b
             .cmp(score_a)
             .then_with(|| suggestion_a.command.len().cmp(&suggestion_b.command.len()))
@@ -2398,7 +2503,11 @@ fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
     });
     matches
         .into_iter()
-        .map(|(_, suggestion)| suggestion)
+        .map(|(_, positions, suggestion)| CommandSuggestionMatch {
+            command: suggestion.command,
+            detail: suggestion.detail,
+            positions: shift_positions(&positions, 1),
+        })
         .collect()
 }
 
@@ -3186,8 +3295,14 @@ fn render_autocomplete_row(item: &AutocompleteItem, selected: bool, width: usize
     let label_width = 24;
     let marker_width = 7;
     let detail_width = width.saturating_sub(label_width + marker_width).max(8);
-    let label = format!("{:<label_width$}", truncate(&item.label, label_width));
-    let detail = truncate(&item.detail, detail_width);
+    let (label, label_positions) =
+        truncate_end_with_positions(&item.label, &item.label_match_positions, label_width);
+    let label = format!("{label:<label_width$}");
+    let (detail, detail_positions) = if item.kind == AutocompleteKind::File {
+        truncate_middle_with_positions(&item.detail, &item.detail_match_positions, detail_width)
+    } else {
+        truncate_end_with_positions(&item.detail, &item.detail_match_positions, detail_width)
+    };
     let content_width = marker_width + label_width + detail.chars().count();
     let trailing = width.saturating_sub(content_width);
     let base_style = if selected {
@@ -3195,19 +3310,139 @@ fn render_autocomplete_row(item: &AutocompleteItem, selected: bool, width: usize
     } else {
         muted_style()
     };
-    Line::from(vec![
-        Span::styled(format!("  {marker:<4} "), base_style),
-        Span::styled(
-            label,
-            if selected {
-                selected_title_style()
+    let label_style = if selected {
+        selected_title_style()
+    } else {
+        input_style()
+    };
+    let mut spans = vec![Span::styled(format!("  {marker:<4} "), base_style)];
+    spans.extend(highlighted_text_spans(
+        &label,
+        &label_positions,
+        label_style,
+        autocomplete_match_style(selected),
+    ));
+    spans.extend(highlighted_text_spans(
+        &detail,
+        &detail_positions,
+        base_style,
+        autocomplete_match_style(selected),
+    ));
+    spans.push(Span::styled(" ".repeat(trailing), base_style));
+    Line::from(spans)
+}
+
+fn highlighted_text_spans(
+    text: &str,
+    positions: &[usize],
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if positions.is_empty() {
+        return vec![Span::styled(text.to_string(), normal_style)];
+    }
+    let position_set = positions.iter().copied().collect::<HashSet<_>>();
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    for (index, ch) in text.chars().enumerate() {
+        let is_match = position_set.contains(&index);
+        if current.is_empty() {
+            current_is_match = is_match;
+        } else if is_match != current_is_match {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_is_match {
+                    match_style
+                } else {
+                    normal_style
+                },
+            ));
+            current_is_match = is_match;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_is_match {
+                match_style
             } else {
-                input_style()
+                normal_style
             },
-        ),
-        Span::styled(detail, base_style),
-        Span::styled(" ".repeat(trailing), base_style),
-    ])
+        ));
+    }
+    spans
+}
+
+fn truncate_end_with_positions(
+    text: &str,
+    positions: &[usize],
+    max_chars: usize,
+) -> (String, Vec<usize>) {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return (text.to_string(), positions.to_vec());
+    }
+    if max_chars <= 1 {
+        return ("…".to_string(), Vec::new());
+    }
+    let keep = max_chars.saturating_sub(1);
+    let truncated = format!("{}…", text.chars().take(keep).collect::<String>());
+    let positions = positions
+        .iter()
+        .copied()
+        .filter(|position| *position < keep)
+        .collect();
+    (truncated, positions)
+}
+
+fn truncate_middle_with_positions(
+    text: &str,
+    positions: &[usize],
+    max_chars: usize,
+) -> (String, Vec<usize>) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let char_count = chars.len();
+    if char_count <= max_chars {
+        return (text.to_string(), positions.to_vec());
+    }
+    if max_chars <= 1 {
+        return ("…".to_string(), Vec::new());
+    }
+    let available = max_chars.saturating_sub(1);
+    let front = available / 2;
+    let back = available.saturating_sub(front);
+    let back_start = char_count.saturating_sub(back);
+    let truncated = format!(
+        "{}…{}",
+        chars[..front].iter().collect::<String>(),
+        chars[back_start..].iter().collect::<String>()
+    );
+    let positions = positions
+        .iter()
+        .filter_map(|position| {
+            if *position < front {
+                Some(*position)
+            } else if *position >= back_start {
+                Some(front + 1 + position.saturating_sub(back_start))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (truncated, positions)
+}
+
+fn autocomplete_match_style(selected: bool) -> Style {
+    let style = Style::default()
+        .fg(Color::Rgb(86, 156, 214))
+        .add_modifier(Modifier::BOLD);
+    if selected {
+        style.bg(Color::Rgb(55, 55, 55))
+    } else {
+        style
+    }
 }
 
 fn draw_draft_list(
@@ -4547,6 +4782,55 @@ mod tests {
         assert!(complete_autocomplete_selection(&mut app));
 
         assert_eq!(app.composer.lines(), &["read @src/main.rs ".to_string()]);
+    }
+
+    #[test]
+    fn file_completion_biases_title_matches() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.file_references = vec![
+            FileReference {
+                path: "references/qstack/CLAUDE.md.file".to_string(),
+            },
+            FileReference {
+                path: "CLAUDE.md".to_string(),
+            },
+        ];
+        app.composer = composer_from_lines(vec!["@CLAUDE.md".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let items = app.autocomplete_items();
+
+        assert_eq!(
+            items.first().map(|item| item.label.as_str()),
+            Some("@CLAUDE.md")
+        );
+        assert_eq!(
+            items.first().map(|item| item.detail.as_str()),
+            Some("CLAUDE.md")
+        );
+        assert!(!items
+            .first()
+            .map(|item| item.label_match_positions.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn middle_truncation_keeps_front_and_end() {
+        let (text, positions) =
+            truncate_middle_with_positions("references/qstack/CLAUDE.md.file", &[0, 19, 24], 18);
+
+        assert!(text.starts_with("referenc"));
+        assert!(text.ends_with(".md.file"));
+        assert!(text.contains('…'));
+        assert!(positions.contains(&0));
     }
 
     #[test]
