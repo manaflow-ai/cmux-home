@@ -1262,7 +1262,7 @@ async function openTaskWorkspace(opts: {
       // it finishes (or codex exits), the user keeps an interactive
       // shell instead of cmux's reconnect loop kicking in.
       const payload = `\n${bootstrap.remoteCommand}\n`;
-      await client.sendText(firstTerm, payload);
+      await client.sendText(firstTerm.surfaceRef, payload);
     } else {
       setStatusLine(`opened cmux ssh, but no surface to send bootstrap to`);
     }
@@ -1289,41 +1289,39 @@ async function openTaskWorkspace(opts: {
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
     const initialSurfaces = await client.listPaneSurfaces(workspaceRef);
-    const codexSurface = initialSurfaces[0];
-    if (!codexSurface) {
+    const codex = initialSurfaces[0];
+    if (!codex) {
       setStatusLine(`opened cmux ssh, but no codex surface to anchor splits`);
       return workspaceRef;
     }
-    // Top-right: browser, anchored on codex pane.
+    // Top-right: browser, anchored on the codex pane.
     const browser = await client.createPane({
       workspaceId: workspaceRef,
       type: "browser",
       direction: "right",
       url: devUrl,
       focus: false,
-      surfaceRef: codexSurface,
+      sourceSurfaceId: codex.surfaceId,
     });
-    // Bottom-right: dev server, anchored on the browser pane (split it
-    // down).
-    if (browser?.surfaceRef) {
+    // Bottom-right: dev server, anchored on the browser pane.
+    if (browser?.surfaceId) {
       await client.createPane({
         workspaceId: workspaceRef,
         type: "terminal",
         direction: "down",
         initialCommand: devCmd,
         focus: false,
-        surfaceRef: browser.surfaceRef,
+        sourceSurfaceId: browser.surfaceId,
       });
     }
-    // Bottom-left: bash shell, anchored on the codex pane (split it
-    // down).
+    // Bottom-left: bash shell, anchored on the codex pane.
     await client.createPane({
       workspaceId: workspaceRef,
       type: "terminal",
       direction: "down",
       initialCommand: shellCmd,
       focus: false,
-      surfaceRef: codexSurface,
+      sourceSurfaceId: codex.surfaceId,
     });
   } catch (err) {
     setStatusLine(`opened cmux ssh, aux panes failed: ${(err as Error).message}`);

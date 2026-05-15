@@ -126,8 +126,13 @@ export class CmuxClient {
     url?: string;
     initialCommand?: string;
     focus?: boolean;
-    surfaceRef?: string;
-  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
+    /**
+     * Surface UUID (NOT ref) to anchor the split on. cmux's pane.create
+     * `surface_id` param goes through `UUID.init(uuidString:)`; a "surface:N"
+     * ref returns nil and the call silently falls back to the focused pane.
+     */
+    sourceSurfaceId?: string;
+  }): Promise<{ paneId: string; paneRef: string; surfaceId: string; surfaceRef: string } | null> {
     const params: Record<string, unknown> = {
       workspace_id: input.workspaceId,
       type: input.type,
@@ -136,12 +141,19 @@ export class CmuxClient {
     };
     if (input.url) params.url = input.url;
     if (input.initialCommand) params.initial_command = input.initialCommand;
-    if (input.surfaceRef) params.surface_id = input.surfaceRef;
+    if (input.sourceSurfaceId) params.surface_id = input.sourceSurfaceId;
     const result = (await this.rpc("pane.create", params)) as
-      | { pane_ref?: string; surface_ref?: string }
+      | { pane_id?: string; pane_ref?: string; surface_id?: string; surface_ref?: string }
       | undefined;
-    if (!result?.pane_ref || !result?.surface_ref) return null;
-    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+    if (!result?.pane_ref || !result?.surface_ref || !result?.surface_id || !result?.pane_id) {
+      return null;
+    }
+    return {
+      paneId: result.pane_id,
+      paneRef: result.pane_ref,
+      surfaceId: result.surface_id,
+      surfaceRef: result.surface_ref,
+    };
   }
 
   async splitSurface(input: {
@@ -172,24 +184,48 @@ export class CmuxClient {
     await this.rpc("workspace.select", { workspace_id: workspaceId });
   }
 
-  /** Return surface refs in the workspace in pane-order (focused first). */
-  async listPaneSurfaces(workspaceId: string): Promise<string[]> {
+  /**
+   * Return surface UUIDs (NOT refs) in the workspace in pane-order
+   * (focused first). UUIDs are required by pane.create's `surface_id`
+   * param — passing a ref like "surface:42" falls through to the
+   * focused pane's UUID parse path and silently splits the wrong pane.
+   *
+   * Also returns ref + title so the caller can pick by type/title if
+   * needed.
+   */
+  async listPaneSurfaces(
+    workspaceId: string,
+  ): Promise<Array<{ surfaceId: string; surfaceRef: string; title: string; type: string | null }>> {
     const result = (await this.rpc("pane.list", {
       workspace_id: workspaceId,
-    })) as { panes?: Array<{ pane_ref?: string }> } | undefined;
+    })) as { panes?: Array<{ pane_id?: string }> } | undefined;
     const panes = result?.panes ?? [];
-    const surfaces: string[] = [];
+    const out: Array<{ surfaceId: string; surfaceRef: string; title: string; type: string | null }> = [];
     for (const p of panes) {
-      if (!p.pane_ref) continue;
+      if (!p.pane_id) continue;
       const sf = (await this.rpc("pane.surfaces", {
         workspace_id: workspaceId,
-        pane_id: p.pane_ref,
-      })) as { surfaces?: Array<{ surface_ref?: string }> } | undefined;
+        pane_id: p.pane_id,
+      })) as {
+        surfaces?: Array<{
+          id?: string;
+          ref?: string;
+          title?: string;
+          type?: string;
+        }>;
+      } | undefined;
       for (const s of sf?.surfaces ?? []) {
-        if (s.surface_ref) surfaces.push(s.surface_ref);
+        if (s.id && s.ref) {
+          out.push({
+            surfaceId: s.id,
+            surfaceRef: s.ref,
+            title: s.title ?? "",
+            type: s.type ?? null,
+          });
+        }
       }
     }
-    return surfaces;
+    return out;
   }
 
   async submitPrompt(workspaceId: string, message: string): Promise<void> {
