@@ -14,6 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
+import { openCmuxSshWorkspace, prepareFreestyleBootstrap } from "./cmux-ssh.js";
 import {
   COLORS,
   SPINNER_FRAMES,
@@ -571,7 +572,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       // the user hits enter on the same VM row.
       const existing = workspacesByVmId.get(vm.id);
       const reuseTarget =
-        existing?.find((w) => /\btask:|\bfork:/.test(w.title ?? "")) ??
+        existing?.find((w) => /\btask:|\bfork:|\bvm:/.test(w.title ?? "")) ??
         existing?.[0];
       if (reuseTarget) {
         try {
@@ -586,23 +587,22 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       }
       setStatusLine(`opening sandbox for ${shortId}…`);
       try {
-        const workspaceId = await client.createWorkspace({
-          title: `vm:${shortId}`,
-          description: `freestyle vm ${vm.id} interactive shell`,
-          layout: buildTaskLayout({
-            vmId: vm.id,
-            prompt: null,
-            devUrl: tailnetUrlForVm(vm.id),
-          }),
-          cwd: resolvedCwd,
-          focus: true,
+        await openTaskWorkspace({
+          client,
+          vmId: vm.id,
+          name: `vm:${shortId}`,
+          codexPrompt: null,
+          helperPath: VM_SSH_SCRIPT,
+          devUrl: tailnetUrlForVm(vm.id),
+          subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
+          setStatusLine,
         });
-        setStatusLine(`opened workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        setStatusLine(`opened workspace for vm ${shortId}`);
       } catch (err) {
         setStatusLine(`launch failed: ${(err as Error).message}`);
       }
     },
-    [client, freestyle, resolvedCwd, tailnetUrlForVm, workspacesByVmId],
+    [client, freestyle, tailnetUrlForVm, workspacesByVmId],
   );
 
   const launchVmOutside = useCallback(
@@ -675,19 +675,17 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         const shortChild = vmId.slice(0, 8);
         setStatusLine(`fork ${shortChild} of ${shortParent} (snap ${snapshotId.slice(0, 8)})`);
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
-        // Skip the healthz wait and open the workspace immediately. The
-        // codex pane will show the SSH/codex bootstrap progress live.
-        const workspaceId = await client.createWorkspace({
-          title: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
-          description: `freestyle vm ${vmId} forked from ${parentVmId}; codex with:\n${prompt ?? "(no prompt)"}`,
-          layout: buildTaskLayout({
-            vmId,
-            prompt: prompt && prompt.trim() ? prompt.trim() : null,
-            devUrl: tailnetUrlForVm(vmId),
-          }),
-          cwd: resolvedCwd,
-          focus: true,
+        await openTaskWorkspace({
+          client,
+          vmId,
+          name: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
+          codexPrompt: prompt && prompt.trim() ? prompt.trim() : null,
+          helperPath: VM_SSH_SCRIPT,
+          devUrl: tailnetUrlForVm(vmId),
+          subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
+          setStatusLine,
         });
+        const workspaceId = "(see sidebar)";
         if (prompt && prompt.trim()) {
           setComposer(EMPTY_COMPOSER);
           setComposerMode({ kind: "new" });
@@ -734,35 +732,24 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       }
       if (submitting) return;
       setSubmitting(true);
-      // Clear composer + reset its mode synchronously so the user sees the
-      // submit registered the moment they hit enter, before we even await
-      // the freestyle SDK round-trip.
       setComposer(EMPTY_COMPOSER);
       setComposerMode({ kind: "new" });
       try {
         const preview = trimmed.slice(0, 48);
         setStatusLine(`spawning cloud sandbox for "${preview}"…`);
-        // 1. Mint the VM (fast: ~400-800ms).
         const { vmId } = await freestyle.createFromSnapshot(snapshotId);
         const shortId = vmId.slice(0, 8);
-        // 2. Create the focused workspace immediately. We don't wait for
-        //    healthz here: the codex pane's bootstrap (in
-        //    freestyle-vm-ssh.mjs) already polls / retries the SSH
-        //    connection while the gateway is warming up, so the user sees
-        //    the panes laid out right away with live boot logs instead of
-        //    staring at the spawning message for 10-90s.
-        const workspaceId = await client.createWorkspace({
-          title: `task: ${preview}`,
-          description: `freestyle vm ${vmId} running codex with:\n${trimmed}`,
-          layout: buildTaskLayout({
-            vmId,
-            prompt: trimmed,
-            devUrl: tailnetUrlForVm(vmId),
-          }),
-          cwd: resolvedCwd,
-          focus: true,
+        await openTaskWorkspace({
+          client,
+          vmId,
+          name: `task: ${preview}`,
+          codexPrompt: trimmed,
+          helperPath: VM_SSH_SCRIPT,
+          devUrl: tailnetUrlForVm(vmId),
+          subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
+          setStatusLine,
         });
-        setStatusLine(`opened task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
+        setStatusLine(`opened task workspace for vm ${shortId}`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);
@@ -770,7 +757,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, tailnetUrlForVm],
+    [client, freestyle, refreshFreestyle, submitting, tailnetUrlForVm],
   );
 
   const dispatchSlashCommand = useCallback(
@@ -1199,81 +1186,107 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
 }
 
 /**
- * Build the layout JSON for a "task" workspace:
+ * Open a task workspace: invoke `cmux ssh` to make the codex pane a
+ * first-class ssh-managed workspace (status indicators, reconnect),
+ * then add the auxiliary panes (browser, shell, dev-log) via pane.create.
  *
- *   ┌──────────────────────┬──────────────────────┐
- *   │  terminal (codex)    │  browser → devUrl    │
- *   ├──────────────────────┼──────────────────────┤
- *   │  terminal (bash)     │  terminal (dev tail) │
- *   └──────────────────────┴──────────────────────┘
+ * Final layout is a 2x2 grid:
+ *   ┌────────────────────────┬───────────────────────┐
+ *   │ cmux ssh (codex)       │ browser → devUrl      │
+ *   ├────────────────────────┼───────────────────────┤
+ *   │ ssh + bash (~/cmux)    │ ssh + dev log tail    │
+ *   └────────────────────────┴───────────────────────┘
  *
- * Bottom-left is a plain ssh shell into the VM (cwd ~/cmux) for the
- * user to poke at the repo, run one-off commands, etc.
- *
- * Layout is applied at workspace.create time so all four surfaces boot
- * in one RPC without needing the workspace to be focused first
- * (pane.create/surface.split both need a focused source surface).
+ * The codex pane goes through `cmux ssh` directly (with
+ * --no-daemon-bootstrap so the russh gateway doesn't try to scp
+ * cmuxd-remote). The dev-log + shell panes stay on the lightweight
+ * helper-script attach modes (--attach-dev-tail / --attach-shell) since
+ * each cmux ssh call creates its own workspace and we want them as
+ * panes inside this workspace.
  */
-function buildTaskLayout(opts: {
+async function openTaskWorkspace(opts: {
+  client: CmuxClient;
   vmId: string;
-  prompt: string | null;
+  name: string;
+  codexPrompt: string | null;
+  helperPath: string;
   devUrl: string;
-}): unknown {
-  const { vmId, prompt, devUrl } = opts;
-  const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
-    ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
-    : "";
-  const promptFlag = prompt ? ` --codex-prompt ${shellQuote(prompt)}` : "";
-  const codexCmd =
-    `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --clone-cmux` +
-    acctFlag +
-    promptFlag;
-  const tailCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail`;
-  const shellCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-shell`;
-  return {
-    direction: "horizontal",
-    split: 0.5,
-    children: [
-      {
-        direction: "vertical",
-        split: 0.65,
-        children: [
-          {
-            pane: {
-              surfaces: [
-                { type: "terminal", command: codexCmd, name: "codex", focus: true },
-              ],
-            },
-          },
-          {
-            pane: {
-              surfaces: [
-                { type: "terminal", command: shellCmd, name: "shell" },
-              ],
-            },
-          },
-        ],
-      },
-      {
-        direction: "vertical",
-        split: 0.65,
-        children: [
-          {
-            pane: {
-              surfaces: [{ type: "browser", url: devUrl, name: "dev server" }],
-            },
-          },
-          {
-            pane: {
-              surfaces: [
-                { type: "terminal", command: tailCmd, name: "dev log" },
-              ],
-            },
-          },
-        ],
-      },
-    ],
-  };
+  subrouterAccountId: string | null;
+  setStatusLine: (s: string) => void;
+}): Promise<string> {
+  const {
+    client,
+    vmId,
+    name,
+    codexPrompt,
+    helperPath,
+    devUrl,
+    subrouterAccountId,
+    setStatusLine,
+  } = opts;
+
+  // 1. Mint freestyle creds + build the full remote bootstrap script.
+  setStatusLine(`preparing bootstrap for ${vmId.slice(0, 8)}…`);
+  const bootstrap = await prepareFreestyleBootstrap({
+    helperPath,
+    vmId,
+    cloneCmux: true,
+    codexPrompt,
+    subrouterAccountId,
+  });
+
+  // 2. cmux ssh as the workspace creator. This gives the codex pane the
+  //    first-class cmux ssh integration (ssh:connected status, auto
+  //    reconnect, etc).
+  setStatusLine(`cmux ssh into ${vmId.slice(0, 8)}…`);
+  const ssh = await openCmuxSshWorkspace({
+    destination: bootstrap.destination,
+    name,
+    noFocus: false,
+    remoteCommand: bootstrap.remoteCommand,
+  });
+  const workspaceRef = ssh.workspaceRef;
+
+  // 3. Add the three auxiliary panes. cmux ssh leaves a focused
+  //    workspace with one terminal panel, so pane.create has a target.
+  const tailCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-tail`;
+  const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
+  try {
+    // Right side, top: browser to dev server.
+    await client.createPane({
+      workspaceId: workspaceRef,
+      type: "browser",
+      direction: "right",
+      url: devUrl,
+      focus: false,
+    });
+    // Bottom-right: dev log tail. Splits the browser pane down.
+    // We split the browser by using direction=down on the focused pane,
+    // which is whatever cmux focused last. Pass the browser surface
+    // explicitly to be safe.
+    const browserPane = (await client.createPane({
+      workspaceId: workspaceRef,
+      type: "terminal",
+      direction: "down",
+      initialCommand: tailCmd,
+      focus: false,
+    })) ?? null;
+    if (!browserPane) {
+      setStatusLine(`browser/dev-log pane creation returned null`);
+    }
+    // Bottom-left: bash shell in the VM. Splits the codex pane down.
+    await client.createPane({
+      workspaceId: workspaceRef,
+      type: "terminal",
+      direction: "down",
+      initialCommand: shellCmd,
+      focus: false,
+    });
+  } catch (err) {
+    setStatusLine(`opened cmux ssh, aux panes failed: ${(err as Error).message}`);
+  }
+
+  return workspaceRef;
 }
 
 async function waitForFreestyleHealthz(

@@ -119,6 +119,31 @@ export class CmuxClient {
     return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
   }
 
+  async createPane(input: {
+    workspaceId: string;
+    type: "terminal" | "browser";
+    direction: "left" | "right" | "up" | "down";
+    url?: string;
+    initialCommand?: string;
+    focus?: boolean;
+    surfaceRef?: string;
+  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
+    const params: Record<string, unknown> = {
+      workspace_id: input.workspaceId,
+      type: input.type,
+      direction: input.direction,
+      focus: input.focus ?? false,
+    };
+    if (input.url) params.url = input.url;
+    if (input.initialCommand) params.initial_command = input.initialCommand;
+    if (input.surfaceRef) params.surface_id = input.surfaceRef;
+    const result = (await this.rpc("pane.create", params)) as
+      | { pane_ref?: string; surface_ref?: string }
+      | undefined;
+    if (!result?.pane_ref || !result?.surface_ref) return null;
+    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+  }
+
   async splitSurface(input: {
     workspaceId: string;
     surfaceRef: string;

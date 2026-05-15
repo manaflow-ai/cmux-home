@@ -361,6 +361,25 @@ try {
   }
   const remoteCommand = remoteSteps.join(" && ");
 
+  // --print-bootstrap mode: emit the credentials + bootstrap script as
+  // JSON on stdout and exit, so an outer process (cmux-home) can hand
+  // them off to `cmux ssh ... -- bash -l -c '<remoteCommand>'` without
+  // ever invoking sshpass. We intentionally DO NOT cleanup() here: the
+  // freestyle identity needs to outlive this process so cmux's reconnect
+  // logic can re-establish the SSH session.
+  if (args.printBootstrap) {
+    process.stdout.write(
+      JSON.stringify({
+        destination: `${args.vmId}+${args.user}:${token}@vm-ssh.freestyle.sh`,
+        identityId,
+        remoteCommand,
+      }) + "\n",
+    );
+    // Mark identity as "owned by caller" so cleanup() doesn't revoke it.
+    identityId = "";
+    process.exit(0);
+  }
+
   // Force TTY allocation. Single -t downgrades to no TTY when our stdin
   // isn't a terminal (it isn't, when called from cmux's workspace
   // initial_command since cmux pipes through). -tt forces it; the remote
@@ -417,6 +436,7 @@ function parseArgs(argv) {
     cloneCmux: false,
     devServerMacPort: null,
     attachMode: "shell",
+    printBootstrap: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -486,6 +506,9 @@ function parseArgs(argv) {
         break;
       case "--attach-shell":
         out.attachMode = "shell-attach";
+        break;
+      case "--print-bootstrap":
+        out.printBootstrap = true;
         break;
     }
   }
