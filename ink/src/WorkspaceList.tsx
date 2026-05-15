@@ -198,17 +198,22 @@ const VmRow = React.memo(function VmRow({
   const idWidth = Math.max(8, 22 - indentWidth);
   const stateWidth = 11;
   const snapshotWidth = 24;
-  const ageLen = 4;
+  const ageStr = timeAgo(vm.lastActivityMs ?? vm.createdAtMs);
+  const ageLen = cellWidth(ageStr);
   const id = padEnd(truncate(vm.id, idWidth), idWidth);
   const stateLabel = padEnd(vm.state, stateWidth);
   const snapshotLabel = padEnd(
     truncate(vm.snapshotId ?? "no snapshot", snapshotWidth),
     snapshotWidth,
   );
-  const age = padStart(timeAgo(vm.lastActivityMs ?? vm.createdAtMs), ageLen);
-  const tailSegment = ` ${stateLabel} ${snapshotLabel} ${age}`;
-  const prefixWidth = 3 + 2 + indentWidth + idWidth;
-  const trailing = Math.max(0, width - prefixWidth - cellWidth(tailSegment));
+  // Layout: "   " + marker + " " + indent + id + " " + state + " " + snapshot + <pad> + age
+  // The trailing age is right-flushed against the screen edge.
+  const prefix = `   ${marker} `; // 3 + 2 = 5 cells
+  const prefixWidth = cellWidth(prefix);
+  const midSegment = ` ${stateLabel} ${snapshotLabel}`;
+  const midWidth = cellWidth(midSegment);
+  const usedWidth = prefixWidth + indentWidth + idWidth + midWidth + ageLen;
+  const padBeforeAge = Math.max(1, width - usedWidth);
 
   return (
     <Box>
@@ -219,8 +224,9 @@ const VmRow = React.memo(function VmRow({
           <Text color={baseColor} backgroundColor={baseBg}>{indent}</Text>
         ) : null}
         <Text color={titleColor} backgroundColor={baseBg}>{id}</Text>
-        <Text color={baseColor} backgroundColor={baseBg}>{tailSegment}</Text>
-        <Text color={baseColor} backgroundColor={baseBg}>{" ".repeat(trailing)}</Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{midSegment}</Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{" ".repeat(padBeforeAge)}</Text>
+        <Text color={baseColor} backgroundColor={baseBg}>{ageStr}</Text>
       </Text>
     </Box>
   );
@@ -284,41 +290,25 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
   const unreadWidth = cellWidth(unreadText);
   const markerWidth = cellWidth(marker) + 1; // marker + space
   const ageLen = cellWidth(age);
-  const fixedWidth = unreadWidth + markerWidth + indentWidth + titleWidth + 2 + ageLen;
-  const messageWidth = Math.max(8, width - fixedWidth);
-  // Collapse newlines in title + message — workspace descriptions can be
-  // multi-line (our cloud submit writes "freestyle vm X running codex
-  // with:\n<prompt>"), and a stray \n in either field makes Ink wrap the
-  // row to a second line, breaking the column alignment.
+  // Layout: unread + marker + indent + title + " " + message + <pad> + age
+  // Age is flush right against the edge.
+  const usedFixedWidth = unreadWidth + markerWidth + indentWidth + titleWidth + 1 + ageLen;
+  const messageWidth = Math.max(8, width - usedFixedWidth - 1);
   const title = padEnd(oneLinePreview(workspace.title, titleWidth), titleWidth);
   const message = oneLinePreview(workspace.latestMessage, messageWidth);
   const messageLen = cellWidth(message);
-  const gap = Math.max(
+  const padBeforeAge = Math.max(
     1,
-    width -
-      (unreadWidth + markerWidth + indentWidth + titleWidth + 1 + messageLen) -
-      ageLen,
+    width - (unreadWidth + markerWidth + indentWidth + titleWidth + 1 + messageLen) - ageLen,
   );
-  const pad = " ".repeat(gap);
-  const trailing = Math.max(
-    0,
-    width -
-      (unreadWidth +
-        markerWidth +
-        indentWidth +
-        titleWidth +
-        1 +
-        messageLen +
-        pad.length +
-        ageLen),
-  );
+  const pad = " ".repeat(padBeforeAge);
 
   const baseColor = COLORS.muted;
   const baseBg = selected ? COLORS.selectedBg : undefined;
   const titleColor = selected ? COLORS.selectedTitleFg : COLORS.muted;
   const unreadColor = COLORS.unread;
   const markerSegment = `${marker} `;
-  const tailSegment = ` ${message}${pad}${age}${" ".repeat(trailing)}`;
+  const tailSegment = ` ${message}${pad}${age}`;
 
   return (
     <Box>
