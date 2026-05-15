@@ -8,6 +8,7 @@ import {
   agentState,
   cellWidth,
   displayGroup,
+  oneLinePreview,
   padEnd,
   timeAgo,
   truncate,
@@ -178,7 +179,7 @@ const VmRow = React.memo(function VmRow({
     ? SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length]!
     : VM_STATE_GLYPH[vm.state];
 
-  const indent = depth > 0 ? "  ".repeat(depth) + "└ " : "";
+  const indent = depth > 0 ? "  ".repeat(depth - 1) + "└─ " : "";
   const indentWidth = cellWidth(indent);
   const idWidth = Math.max(8, 22 - indentWidth);
   const stateWidth = 11;
@@ -269,7 +270,7 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
         ? " "
         : "∙";
 
-  const indent = depth > 0 ? "  ".repeat(depth) + "└ " : "";
+  const indent = depth > 0 ? "  ".repeat(depth - 1) + "└─ " : "";
   const indentWidth = cellWidth(indent);
   const titleWidth = Math.max(8, 28 - indentWidth);
   const unreadWidth = cellWidth(unreadText);
@@ -277,8 +278,12 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
   const ageLen = cellWidth(age);
   const fixedWidth = unreadWidth + markerWidth + indentWidth + titleWidth + 2 + ageLen;
   const messageWidth = Math.max(8, width - fixedWidth);
-  const title = padEnd(truncate(workspace.title, titleWidth), titleWidth);
-  const message = truncate(workspace.latestMessage, messageWidth);
+  // Collapse newlines in title + message — workspace descriptions can be
+  // multi-line (our cloud submit writes "freestyle vm X running codex
+  // with:\n<prompt>"), and a stray \n in either field makes Ink wrap the
+  // row to a second line, breaking the column alignment.
+  const title = padEnd(oneLinePreview(workspace.title, titleWidth), titleWidth);
+  const message = oneLinePreview(workspace.latestMessage, messageWidth);
   const messageLen = cellWidth(message);
   const gap = Math.max(
     1,
