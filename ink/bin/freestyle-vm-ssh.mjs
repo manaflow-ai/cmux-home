@@ -103,6 +103,7 @@ const installCleanup = () => {
   process.on("exit", () => { /* sync cleanup already happened */ });
 };
 
+await (async () => {
 try {
   installCleanup();
 
@@ -387,6 +388,7 @@ try {
   await cleanup();
   process.exit(1);
 }
+})();
 
 function parseArgs(argv) {
   const out = {
