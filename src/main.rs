@@ -19,6 +19,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ignore::WalkBuilder;
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -59,6 +62,8 @@ const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
 const COMPOSER_CONTINUATION_PROMPT: &str = "  ";
 const MAX_AUTOCOMPLETE_ROWS: usize = 8;
+const MAX_AUTOCOMPLETE_ITEMS: usize = 100;
+const MAX_FILE_REFERENCES: usize = 20_000;
 const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
     CommandSuggestion {
         command: "/history",
@@ -83,6 +88,7 @@ struct CommandSuggestion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AutocompleteKind {
     Command,
+    File,
     Skill,
 }
 
@@ -110,6 +116,7 @@ enum SelectionDirection {
 enum AutocompleteMarker {
     Slash,
     Dollar,
+    At,
 }
 
 impl AutocompleteMarker {
@@ -117,6 +124,7 @@ impl AutocompleteMarker {
         match self {
             Self::Slash => '/',
             Self::Dollar => '$',
+            Self::At => '@',
         }
     }
 }
@@ -258,6 +266,7 @@ struct App {
     claude_submit_template: Option<String>,
     rename_template: Option<String>,
     skills: Vec<SkillEntry>,
+    file_references: Vec<FileReference>,
     provider: AgentKind,
     plan_mode: bool,
     show_shortcuts: bool,
@@ -302,6 +311,11 @@ struct ImageSelection {
     image_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileReference {
+    path: String,
+}
+
 impl App {
     fn new(args: Args) -> Self {
         let socket_path = args
@@ -320,6 +334,7 @@ impl App {
         let persisted = load_persisted_state(&state_path);
         let config = load_config(args.config.as_ref());
         let skills = load_skill_entries(&workspace_cwd);
+        let file_references = load_file_references(&workspace_cwd);
         let codex_bin = resolve_agent_executable("codex", "CMUX_HOME_CODEX_BIN");
         let claude_bin = resolve_agent_executable("claude", "CMUX_HOME_CLAUDE_BIN");
         let terminal_path = std::env::var("PATH").ok();
@@ -349,6 +364,7 @@ impl App {
             claude_submit_template: config.agents.claude.submit_command,
             rename_template: config.rename.command,
             skills,
+            file_references,
             provider: AgentKind::Codex,
             plan_mode: false,
             show_shortcuts: false,
@@ -1128,11 +1144,10 @@ impl App {
             return Vec::new();
         };
         let mut items = Vec::new();
-        if query.marker == AutocompleteMarker::Slash {
-            items.extend(
-                command_suggestions_for_query(&query.raw)
-                    .into_iter()
-                    .map(|suggestion| {
+        match query.marker {
+            AutocompleteMarker::Slash => {
+                items.extend(command_suggestions_for_query(&query.raw).into_iter().map(
+                    |suggestion| {
                         let insert_text = if suggestion.command == "/stash save" {
                             "/stash save ".to_string()
                         } else {
@@ -1144,42 +1159,50 @@ impl App {
                             insert_text,
                             detail: suggestion.detail.to_string(),
                         }
-                    }),
-            );
+                    },
+                ));
+                items.extend(self.skill_autocomplete_items(&query));
+            }
+            AutocompleteMarker::Dollar => items.extend(self.skill_autocomplete_items(&query)),
+            AutocompleteMarker::At => items.extend(self.file_autocomplete_items(&query)),
         }
-        items.extend(self.skill_autocomplete_items(&query));
+        items.truncate(MAX_AUTOCOMPLETE_ITEMS);
         items
     }
 
     fn skill_autocomplete_items(&self, query: &AutocompleteQuery) -> Vec<AutocompleteItem> {
-        let search = query.search.trim().to_ascii_lowercase();
+        let search = query.search.trim();
         if search.contains(char::is_whitespace) {
             return Vec::new();
         }
+        let pattern = fuzzy_pattern(search);
+        let mut matcher = fuzzy_matcher(false);
+        let mut buf = Vec::new();
         let mut matches = self
             .skills
             .iter()
             .filter_map(|skill| {
+                let candidate = if skill.description.is_empty() {
+                    skill.name.clone()
+                } else {
+                    format!("{} {}", skill.name, skill.description)
+                };
+                let score = pattern.score(Utf32Str::new(&candidate, &mut buf), &mut matcher)?;
                 let name = skill.name.to_ascii_lowercase();
-                let description = skill.description.to_ascii_lowercase();
-                let is_match = search.is_empty()
-                    || name.starts_with(&search)
-                    || name.contains(&search)
-                    || description.contains(&search);
-                is_match.then(|| {
-                    let source_match = skill
-                        .sources
-                        .iter()
-                        .any(|source| source.contains(self.provider.label()));
-                    let prefix_match = search.is_empty() || name.starts_with(&search);
-                    (source_match, prefix_match, skill)
-                })
+                let search = search.to_ascii_lowercase();
+                let source_match = skill
+                    .sources
+                    .iter()
+                    .any(|source| source.contains(self.provider.label()));
+                let prefix_match = search.is_empty() || name.starts_with(&search);
+                Some((score, source_match, prefix_match, skill))
             })
             .collect::<Vec<_>>();
         matches.sort_by(
-            |(source_a, prefix_a, skill_a), (source_b, prefix_b, skill_b)| {
-                source_b
-                    .cmp(source_a)
+            |(score_a, source_a, prefix_a, skill_a), (score_b, source_b, prefix_b, skill_b)| {
+                score_b
+                    .cmp(score_a)
+                    .then_with(|| source_b.cmp(source_a))
                     .then_with(|| prefix_b.cmp(prefix_a))
                     .then_with(|| skill_a.priority.cmp(&skill_b.priority))
                     .then_with(|| skill_a.name.cmp(&skill_b.name))
@@ -1188,7 +1211,7 @@ impl App {
         let marker = query.marker.as_char();
         matches
             .into_iter()
-            .map(|(_, _, skill)| {
+            .map(|(_, _, _, skill)| {
                 let source = skill.sources.join(", ");
                 let detail = if skill.description.is_empty() {
                     format!("skill · {source}")
@@ -1201,6 +1224,39 @@ impl App {
                     insert_text: format!("{marker}{} ", skill.name),
                     detail,
                 }
+            })
+            .collect()
+    }
+
+    fn file_autocomplete_items(&self, query: &AutocompleteQuery) -> Vec<AutocompleteItem> {
+        let search = query.search.trim();
+        if search.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let pattern = fuzzy_pattern(search);
+        let mut matcher = fuzzy_matcher(true);
+        let mut buf = Vec::new();
+        let mut matches = self
+            .file_references
+            .iter()
+            .filter_map(|file| {
+                let score = pattern.score(Utf32Str::new(&file.path, &mut buf), &mut matcher)?;
+                Some((score, file))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|(score_a, file_a), (score_b, file_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| file_a.path.cmp(&file_b.path))
+        });
+        matches
+            .into_iter()
+            .take(MAX_AUTOCOMPLETE_ITEMS)
+            .map(|(_, file)| AutocompleteItem {
+                kind: AutocompleteKind::File,
+                label: format!("@{}", file.path),
+                insert_text: format!("@{} ", file.path),
+                detail: "file".to_string(),
             })
             .collect()
     }
@@ -1532,6 +1588,7 @@ fn autocomplete_query_at_cursor(textarea: &TextArea<'static>) -> Option<Autocomp
     let marker = match raw.chars().next()? {
         '/' => AutocompleteMarker::Slash,
         '$' => AutocompleteMarker::Dollar,
+        '@' => AutocompleteMarker::At,
         _ => return None,
     };
 
@@ -1543,6 +1600,65 @@ fn autocomplete_query_at_cursor(textarea: &TextArea<'static>) -> Option<Autocomp
         start_col,
         end_col: cursor,
     })
+}
+
+fn load_file_references(workspace_cwd: &str) -> Vec<FileReference> {
+    let root = PathBuf::from(workspace_cwd);
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .standard_filters(true)
+        .hidden(true)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                ".git" | ".next" | ".turbo" | ".venv" | "DerivedData" | "node_modules" | "target"
+            )
+        });
+
+    let mut files = Vec::new();
+    for entry in builder.build().flatten() {
+        if files.len() >= MAX_FILE_REFERENCES {
+            break;
+        }
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let display = relative.to_string_lossy().replace('\\', "/");
+        if display.is_empty() {
+            continue;
+        }
+        files.push(FileReference { path: display });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+fn fuzzy_pattern(query: &str) -> Pattern {
+    Pattern::new(
+        query.trim(),
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    )
+}
+
+fn fuzzy_matcher(path_mode: bool) -> FuzzyMatcher {
+    let mut config = if path_mode {
+        FuzzyConfig::DEFAULT.match_paths()
+    } else {
+        FuzzyConfig::DEFAULT
+    };
+    if !path_mode {
+        config.prefer_prefix = true;
+    }
+    FuzzyMatcher::new(config)
 }
 
 fn resolve_agent_executable(name: &str, override_env: &str) -> String {
@@ -2253,6 +2369,7 @@ fn complete_autocomplete_selection(app: &mut App) -> bool {
     app.selected_image = None;
     app.status_line = match item.kind {
         AutocompleteKind::Command => format!("command {}", item.label),
+        AutocompleteKind::File => format!("file {}", item.label),
         AutocompleteKind::Skill => format!("skill {}", item.label),
     };
     app.sync_focus_after_composer_change();
@@ -2260,11 +2377,28 @@ fn complete_autocomplete_selection(app: &mut App) -> bool {
 }
 
 fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
-    let query = query.trim_start();
-    COMMAND_SUGGESTIONS
+    let search = query.trim_start().trim_start_matches('/').trim();
+    let pattern = fuzzy_pattern(search);
+    let mut matcher = fuzzy_matcher(false);
+    let mut buf = Vec::new();
+    let mut matches = COMMAND_SUGGESTIONS
         .iter()
         .copied()
-        .filter(|suggestion| suggestion.command.starts_with(query))
+        .filter_map(|suggestion| {
+            let candidate = suggestion.command.trim_start_matches('/');
+            let score = pattern.score(Utf32Str::new(&candidate, &mut buf), &mut matcher)?;
+            Some((score, suggestion))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(score_a, suggestion_a), (score_b, suggestion_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| suggestion_a.command.len().cmp(&suggestion_b.command.len()))
+            .then_with(|| suggestion_a.command.cmp(suggestion_b.command))
+    });
+    matches
+        .into_iter()
+        .map(|(_, suggestion)| suggestion)
         .collect()
 }
 
@@ -3016,13 +3150,10 @@ fn draw_autocomplete(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let items = app.autocomplete_items();
     let viewport = area.height.saturating_sub(1) as usize;
     app.autocomplete.ensure_visible(viewport, items.len());
-    let title = if app
-        .autocomplete_query()
-        .is_some_and(|query| query.marker == AutocompleteMarker::Dollar)
-    {
-        "Skills"
-    } else {
-        "Commands and skills"
+    let title = match app.autocomplete_query().map(|query| query.marker) {
+        Some(AutocompleteMarker::Dollar) => "Skills",
+        Some(AutocompleteMarker::At) => "Files",
+        _ => "Commands and skills",
     };
     let mut lines = vec![Line::from(Span::styled(title, muted_style()))];
     if items.is_empty() {
@@ -3049,6 +3180,7 @@ fn draw_autocomplete(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 fn render_autocomplete_row(item: &AutocompleteItem, selected: bool, width: usize) -> Line<'static> {
     let marker = match item.kind {
         AutocompleteKind::Command => "cmd",
+        AutocompleteKind::File => "file",
         AutocompleteKind::Skill => "skill",
     };
     let label_width = 24;
@@ -4393,5 +4525,37 @@ mod tests {
         assert!(complete_autocomplete_selection(&mut app));
 
         assert_eq!(app.composer.lines(), &["run /review ".to_string()]);
+    }
+
+    #[test]
+    fn at_file_completion_replaces_current_token_only() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.file_references = vec![FileReference {
+            path: "src/main.rs".to_string(),
+        }];
+        app.composer = composer_from_lines(vec!["read @main".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(app.composer.lines(), &["read @src/main.rs ".to_string()]);
+    }
+
+    #[test]
+    fn command_suggestions_fuzzy_match_command_names() {
+        let suggestions = command_suggestions_for_query("/hs");
+
+        assert_eq!(
+            suggestions.first().map(|suggestion| suggestion.command),
+            Some("/history")
+        );
     }
 }
