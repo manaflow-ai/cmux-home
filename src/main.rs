@@ -234,9 +234,11 @@ struct App {
     workspace_cwd: String,
     codex_template: String,
     codex_plan_template: String,
+    codex_prepare_template: Option<String>,
     codex_submit_template: Option<String>,
     claude_template: String,
     claude_plan_template: String,
+    claude_prepare_template: Option<String>,
     claude_submit_template: Option<String>,
     rename_template: Option<String>,
     skills: Vec<SkillEntry>,
@@ -311,6 +313,7 @@ impl App {
                 .codex
                 .plan_command
                 .unwrap_or(args.codex_plan_command),
+            codex_prepare_template: config.agents.codex.prepare_command,
             codex_submit_template: config.agents.codex.submit_command,
             claude_template: config.agents.claude.command.unwrap_or(args.claude_command),
             claude_plan_template: config
@@ -318,6 +321,7 @@ impl App {
                 .claude
                 .plan_command
                 .unwrap_or(args.claude_plan_command),
+            claude_prepare_template: config.agents.claude.prepare_command,
             claude_submit_template: config.agents.claude.submit_command,
             rename_template: config.rename.command,
             skills,
@@ -750,7 +754,6 @@ impl App {
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let images = self.image_paths.clone();
         let start_prompt = self.agent_start_prompt(&prompt, &images);
-        let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
         let latest_message = if prompt.is_empty() {
             "standing by for task".to_string()
         } else {
@@ -761,6 +764,13 @@ impl App {
         } else {
             format!("{}: {}", self.agent_label(), one_line_preview(&prompt, 42))
         };
+        let (mut command, mut command_accepts_prompt) =
+            self.render_agent_command(&images, &start_prompt);
+        if let Some(prepared_command) = self.prepare_agent_initial_command(&prompt, &title, &images)
+        {
+            command = prepared_command;
+            command_accepts_prompt = true;
+        }
         let mut client = CmuxClient::new(self.socket_path.clone());
         let created = client.v2(
             "workspace.create",
@@ -1396,6 +1406,70 @@ impl App {
             &[("image_args", &image_args)],
         );
         (command, accepts_prompt)
+    }
+
+    fn prepare_template(&self) -> Option<&str> {
+        match self.provider {
+            AgentKind::Codex => self.codex_prepare_template.as_deref(),
+            AgentKind::Claude => self.claude_prepare_template.as_deref(),
+        }
+    }
+
+    fn prepare_agent_initial_command(
+        &self,
+        prompt: &str,
+        title: &str,
+        images: &[String],
+    ) -> Option<String> {
+        let Some(template) = self.prepare_template() else {
+            return None;
+        };
+        if template.trim().is_empty() || (prompt.is_empty() && images.is_empty()) {
+            return None;
+        }
+        let mode = if self.plan_mode { "plan" } else { "build" };
+        let payload_path = write_submit_payload(SubmitPayload {
+            workspace_id: "pending",
+            prompt,
+            title,
+            agent: self.provider.label(),
+            mode,
+            workspace_cwd: &self.workspace_cwd,
+            socket: &self.socket_path,
+            images,
+        })
+        .ok()?;
+        let payload_path_string = payload_path.display().to_string();
+        let rendered = render_command_template(
+            template,
+            &[
+                ("payload", &payload_path_string),
+                ("workspace_id", "pending"),
+                ("socket", &self.socket_path),
+            ],
+        );
+        let output = Command::new("sh")
+            .arg("-lc")
+            .arg(rendered)
+            .current_dir(&self.workspace_cwd)
+            .env("CMUX_SOCKET_PATH", &self.socket_path)
+            .env("CMUX_WORKSPACE_ID", "pending")
+            .env_remove("CMUX_SURFACE_ID")
+            .env_remove("CMUX_TAB_ID")
+            .env_remove("CMUX_PANEL_ID")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8(output.stdout).ok()?;
+        let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+        value
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     fn submit_template(&self) -> Option<&str> {

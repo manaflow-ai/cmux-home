@@ -36,6 +36,7 @@ pub(crate) struct AgentConfig {
 pub(crate) struct AgentCommandConfig {
     pub(crate) command: Option<String>,
     pub(crate) plan_command: Option<String>,
+    pub(crate) prepare_command: Option<String>,
     pub(crate) submit_command: Option<String>,
 }
 
