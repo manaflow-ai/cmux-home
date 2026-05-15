@@ -233,7 +233,6 @@ enum KeyAction {
 struct App {
     socket_path: String,
     workspace_cwd: String,
-    home_workspace_id: Option<String>,
     codex_bin: String,
     claude_bin: String,
     terminal_path: Option<String>,
@@ -305,7 +304,6 @@ impl App {
                     .map(|path| path.display().to_string())
             })
             .unwrap_or_else(|| ".".to_string());
-        let home_workspace_id = std::env::var("CMUX_WORKSPACE_ID").ok();
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
         let config = load_config(args.config.as_ref());
@@ -318,7 +316,6 @@ impl App {
         let mut app = Self {
             socket_path,
             workspace_cwd,
-            home_workspace_id,
             codex_bin,
             claude_bin,
             terminal_path,
@@ -785,7 +782,7 @@ impl App {
             "description": prompt,
             "initial_command": command,
             "cwd": self.workspace_cwd,
-            "focus": true,
+            "focus": false,
         });
         if let Some(path) = self.terminal_path.as_deref() {
             params["initial_env"] = json!({ "PATH": path });
@@ -794,9 +791,7 @@ impl App {
         let created = client.v2("workspace.create", params)?;
         let workspace_id = string_field(&created, "workspace_id")
             .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
-        let workspace_ref =
-            string_field(&created, "workspace_ref").unwrap_or_else(|| workspace_id.clone());
-        self.restore_home_workspace_focus_after_start(&workspace_id, &workspace_ref);
+        let _ = client.v1("refresh-surfaces");
         self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
         self.select_workspace_by_id(&workspace_id);
         if !command_accepts_prompt {
@@ -815,42 +810,6 @@ impl App {
         self.composer_mode = ComposerMode::NewWorkspace;
         self.status_line = format!("started {} workspace", self.agent_label());
         Ok(())
-    }
-
-    fn restore_home_workspace_focus_after_start(
-        &self,
-        created_workspace_id: &str,
-        created_workspace_ref: &str,
-    ) {
-        let Some(home_workspace_id) = self.home_workspace_id.as_deref() else {
-            return;
-        };
-        if home_workspace_id == created_workspace_id {
-            return;
-        }
-        let socket_path = self.socket_path.clone();
-        let home_workspace_id = home_workspace_id.to_string();
-        let created_workspace_ref = created_workspace_ref.to_string();
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                let mut client = CmuxClient::new(socket_path.clone());
-                if client
-                    .v1(&format!("read-screen --workspace {created_workspace_ref} --lines 1"))
-                    .is_ok()
-                {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            let mut client = CmuxClient::new(socket_path);
-            let _ = client.v2(
-                "workspace.select",
-                json!({
-                    "workspace_id": home_workspace_id,
-                }),
-            );
-        });
     }
 
     fn upsert_optimistic_workspace(
