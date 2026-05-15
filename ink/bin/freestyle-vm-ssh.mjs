@@ -218,12 +218,31 @@ try {
     const remoteCmd =
       args.attachMode === "dev-start"
         ? // Wait for cmux/web/package.json to appear (the codex pane's
-          // bootstrap clones + runs bun install), then exec bun dev in
-          // the foreground. HOSTNAME/HOST=0.0.0.0 so the tailnet sees
-          // the dev server. exec replaces the bash so Ctrl-C goes
-          // straight to bun.
+          // bootstrap clones + runs bun install), ensure the
+          // ~/.secrets/cmuxterm-dev.env stub exists (dev-local.sh errors
+          // out without it), then exec bun dev in the foreground.
+          // HOSTNAME/HOST=0.0.0.0 so the tailnet sees the dev server.
+          // exec replaces the bash so Ctrl-C goes straight to bun.
           `printf '[freestyle-vm-ssh] waiting for ~/cmux/web…\\n' && ` +
           `while [ ! -f $HOME/cmux/web/package.json ]; do sleep 1; done && ` +
+          `mkdir -p $HOME/.secrets && ` +
+          `if [ ! -f $HOME/.secrets/cmuxterm-dev.env ]; then ` +
+          `  printf '%s\\n' ` +
+          // Use single-quoted echo args; each is a literal KEY=VALUE
+          // line for cmux web's dev-local.sh. These are stub values so
+          // the dev server boots and public pages render; routes that
+          // hit Stack Auth / Convex will 500 but that is fine for
+          // demo / browse use.
+          `    'STACK_SECRET_SERVER_KEY=dev-stub' ` +
+          `    'NEXT_PUBLIC_STACK_PROJECT_ID=dev-stub' ` +
+          `    'NEXT_PUBLIC_STACK_PUBLISHABLE_CLIENT_KEY=dev-stub' ` +
+          `    'NEXT_PUBLIC_CONVEX_URL=https://dev-stub.convex.cloud' ` +
+          `    'CONVEX_DEPLOYMENT=dev:dev-stub' ` +
+          `    'RESEND_API_KEY=cmux-local-dev' ` +
+          `    'CMUX_FEEDBACK_FROM_EMAIL=dev@example.invalid' ` +
+          `    'CMUX_FEEDBACK_RATE_LIMIT_ID=cmux-feedback-local' ` +
+          `    > $HOME/.secrets/cmuxterm-dev.env; ` +
+          `fi && ` +
           `cd $HOME/cmux/web && ` +
           `printf '[freestyle-vm-ssh] starting bun dev on :3000\\n\\n' && ` +
           `exec env CMUX_PORT=3000 HOSTNAME=0.0.0.0 HOST=0.0.0.0 ` +

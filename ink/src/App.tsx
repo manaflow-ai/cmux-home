@@ -119,13 +119,26 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
-  // Each VM runs its dev server on the same port (3000) internally.
-  // Browser panes use the VM's tailnet magic-DNS hostname so we don't
-  // need mac-side ssh -L gymnastics or per-VM port allocation.
-  const tailnetUrlForVm = useCallback(
-    (vmId: string): string =>
-      `http://fs-${vmId.slice(0, 8)}.tail41290.ts.net:3000`,
-    [],
+  // Each VM runs its dev server on port 3000 internally. We forward
+  // that to a deterministic mac-side port via ssh -L baked into the
+  // cmux ssh command, because the freestyle russh gateway sits in
+  // front of the VM with tailscale userspace networking — userspace
+  // mode doesn't accept inbound TCP, so the browser can't dial the
+  // VM's tailnet IP directly.
+  //
+  // Hash vmId[:8] into [30000, 39999) so concurrent VMs don't fight
+  // over the same mac socket. (Two VMs hashing into the same bucket
+  // would conflict; vanishingly rare with 10k buckets and ~10 VMs).
+  const macPortForVm = useCallback((vmId: string): number => {
+    let h = 0;
+    for (let i = 0; i < Math.min(vmId.length, 16); i += 1) {
+      h = (h * 31 + vmId.charCodeAt(i)) >>> 0;
+    }
+    return 30000 + (h % 10000);
+  }, []);
+  const browserUrlForVm = useCallback(
+    (vmId: string): string => `http://127.0.0.1:${macPortForVm(vmId)}`,
+    [macPortForVm],
   );
 
   const commands = useMemo(defaultAgentCommands, []);
@@ -593,7 +606,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           name: `vm:${shortId}`,
           codexPrompt: null,
           helperPath: VM_SSH_SCRIPT,
-          devUrl: tailnetUrlForVm(vm.id),
+          devUrl: browserUrlForVm(vm.id),
           subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
           setStatusLine,
         });
@@ -602,7 +615,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setStatusLine(`launch failed: ${(err as Error).message}`);
       }
     },
-    [client, freestyle, tailnetUrlForVm, workspacesByVmId],
+    [client, freestyle, browserUrlForVm, workspacesByVmId],
   );
 
   const launchVmOutside = useCallback(
@@ -681,7 +694,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           name: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
           codexPrompt: prompt && prompt.trim() ? prompt.trim() : null,
           helperPath: VM_SSH_SCRIPT,
-          devUrl: tailnetUrlForVm(vmId),
+          devUrl: browserUrlForVm(vmId),
           subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
           setStatusLine,
         });
@@ -698,7 +711,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, tailnetUrlForVm],
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, browserUrlForVm],
   );
 
   const createVmFromDefaultSnapshot = useCallback(async () => {
@@ -746,7 +759,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           name: `task: ${preview}`,
           codexPrompt: trimmed,
           helperPath: VM_SSH_SCRIPT,
-          devUrl: tailnetUrlForVm(vmId),
+          devUrl: browserUrlForVm(vmId),
           subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
           setStatusLine,
         });
@@ -758,7 +771,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, submitting, tailnetUrlForVm],
+    [client, freestyle, refreshFreestyle, submitting, browserUrlForVm],
   );
 
   const dispatchSlashCommand = useCallback(
@@ -1152,6 +1165,18 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function portFromUrl(url: string): number | null {
+  try {
+    const u = new URL(url);
+    if (u.port) return Number.parseInt(u.port, 10);
+    if (u.protocol === "http:") return 80;
+    if (u.protocol === "https:") return 443;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 interface ParsedSlashCommand {
   readonly name: string;
   readonly count: number;
@@ -1238,14 +1263,25 @@ async function openTaskWorkspace(opts: {
 
   // 2. cmux ssh as the workspace creator. Opens an INTERACTIVE shell on
   //    the remote (no `-- <cmd>`). The russh freestyle gateway accepts
-  //    shell-request channels but rejects exec-request channels; passing
-  //    a remote command produces `exec request failed on channel 0` and
-  //    cmux loops on reconnect.
+  //    shell-request channels but rejects exec-request channels;
+  //    passing a remote command produces `exec request failed on
+  //    channel 0` and cmux loops on reconnect.
+  //
+  //    cmux's auto port-forwarding goes through cmuxd-remote, but
+  //    --no-daemon-bootstrap disables that (the russh gateway also
+  //    rejects the scp the cmuxd-remote upload uses). Instead we bake
+  //    a plain `ssh -L <macPort>:127.0.0.1:3000` into the cmux ssh
+  //    options so the browser pane (on the user's mac) can reach the
+  //    VM's dev server. Tailscale userspace mode doesn't accept inbound
+  //    TCP to the VM's tailnet IP either, so the mac-side forward is
+  //    the only thing that actually works through the freestyle gateway.
   setStatusLine(`cmux ssh into ${vmId.slice(0, 8)}…`);
+  const macPort = portFromUrl(devUrl);
   const ssh = await openCmuxSshWorkspace({
     destination: bootstrap.destination,
     name,
     noFocus: false,
+    localForwards: macPort ? [{ macPort, vmPort: 3000 }] : undefined,
   });
   const workspaceRef = ssh.workspaceRef;
 

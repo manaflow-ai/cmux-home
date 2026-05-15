@@ -19,6 +19,15 @@ export interface CmuxSshOptions {
   readonly name: string;
   /** Pass true to NOT switch focus to the new workspace. */
   readonly noFocus?: boolean;
+  /**
+   * Mac-side `ssh -L` forwards baked into the cmux ssh session.
+   * Each entry forwards localhost:`macPort` → 127.0.0.1:`vmPort` on
+   * the remote. Needed because tailscale userspace networking (the
+   * only mode that works on freestyle russh gateways) doesn't accept
+   * inbound TCP, so the browser pane can't reach VM-side services
+   * through the tailnet.
+   */
+  readonly localForwards?: ReadonlyArray<{ macPort: number; vmPort: number }>;
 }
 
 export interface CmuxSshResult {
@@ -63,8 +72,14 @@ export async function openCmuxSshWorkspace(
     "--ssh-option", "LogLevel=ERROR",
     "--ssh-option", "ServerAliveInterval=30",
     "--ssh-option", "ServerAliveCountMax=4",
+    // Don't fail the session if a forward port is already bound on
+    // the mac side (concurrent VMs that hashed to the same port).
+    "--ssh-option", "ExitOnForwardFailure=no",
     "--name", opts.name,
   ];
+  for (const fwd of opts.localForwards ?? []) {
+    args.push("--ssh-option", `LocalForward=${fwd.macPort} 127.0.0.1:${fwd.vmPort}`);
+  }
   if (opts.noFocus) args.push("--no-focus");
   args.push(opts.destination);
 
