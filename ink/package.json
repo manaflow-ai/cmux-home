@@ -1,11 +1,11 @@
 {
-  "name": "cmux-home",
-  "version": "0.1.0",
-  "description": "TUI for browsing cmux workspaces and starting Claude/Codex tasks.",
+  "name": "cmux-freestyle-hq",
+  "version": "0.2.0",
+  "description": "Headquarters TUI for Freestyle cloud sandboxes: spawn, fork, and route codex through Subrouter.",
   "license": "GPL-3.0-only",
   "type": "module",
   "bin": {
-    "cmux-home": "bin/cmux-home.mjs"
+    "cmux-freestyle-hq": "bin/cmux-home.mjs"
   },
   "engines": {
     "node": ">=20"

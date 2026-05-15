@@ -20,6 +20,7 @@ import {
   SPINNER_INTERVAL_MS,
   agentState,
   displayGroup,
+  oneLinePreview,
 } from "./format.js";
 import {
   FreestyleClient,
@@ -145,24 +146,29 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     };
   }, [stdout]);
 
-  // Spinner only ticks when there is at least one workspace in the
-  // "working" group; otherwise it would cause a full re-render every
-  // SPINNER_INTERVAL_MS for no visible change.
-  const hasWorkingWorkspace = useMemo(
-    () =>
-      workspaces.some(
-        (ws) => agentState(ws) === "working" || displayGroup(agentState(ws)) === "working",
-      ),
-    [workspaces],
-  );
+  // Spinner ticks while anything visible is animating: a workspace in the
+  // "working" group, OR a Freestyle VM whose state shows the braille
+  // spinner (starting / suspending). Tracking VMs here is what makes the
+  // ⠋ marker on a starting VM actually animate during the cold-path
+  // tailscale install.
+  const hasAnimatedRow = useMemo(() => {
+    const workspaceWorking = workspaces.some(
+      (ws) =>
+        agentState(ws) === "working" || displayGroup(agentState(ws)) === "working",
+    );
+    if (workspaceWorking) return true;
+    return (freestyleSummary?.vms ?? []).some(
+      (vm) => vm.state === "starting" || vm.state === "suspending",
+    );
+  }, [workspaces, freestyleSummary]);
   useEffect(() => {
-    if (!hasWorkingWorkspace) return;
+    if (!hasAnimatedRow) return;
     const id = setInterval(
       () => setSpinnerTick((t) => (t + 1) % SPINNER_FRAMES.length),
       SPINNER_INTERVAL_MS,
     );
     return () => clearInterval(id);
-  }, [hasWorkingWorkspace]);
+  }, [hasAnimatedRow]);
 
   // Live data + event stream.
   const refresh = useCallback(
@@ -358,14 +364,12 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   }, [forkParents]);
 
   const visibleRows: ListRow[] = useMemo(() => {
-    const topRows: ListRow[] = workspaceRows.filter((row) => {
-      if (row.kind !== "workspace") return true;
-      const ws = workspaces[row.workspaceIndex];
-      return !ws || !groupedWorkspaceIds.has(ws.id);
-    });
-    const rows = topRows.slice();
+    // cmux-freestyle-hq view: skip the top-level cmux workspace sections
+    // (Needs input / Working / Completed). The dashboard focuses on the
+    // user's Freestyle VMs; workspaces created via /spawn or /fork still
+    // appear nested under their VM in the tree below.
+    const rows: ListRow[] = [];
     if (freestyle.isEnabled()) {
-      if (rows.length > 0) rows.push({ kind: "blank" });
       rows.push({ kind: "vm-header" });
       const emittedVm = new Set<string>();
       const emitVm = (vm: FreestyleSummary["vms"][number], depth = 0): void => {
@@ -396,9 +400,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     }
     return rows;
   }, [
-    workspaceRows,
     workspaces,
-    groupedWorkspaceIds,
     freestyle,
     vms,
     vmsById,
@@ -1097,6 +1099,15 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
+      <Box>
+        <Text>
+          <Text color="blueBright" bold>cmux-freestyle-hq</Text>
+          <Text color={COLORS.muted}>
+            {`  ·  ${freestyle.isEnabled() ? "freestyle " + (freestyle.apiKey?.slice(0, 6) ?? "?") + "…" : "no FREESTYLE_API_KEY"}`}
+            {`  ·  socket ${oneLinePreview(resolvedSocketPath, 36)}`}
+          </Text>
+        </Text>
+      </Box>
       <Box flexDirection="column" flexGrow={1} overflow="hidden">
         <WorkspaceList
           rows={visibleRows}
