@@ -202,14 +202,23 @@ try {
 
   const remoteSteps = [];
 
-  // Dev-tail attach: skip bootstrap entirely, just ssh in and follow the
-  // dev server log that the main attach session set up.
-  if (args.attachMode === "dev-tail") {
+  // Lightweight attach modes that skip the full bootstrap: just SSH into
+  // the VM and run a single fire-and-forget remote command, then either
+  // tail/follow it (dev-tail) or exec a login shell (shell).
+  if (args.attachMode === "dev-tail" || args.attachMode === "shell-attach") {
     const remoteHost = `${args.vmId}+${args.user}@vm-ssh.freestyle.sh`;
-    const tailCmd =
-      `printf '[freestyle-vm-ssh] tailing /tmp/cmux-dev.log on ${args.vmId}\\n\\n' && ` +
-      `while [ ! -f /tmp/cmux-dev.log ]; do sleep 0.5; done && ` +
-      `tail -n 500 -F /tmp/cmux-dev.log`;
+    const remoteCmd =
+      args.attachMode === "dev-tail"
+        ? `printf '[freestyle-vm-ssh] tailing /tmp/cmux-dev.log on ${args.vmId}\\n\\n' && ` +
+          `while [ ! -f /tmp/cmux-dev.log ]; do sleep 0.5; done && ` +
+          `tail -n 500 -F /tmp/cmux-dev.log`
+        : // Shell attach: drop into bash in $HOME. We deliberately do NOT
+          // re-run the bootstrap because the main codex pane already
+          // installed tailscale + cloned cmux for this VM. `cd ~/cmux`
+          // gets the user to the project root; if it doesn't exist yet
+          // (e.g. the user opened this pane before the main bootstrap
+          // finished) we fall back to $HOME so the shell still works.
+          `cd \$HOME/cmux 2>/dev/null || cd \$HOME; exec bash -l`;
     const finalArgs = [
       "-e", "ssh",
       "-p", "22",
@@ -218,7 +227,7 @@ try {
       "-o", "LogLevel=ERROR",
       "-o", "ServerAliveInterval=30",
       "-o", "ServerAliveCountMax=4",
-      "-tt", remoteHost, tailCmd,
+      "-tt", remoteHost, remoteCmd,
     ];
     const child = spawn("sshpass", finalArgs, {
       stdio: "inherit",
@@ -474,6 +483,9 @@ function parseArgs(argv) {
       }
       case "--attach-dev-tail":
         out.attachMode = "dev-tail";
+        break;
+      case "--attach-shell":
+        out.attachMode = "shell-attach";
         break;
     }
   }

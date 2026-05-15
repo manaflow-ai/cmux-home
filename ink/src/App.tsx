@@ -1202,12 +1202,15 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
  * Build the layout JSON for a "task" workspace:
  *
  *   ┌──────────────────────┬──────────────────────┐
- *   │                      │  browser → devUrl    │
- *   │  terminal (codex)    ├──────────────────────┤
- *   │                      │  terminal (dev tail) │
+ *   │  terminal (codex)    │  browser → devUrl    │
+ *   ├──────────────────────┼──────────────────────┤
+ *   │  terminal (bash)     │  terminal (dev tail) │
  *   └──────────────────────┴──────────────────────┘
  *
- * Layout is applied at workspace.create time so all three surfaces boot
+ * Bottom-left is a plain ssh shell into the VM (cwd ~/cmux) for the
+ * user to poke at the repo, run one-off commands, etc.
+ *
+ * Layout is applied at workspace.create time so all four surfaces boot
  * in one RPC without needing the workspace to be focused first
  * (pane.create/surface.split both need a focused source surface).
  */
@@ -1226,16 +1229,30 @@ function buildTaskLayout(opts: {
     acctFlag +
     promptFlag;
   const tailCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail`;
+  const shellCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-shell`;
   return {
     direction: "horizontal",
     split: 0.5,
     children: [
       {
-        pane: {
-          surfaces: [
-            { type: "terminal", command: codexCmd, name: "codex", focus: true },
-          ],
-        },
+        direction: "vertical",
+        split: 0.65,
+        children: [
+          {
+            pane: {
+              surfaces: [
+                { type: "terminal", command: codexCmd, name: "codex", focus: true },
+              ],
+            },
+          },
+          {
+            pane: {
+              surfaces: [
+                { type: "terminal", command: shellCmd, name: "shell" },
+              ],
+            },
+          },
+        ],
       },
       {
         direction: "vertical",
