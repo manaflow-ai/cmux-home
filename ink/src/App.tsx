@@ -657,31 +657,17 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         } else {
           setStatusLine(`fork ${shortChild} ready, opening workspace…`);
         }
-        const promptArg = prompt && prompt.trim()
-          ? ` --codex-prompt ${shellQuote(prompt.trim())}`
-          : "";
-        const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
-          ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
-          : "";
-        const cmd =
-          `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
-          `--clone-cmux` +
-          acctFlag +
-          promptArg;
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
         const workspaceId = await client.createWorkspace({
           title: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
           description: `freestyle vm ${vmId} forked from ${parentVmId}; codex with:\n${prompt ?? "(no prompt)"}`,
-          initialCommand: cmd,
+          layout: buildTaskLayout({
+            vmId,
+            prompt: prompt && prompt.trim() ? prompt.trim() : null,
+            devUrl: tailnetUrlForVm(vmId),
+          }),
           cwd: resolvedCwd,
           focus: false,
-        });
-        await openTaskRightSide({
-          client,
-          workspaceId,
-          vmId,
-          devUrl: tailnetUrlForVm(vmId),
-          setStatusLine,
         });
         if (prompt && prompt.trim()) {
           setComposer(EMPTY_COMPOSER);
@@ -741,27 +727,16 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         } else {
           setStatusLine(`vm ${shortId} ready, opening workspace…`);
         }
-        const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
-          ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
-          : "";
-        const cmd =
-          `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
-          `--clone-cmux` +
-          acctFlag +
-          ` --codex-prompt ${shellQuote(trimmed)}`;
         const workspaceId = await client.createWorkspace({
           title: `task: ${preview}`,
           description: `freestyle vm ${vmId} running codex with:\n${trimmed}`,
-          initialCommand: cmd,
+          layout: buildTaskLayout({
+            vmId,
+            prompt: trimmed,
+            devUrl: tailnetUrlForVm(vmId),
+          }),
           cwd: resolvedCwd,
           focus: false,
-        });
-        await openTaskRightSide({
-          client,
-          workspaceId,
-          vmId,
-          devUrl: tailnetUrlForVm(vmId),
-          setStatusLine,
         });
         setComposer(EMPTY_COMPOSER);
         setComposerMode({ kind: "new" });
@@ -1197,100 +1172,64 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
 }
 
 /**
- * Set up the right side of a task workspace:
- *   - Top right: terminal that ssh's into the VM and tails the dev log
- *     (`tail -F /tmp/cmux-dev.log`), so the user sees the dev server boot.
- *   - Once the forwarded dev port responds, split that tail surface
- *     downward (so the layout becomes: top=tail, bottom=browser) and
- *     point the browser at http://127.0.0.1:<devPort>.
+ * Build the layout JSON for a "task" workspace:
  *
- * Fire-and-forget; the caller awaits the initial pane creation, but the
- * port poll + browser split happen in the background so the cmux-home
- * composer is unblocked.
+ *   ┌──────────────────────┬──────────────────────┐
+ *   │                      │  browser → devUrl    │
+ *   │  terminal (codex)    ├──────────────────────┤
+ *   │                      │  terminal (dev tail) │
+ *   └──────────────────────┴──────────────────────┘
+ *
+ * Layout is applied at workspace.create time so all three surfaces boot
+ * in one RPC without needing the workspace to be focused first
+ * (pane.create/surface.split both need a focused source surface).
  */
-async function openTaskRightSide(opts: {
-  client: CmuxClient;
-  workspaceId: string;
+function buildTaskLayout(opts: {
   vmId: string;
+  prompt: string | null;
   devUrl: string;
-  setStatusLine: (s: string) => void;
-}): Promise<void> {
-  const { client, workspaceId, vmId, devUrl, setStatusLine } = opts;
-  let tailSurface: string | null = null;
-  try {
-    const tail = await client.createTerminalPane({
-      workspaceId,
-      direction: "right",
-      focus: false,
-    });
-    if (tail) {
-      tailSurface = tail.surfaceRef;
-      const tailCmd = `clear && node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail\n`;
-      // Small grace period so the new terminal's shell is ready to accept
-      // input; without it the first `cmux send-text` lands before bash is
-      // up and the command gets eaten.
-      await new Promise<void>((r) => setTimeout(r, 700));
-      try {
-        await client.sendText(tail.surfaceRef, tailCmd);
-      } catch (err) {
-        setStatusLine(`tail send failed: ${(err as Error).message}`);
-      }
-    }
-  } catch (err) {
-    setStatusLine(`tail pane failed: ${(err as Error).message}; opening browser anyway`);
-  }
-
-  // Wait for the dev server on the VM's tailnet hostname before opening
-  // the browser pane. Goes through tailscaled's userspace stack via the
-  // local http proxy we already set up.
-  void (async () => {
-    const ready = await waitForUrl(devUrl, 180_000);
-    if (!ready) {
-      setStatusLine(`${devUrl} not ready after 3 min; opening browser anyway`);
-    }
-    try {
-      if (tailSurface) {
-        await client.splitSurface({
-          workspaceId,
-          surfaceRef: tailSurface,
-          direction: "down",
-          type: "browser",
-          url: devUrl,
-          focus: false,
-        });
-      } else {
-        await client.createBrowserPane({
-          workspaceId,
-          url: devUrl,
-          direction: "right",
-          focus: false,
-        });
-      }
-    } catch (err) {
-      setStatusLine(`browser pane failed: ${(err as Error).message}`);
-    }
-  })();
-}
-
-async function waitForUrl(url: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 2_000);
-      try {
-        // Any response (even 500) means the dev server is listening.
-        await fetch(url, { signal: ctrl.signal });
-        return true;
-      } finally {
-        clearTimeout(t);
-      }
-    } catch {
-      // ECONNREFUSED / DNS NXDOMAIN / abort: not ready yet
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
-  }
-  return false;
+}): unknown {
+  const { vmId, prompt, devUrl } = opts;
+  const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
+    ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
+    : "";
+  const promptFlag = prompt ? ` --codex-prompt ${shellQuote(prompt)}` : "";
+  const codexCmd =
+    `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --clone-cmux` +
+    acctFlag +
+    promptFlag;
+  const tailCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail`;
+  return {
+    direction: "right",
+    split: 0.5,
+    children: [
+      {
+        pane: {
+          surfaces: [
+            { type: "terminal", command: codexCmd, name: "codex", focus: true },
+          ],
+        },
+      },
+      {
+        direction: "down",
+        split: 0.65,
+        children: [
+          {
+            pane: {
+              surfaces: [{ type: "browser", url: devUrl, name: "dev server" }],
+            },
+          },
+          {
+            pane: {
+              surfaces: [
+                { type: "terminal", command: tailCmd, name: "dev log" },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
 }
 
 async function waitForFreestyleHealthz(

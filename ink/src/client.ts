@@ -66,17 +66,22 @@ export class CmuxClient {
   async createWorkspace(input: {
     title: string;
     description?: string;
-    initialCommand: string;
+    initialCommand?: string;
+    layout?: unknown;
     cwd: string;
     focus: boolean;
   }): Promise<string> {
-    const result = (await this.rpc("workspace.create", {
+    const params: Record<string, unknown> = {
       title: input.title,
       description: input.description ?? "",
-      initial_command: input.initialCommand,
       cwd: input.cwd,
       focus: input.focus,
-    })) as { workspace_id?: unknown } | undefined;
+    };
+    if (input.initialCommand) params.initial_command = input.initialCommand;
+    if (input.layout) params.layout = input.layout;
+    const result = (await this.rpc("workspace.create", params)) as
+      | { workspace_id?: unknown }
+      | undefined;
     const id = typeof result?.workspace_id === "string" ? result.workspace_id : "";
     if (!id) throw new Error("workspace.create did not return workspace_id");
     return id;
