@@ -46,6 +46,9 @@ export async function openCmuxSshWorkspace(
   opts: CmuxSshOptions,
 ): Promise<CmuxSshResult> {
   const cli = resolveCmuxCli();
+  if (process.env.CMUX_HOME_DEBUG?.trim()) {
+    process.stderr.write(`[cmux-ssh] using CLI: ${cli}\n`);
+  }
   const args = [
     "ssh",
     "--port", "22",

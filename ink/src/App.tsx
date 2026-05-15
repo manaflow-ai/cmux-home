@@ -736,10 +736,11 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       setComposerMode({ kind: "new" });
       try {
         const preview = trimmed.slice(0, 48);
-        setStatusLine(`spawning cloud sandbox for "${preview}"…`);
+        setStatusLine(`creating vm from snapshot…`);
         const { vmId } = await freestyle.createFromSnapshot(snapshotId);
         const shortId = vmId.slice(0, 8);
-        await openTaskWorkspace({
+        setStatusLine(`vm ${shortId} minted; opening cmux ssh…`);
+        const ref = await openTaskWorkspace({
           client,
           vmId,
           name: `task: ${preview}`,
@@ -749,7 +750,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
           setStatusLine,
         });
-        setStatusLine(`opened task workspace for vm ${shortId}`);
+        setStatusLine(`opened ${ref} (cmux ssh) for vm ${shortId}`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);
@@ -1076,7 +1077,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     if (s.startsWith("press ctrl+")) return s;
     if (
       submitting ||
-      /^(spawning|waiting|opening|creating|destroying|task workspace|destroyed|created vm|started)/i.test(s) ||
+      /^(spawning|waiting|opening|opened|creating|cmux ssh|preparing|vm |destroying|task workspace|destroyed|created vm|started|focused)/i.test(s) ||
       / failed:/.test(s) ||
       s.startsWith("rename")
     ) {
