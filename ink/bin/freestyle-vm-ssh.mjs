@@ -566,14 +566,15 @@ function buildCmuxCloneBootstrap() {
     'if ! ss -tnlp 2>/dev/null | grep -q ":3000 "; then',
     '  echo "[freestyle-vm-ssh] starting cmux web dev server on port 3000…"',
     "  cd $HOME/cmux/web && bun install --silent >/tmp/cmux-bun-install.log 2>&1 || true",
-    // cmux web's dev-local.sh prefers CMUX_PORT over PORT. Bind to 3000 so it
-    // lands on the SSH-forwarded port.
+    // cmux web's dev-local.sh prefers CMUX_PORT over PORT. Bind to 3000 so
+    // the tailnet sees the dev server (HOSTNAME=0.0.0.0 → all interfaces;
+    // tailscale userspace tun routes inbound traffic for the tailnet IP).
     //
-    // setsid puts the dev server in its own session + process group so SIGHUP
-    // from the closing SSH session doesn't cascade into bun → bash → next.
-    // nohup alone isn't enough because the SIGHUP-ignore doesn't survive
-    // bun's `exec` of bash + dev-local.sh's child processes.
-    "  cd $HOME/cmux/web && setsid -f bash -c 'CMUX_PORT=3000 CMUX_DEV_START_DB=0 CMUX_DEV_STOP_DB_ON_EXIT=0 exec bun dev' </dev/null >/tmp/cmux-dev.log 2>&1",
+    // setsid puts the dev server in its own session + process group so
+    // SIGHUP from the closing SSH session doesn't cascade into bun → bash
+    // → next. nohup alone isn't enough because the SIGHUP-ignore doesn't
+    // survive bun's `exec` of bash + dev-local.sh's child processes.
+    "  cd $HOME/cmux/web && setsid -f bash -c 'CMUX_PORT=3000 HOSTNAME=0.0.0.0 HOST=0.0.0.0 CMUX_DEV_START_DB=0 CMUX_DEV_STOP_DB_ON_EXIT=0 exec bun dev --hostname 0.0.0.0' </dev/null >/tmp/cmux-dev.log 2>&1",
     '  printf "[freestyle-vm-ssh] dev server starting on :3000; log at /tmp/cmux-dev.log\\n"',
     "else",
     '  echo "[freestyle-vm-ssh] dev server already listening on :3000"',

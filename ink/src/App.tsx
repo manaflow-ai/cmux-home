@@ -118,14 +118,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
-  // Monotonic mac-side port allocator for SSH -L forwards. Each spawned
-  // task / fork gets its own port so concurrent VMs don't fight over 3000.
-  const nextDevPortRef = useRef<number>(30000);
-  const allocDevPort = useCallback((): number => {
-    const p = nextDevPortRef.current;
-    nextDevPortRef.current = p + 1;
-    return p;
-  }, []);
+  // Each VM runs its dev server on the same port (3000) internally.
+  // Browser panes use the VM's tailnet magic-DNS hostname so we don't
+  // need mac-side ssh -L gymnastics or per-VM port allocation.
+  const tailnetUrlForVm = useCallback(
+    (vmId: string): string =>
+      `http://fs-${vmId.slice(0, 8)}.tail41290.ts.net:3000`,
+    [],
+  );
 
   const commands = useMemo(defaultAgentCommands, []);
 
@@ -660,14 +660,12 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         const promptArg = prompt && prompt.trim()
           ? ` --codex-prompt ${shellQuote(prompt.trim())}`
           : "";
-        const devPort = allocDevPort();
         const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
           ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
           : "";
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
-          `--clone-cmux ` +
-          `--dev-server-mac-port ${devPort}` +
+          `--clone-cmux` +
           acctFlag +
           promptArg;
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
@@ -682,7 +680,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           client,
           workspaceId,
           vmId,
-          devPort,
+          devUrl: tailnetUrlForVm(vmId),
           setStatusLine,
         });
         if (prompt && prompt.trim()) {
@@ -697,7 +695,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, allocDevPort],
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, tailnetUrlForVm],
   );
 
   const createVmFromDefaultSnapshot = useCallback(async () => {
@@ -743,14 +741,12 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         } else {
           setStatusLine(`vm ${shortId} ready, opening workspace…`);
         }
-        const devPort = allocDevPort();
         const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
           ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
           : "";
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
-          `--clone-cmux ` +
-          `--dev-server-mac-port ${devPort}` +
+          `--clone-cmux` +
           acctFlag +
           ` --codex-prompt ${shellQuote(trimmed)}`;
         const workspaceId = await client.createWorkspace({
@@ -764,12 +760,12 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           client,
           workspaceId,
           vmId,
-          devPort,
+          devUrl: tailnetUrlForVm(vmId),
           setStatusLine,
         });
         setComposer(EMPTY_COMPOSER);
         setComposerMode({ kind: "new" });
-        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId} (dev :${devPort})`);
+        setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId}`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);
@@ -777,7 +773,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setSubmitting(false);
       }
     },
-    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, allocDevPort],
+    [client, freestyle, refreshFreestyle, resolvedCwd, submitting, tailnetUrlForVm],
   );
 
   const dispatchSlashCommand = useCallback(
@@ -1216,10 +1212,10 @@ async function openTaskRightSide(opts: {
   client: CmuxClient;
   workspaceId: string;
   vmId: string;
-  devPort: number;
+  devUrl: string;
   setStatusLine: (s: string) => void;
 }): Promise<void> {
-  const { client, workspaceId, vmId, devPort, setStatusLine } = opts;
+  const { client, workspaceId, vmId, devUrl, setStatusLine } = opts;
   let tailSurface: string | null = null;
   try {
     const tail = await client.createTerminalPane({
@@ -1229,8 +1225,6 @@ async function openTaskRightSide(opts: {
     });
     if (tail) {
       tailSurface = tail.surfaceRef;
-      // Boot the dev-log tail in the new pane. Pre-pend a `clear` so old
-      // shell noise doesn't show.
       const tailCmd = `clear && node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail\n`;
       // Small grace period so the new terminal's shell is ready to accept
       // input; without it the first `cmux send-text` lands before bash is
@@ -1246,13 +1240,13 @@ async function openTaskRightSide(opts: {
     setStatusLine(`tail pane failed: ${(err as Error).message}; opening browser anyway`);
   }
 
-  // Wait for the dev server on the SSH-forwarded mac port before opening
-  // the browser pane. This avoids the browser sitting on a 'connection
-  // refused' screen while the VM bootstraps.
+  // Wait for the dev server on the VM's tailnet hostname before opening
+  // the browser pane. Goes through tailscaled's userspace stack via the
+  // local http proxy we already set up.
   void (async () => {
-    const ready = await waitForLocalPort(devPort, 180_000);
+    const ready = await waitForUrl(devUrl, 180_000);
     if (!ready) {
-      setStatusLine(`dev :${devPort} not ready after 3 min; opening browser anyway`);
+      setStatusLine(`${devUrl} not ready after 3 min; opening browser anyway`);
     }
     try {
       if (tailSurface) {
@@ -1261,13 +1255,13 @@ async function openTaskRightSide(opts: {
           surfaceRef: tailSurface,
           direction: "down",
           type: "browser",
-          url: `http://127.0.0.1:${devPort}`,
+          url: devUrl,
           focus: false,
         });
       } else {
         await client.createBrowserPane({
           workspaceId,
-          url: `http://127.0.0.1:${devPort}`,
+          url: devUrl,
           direction: "right",
           focus: false,
         });
@@ -1278,13 +1272,12 @@ async function openTaskRightSide(opts: {
   })();
 }
 
-async function waitForLocalPort(port: number, timeoutMs: number): Promise<boolean> {
+async function waitForUrl(url: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  const url = `http://127.0.0.1:${port}/`;
   while (Date.now() < deadline) {
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 1_500);
+      const t = setTimeout(() => ctrl.abort(), 2_000);
       try {
         // Any response (even 500) means the dev server is listening.
         await fetch(url, { signal: ctrl.signal });
@@ -1293,9 +1286,9 @@ async function waitForLocalPort(port: number, timeoutMs: number): Promise<boolea
         clearTimeout(t);
       }
     } catch {
-      // ECONNREFUSED / abort: not ready yet
+      // ECONNREFUSED / DNS NXDOMAIN / abort: not ready yet
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_500));
   }
   return false;
 }
