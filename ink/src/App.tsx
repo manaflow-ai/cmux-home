@@ -14,7 +14,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
-import { openCmuxSshWorkspace, prepareFreestyleBootstrap } from "./cmux-ssh.js";
+import { prepareFreestyleBootstrap } from "./cmux-ssh.js";
+import { openCmuxWsWorkspace, prepareFreestyleWsAttach } from "./cmux-ws.js";
 import {
   COLORS,
   SPINNER_FRAMES,
@@ -602,6 +603,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       try {
         await openTaskWorkspace({
           client,
+          freestyle,
           vmId: vm.id,
           name: `vm:${shortId}`,
           codexPrompt: null,
@@ -690,6 +692,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
         await openTaskWorkspace({
           client,
+          freestyle,
           vmId,
           name: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
           codexPrompt: prompt && prompt.trim() ? prompt.trim() : null,
@@ -752,9 +755,10 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         setStatusLine(`creating vm from snapshot…`);
         const { vmId } = await freestyle.createFromSnapshot(snapshotId);
         const shortId = vmId.slice(0, 8);
-        setStatusLine(`vm ${shortId} minted; opening cmux ssh…`);
+        setStatusLine(`vm ${shortId} minted; opening cmux ws attach…`);
         const ref = await openTaskWorkspace({
           client,
+          freestyle,
           vmId,
           name: `task: ${preview}`,
           codexPrompt: trimmed,
@@ -763,7 +767,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           subrouterAccountId: process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim() ?? null,
           setStatusLine,
         });
-        setStatusLine(`opened ${ref} (cmux ssh) for vm ${shortId}`);
+        setStatusLine(`opened ${ref} (cmux ws) for vm ${shortId}`);
         void refreshFreestyle();
       } catch (err) {
         setStatusLine(`submit failed: ${(err as Error).message}`);
@@ -1232,6 +1236,7 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
  */
 async function openTaskWorkspace(opts: {
   client: CmuxClient;
+  freestyle: FreestyleClient;
   vmId: string;
   name: string;
   codexPrompt: string | null;
@@ -1242,6 +1247,7 @@ async function openTaskWorkspace(opts: {
 }): Promise<string> {
   const {
     client,
+    freestyle,
     vmId,
     name,
     codexPrompt,
@@ -1251,7 +1257,8 @@ async function openTaskWorkspace(opts: {
     setStatusLine,
   } = opts;
 
-  // 1. Mint freestyle creds + build the full remote bootstrap script.
+  // 1. Mint freestyle creds + build the full remote bootstrap script
+  //    that we'll type into the WS-attached shell.
   setStatusLine(`preparing bootstrap for ${vmId.slice(0, 8)}…`);
   const bootstrap = await prepareFreestyleBootstrap({
     helperPath,
@@ -1261,29 +1268,24 @@ async function openTaskWorkspace(opts: {
     subrouterAccountId,
   });
 
-  // 2. cmux ssh as the workspace creator. Opens an INTERACTIVE shell on
-  //    the remote (no `-- <cmd>`). The russh freestyle gateway accepts
-  //    shell-request channels but rejects exec-request channels;
-  //    passing a remote command produces `exec request failed on
-  //    channel 0` and cmux loops on reconnect.
-  //
-  //    cmux's auto port-forwarding goes through cmuxd-remote, but
-  //    --no-daemon-bootstrap disables that (the russh gateway also
-  //    rejects the scp the cmuxd-remote upload uses). Instead we bake
-  //    a plain `ssh -L <macPort>:127.0.0.1:3000` into the cmux ssh
-  //    options so the browser pane (on the user's mac) can reach the
-  //    VM's dev server. Tailscale userspace mode doesn't accept inbound
-  //    TCP to the VM's tailnet IP either, so the mac-side forward is
-  //    the only thing that actually works through the freestyle gateway.
-  setStatusLine(`cmux ssh into ${vmId.slice(0, 8)}…`);
-  const macPort = portFromUrl(devUrl);
-  const ssh = await openCmuxSshWorkspace({
-    destination: bootstrap.destination,
-    name,
+  // 2. Attach via cmuxd-ws WebSocket. Avoids the SSH exec-channel
+  //    limitation of the russh freestyle gateway entirely. The
+  //    snapshot already runs `cmuxd-remote serve --ws` on port 7777
+  //    (exposed by freestyle at wss://<vmId>.vm.freestyle.sh/), so
+  //    we just mint lease tokens, write them into the VM via the
+  //    Freestyle exec API, and tell cmux to open a workspace pointing
+  //    at the WebSocket endpoints. The daemon RPC + proxy / port
+  //    forwarding cmux normally provides over SSH work too because
+  //    cmuxd-remote serves both /terminal and /rpc.
+  setStatusLine(`cmux ws attach into ${vmId.slice(0, 8)}…`);
+  const attach = await prepareFreestyleWsAttach(freestyle.sdk, vmId);
+  const ws = await openCmuxWsWorkspace({
+    vmId,
+    attach,
+    workspaceName: name,
     noFocus: false,
-    localForwards: macPort ? [{ macPort, vmPort: 3000 }] : undefined,
   });
-  const workspaceRef = ssh.workspaceRef;
+  const workspaceRef = ws.workspaceRef;
 
   // 3. Send the bootstrap to the interactive shell. cmux's SSH bootstrap
   //    already allocates the PTY before we get a workspace_id back, so

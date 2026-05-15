@@ -33,6 +33,18 @@ export class FreestyleClient {
     return this.fs !== null;
   }
 
+  /**
+   * Underlying SDK for callers that need to mint identities, exec
+   * commands on a VM, or other operations not yet wrapped here.
+   * Throws when FREESTYLE_API_KEY isn't set.
+   */
+  get sdk(): Freestyle {
+    if (!this.fs) {
+      throw new Error("FREESTYLE_API_KEY is not set; freestyle SDK unavailable");
+    }
+    return this.fs;
+  }
+
   async list(): Promise<FreestyleSummary | null> {
     if (!this.fs) return null;
     const response = await this.fs.vms.list();
