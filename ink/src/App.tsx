@@ -770,6 +770,53 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     [client, freestyle, refreshFreestyle, resolvedCwd, submitting, allocDevPort],
   );
 
+  const dispatchSlashCommand = useCallback(
+    async (cmd: ParsedSlashCommand): Promise<void> => {
+      switch (cmd.name) {
+        case "fork": {
+          const selectedVm = selectedVmRow();
+          if (!selectedVm) {
+            setStatusLine("/fork needs a VM row selected");
+            return;
+          }
+          const count = cmd.count;
+          const prompt = cmd.prompt;
+          setComposer(EMPTY_COMPOSER);
+          setComposerMode({ kind: "new" });
+          setStatusLine(
+            `forking ${count} × ${selectedVm.id.slice(0, 8)}${prompt ? ` for "${prompt.slice(0, 32)}"` : ""}`,
+          );
+          await Promise.allSettled(
+            Array.from({ length: count }, () =>
+              forkSelectedVm(selectedVm.id, prompt || null),
+            ),
+          );
+          setStatusLine(`fork swarm of ${count} from ${selectedVm.id.slice(0, 8)} dispatched`);
+          return;
+        }
+        case "spawn": {
+          const count = cmd.count;
+          const prompt = cmd.prompt;
+          if (!prompt) {
+            setStatusLine("/spawn needs a prompt: /spawn 3 <task>");
+            return;
+          }
+          setComposer(EMPTY_COMPOSER);
+          setComposerMode({ kind: "new" });
+          setStatusLine(`spawning ${count} cloud sandboxes for "${prompt.slice(0, 32)}"`);
+          await Promise.allSettled(
+            Array.from({ length: count }, () => submitToNewCloudSandbox(prompt)),
+          );
+          setStatusLine(`spawn swarm of ${count} dispatched`);
+          return;
+        }
+        default:
+          setStatusLine(`unknown slash command: /${cmd.name}`);
+      }
+    },
+    [forkSelectedVm, selectedVmRow, submitToNewCloudSandbox],
+  );
+
   const submitRename = useCallback(
     async (workspaceId: string): Promise<void> => {
       const title = composer.lines.join(" ").trim();
@@ -807,14 +854,21 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           return;
         }
         if (composerHasText(composer)) {
-          // Default enter spawns a fresh Freestyle cloud sandbox when the
-          // environment is wired for it; falls back to the local cmux
-          // workspace path otherwise.
+          // Slash commands: '/fork [N] <prompt>' / '/spawn [N] <prompt>'.
+          // Default enter (no slash command) spawns a fresh Freestyle cloud
+          // sandbox when the env is wired for it; falls back to the local
+          // cmux workspace path otherwise.
+          const text = composer.lines.join("\n");
+          const cmd = parseSlashCommand(text);
+          if (cmd) {
+            void dispatchSlashCommand(cmd);
+            return;
+          }
           const cloudReady =
             freestyle.isEnabled() &&
             !!process.env.FREESTYLE_SANDBOX_SNAPSHOT?.trim();
           if (cloudReady) {
-            void submitToNewCloudSandbox(composer.lines.join("\n"));
+            void submitToNewCloudSandbox(text);
           } else {
             void submit();
           }
@@ -1091,6 +1145,40 @@ function Separator({ width }: { width: number }): React.JSX.Element {
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+interface ParsedSlashCommand {
+  readonly name: string;
+  readonly count: number;
+  readonly prompt: string;
+}
+
+/**
+ * Parse '/fork [N] <prompt>' / '/spawn [N] <prompt>' style commands.
+ * Returns null when the text isn't a known slash command.
+ *
+ * Examples:
+ *   '/fork build a snake game'      -> { name: 'fork', count: 1, prompt: 'build a snake game' }
+ *   '/fork 5 try harder'            -> { name: 'fork', count: 5, prompt: 'try harder' }
+ *   '/spawn 3 implement caching'    -> { name: 'spawn', count: 3, prompt: 'implement caching' }
+ *   '/fork'                         -> { name: 'fork', count: 1, prompt: '' }
+ */
+function parseSlashCommand(text: string): ParsedSlashCommand | null {
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  if (!trimmed.startsWith("/")) return null;
+  const match = trimmed.match(/^\/([a-z][a-z0-9-]*)(?:\s+(.*))?$/i);
+  if (!match) return null;
+  const name = match[1]!.toLowerCase();
+  if (name !== "fork" && name !== "spawn") return null;
+  const rest = (match[2] ?? "").trim();
+  let count = 1;
+  let prompt = rest;
+  const countMatch = rest.match(/^(\d{1,3})(?:\s+(.*))?$/);
+  if (countMatch) {
+    count = Math.max(1, Math.min(32, Number.parseInt(countMatch[1]!, 10)));
+    prompt = (countMatch[2] ?? "").trim();
+  }
+  return { name, count, prompt };
 }
 
 async function waitForFreestyleHealthz(

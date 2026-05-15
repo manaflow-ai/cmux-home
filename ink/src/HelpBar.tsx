@@ -95,7 +95,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
       <Box>
         <CurrentMode provider={props.provider} planMode={props.planMode} />
         <Text color={COLORS.muted}>
-          {" · enter spawn cloud sandbox · ctrl+s stash · tab switch agent · shift+tab switch mode · esc clear"}
+          {" · enter spawn cloud sandbox · /fork [N] <prompt> · /spawn N <prompt> · tab switch agent · esc clear"}
         </Text>
       </Box>
     );
