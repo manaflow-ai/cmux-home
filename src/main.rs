@@ -1291,25 +1291,30 @@ impl App {
                     fuzzy_match_candidate(&pattern, &mut matcher, title, &mut buf, &mut positions);
                 let title_lower = title.to_ascii_lowercase();
                 let search_lower = search.to_ascii_lowercase();
+                let title_rank =
+                    file_title_rank(&search_lower, &title_lower, title_match.is_some());
+                let path_depth = file_path_depth(&file.path);
                 let mut score = path_match.score;
                 if let Some(title_match) = title_match.as_ref() {
                     score = score.saturating_add(title_match.score.saturating_mul(5));
-                    if !search_lower.is_empty() && title_lower == search_lower {
+                    if title_rank == 4 {
                         score = score.saturating_add(20_000);
-                    } else if !search_lower.is_empty() && title_lower.starts_with(&search_lower) {
+                    } else if title_rank == 3 {
                         score = score.saturating_add(10_000);
-                    } else if !search_lower.is_empty() && title_lower.contains(&search_lower) {
+                    } else if title_rank == 2 {
                         score = score.saturating_add(5_000);
                     }
                 }
-                Some((score, path_match, title_match, file))
+                Some((title_rank, path_depth, score, path_match, title_match, file))
             })
             .collect::<Vec<_>>();
         matches.sort_by(
-            |(score_a, _, title_a, file_a), (score_b, _, title_b, file_b)| {
-                score_b
-                    .cmp(score_a)
-                    .then_with(|| title_b.is_some().cmp(&title_a.is_some()))
+            |(title_rank_a, depth_a, score_a, _, _, file_a),
+             (title_rank_b, depth_b, score_b, _, _, file_b)| {
+                title_rank_b
+                    .cmp(title_rank_a)
+                    .then_with(|| depth_a.cmp(depth_b))
+                    .then_with(|| score_b.cmp(score_a))
                     .then_with(|| file_a.path.len().cmp(&file_b.path.len()))
                     .then_with(|| file_a.path.cmp(&file_b.path))
             },
@@ -1317,7 +1322,7 @@ impl App {
         matches
             .into_iter()
             .take(MAX_AUTOCOMPLETE_ITEMS)
-            .map(|(_, path_match, title_match, file)| {
+            .map(|(_, _, _, path_match, title_match, file)| {
                 let title = file_reference_title(&file.path);
                 AutocompleteItem {
                     kind: AutocompleteKind::File,
@@ -1762,6 +1767,27 @@ fn shift_positions(positions: &[usize], offset: usize) -> Vec<usize> {
 
 fn file_reference_title(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn file_title_rank(search_lower: &str, title_lower: &str, title_matches: bool) -> u8 {
+    if search_lower.is_empty() {
+        return 0;
+    }
+    if title_lower == search_lower {
+        4
+    } else if title_lower.starts_with(search_lower) {
+        3
+    } else if title_lower.contains(search_lower) {
+        2
+    } else if title_matches {
+        1
+    } else {
+        0
+    }
+}
+
+fn file_path_depth(path: &str) -> usize {
+    path.chars().filter(|ch| *ch == '/').count()
 }
 
 fn resolve_agent_executable(name: &str, override_env: &str) -> String {
@@ -4797,7 +4823,7 @@ mod tests {
         });
         app.file_references = vec![
             FileReference {
-                path: "references/qstack/CLAUDE.md.file".to_string(),
+                path: "references/gstack/CLAUDE.md".to_string(),
             },
             FileReference {
                 path: "CLAUDE.md".to_string(),
@@ -4815,6 +4841,10 @@ mod tests {
         assert_eq!(
             items.first().map(|item| item.detail.as_str()),
             Some("CLAUDE.md")
+        );
+        assert_eq!(
+            items.get(1).map(|item| item.detail.as_str()),
+            Some("references/gstack/CLAUDE.md")
         );
         assert!(!items
             .first()
