@@ -1272,7 +1272,9 @@ async function openTaskWorkspace(opts: {
 
   // 4. Add the three auxiliary panes. cmux ssh leaves a focused
   //    workspace with one terminal panel, so pane.create has a target.
-  const tailCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-tail`;
+  //    The dev pane runs `bun dev` in the foreground (visible logs +
+  //    Ctrl-C restartable) instead of tailing a backgrounded log file.
+  const devCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-start`;
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
     await client.createPane({
@@ -1286,7 +1288,7 @@ async function openTaskWorkspace(opts: {
       workspaceId: workspaceRef,
       type: "terminal",
       direction: "down",
-      initialCommand: tailCmd,
+      initialCommand: devCmd,
       focus: false,
     });
     await client.createPane({

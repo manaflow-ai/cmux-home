@@ -203,22 +203,37 @@ try {
   const remoteSteps = [];
 
   // Lightweight attach modes that skip the full bootstrap: just SSH into
-  // the VM and run a single fire-and-forget remote command, then either
-  // tail/follow it (dev-tail) or exec a login shell (shell).
-  if (args.attachMode === "dev-tail" || args.attachMode === "shell-attach") {
+  // the VM and run a single fire-and-forget remote command.
+  //   --attach-dev-start: run `bun dev` in the foreground inside
+  //                       ~/cmux/web (visible logs, Ctrl-C restartable).
+  //                       Waits for the cmux clone to land if the main
+  //                       codex pane is still bootstrapping.
+  //   --attach-shell:     drop into bash, cwd ~/cmux when it exists.
+  if (
+    args.attachMode === "dev-start" ||
+    args.attachMode === "dev-tail" ||
+    args.attachMode === "shell-attach"
+  ) {
     const remoteHost = `${args.vmId}+${args.user}@vm-ssh.freestyle.sh`;
     const remoteCmd =
-      args.attachMode === "dev-tail"
-        ? `printf '[freestyle-vm-ssh] tailing /tmp/cmux-dev.log on ${args.vmId}\\n\\n' && ` +
-          `while [ ! -f /tmp/cmux-dev.log ]; do sleep 0.5; done && ` +
-          `tail -n 500 -F /tmp/cmux-dev.log`
-        : // Shell attach: drop into bash in $HOME. We deliberately do NOT
-          // re-run the bootstrap because the main codex pane already
-          // installed tailscale + cloned cmux for this VM. `cd ~/cmux`
-          // gets the user to the project root; if it doesn't exist yet
-          // (e.g. the user opened this pane before the main bootstrap
-          // finished) we fall back to $HOME so the shell still works.
-          `cd \$HOME/cmux 2>/dev/null || cd \$HOME; exec bash -l`;
+      args.attachMode === "dev-start"
+        ? // Wait for cmux/web/package.json to appear (the codex pane's
+          // bootstrap clones + runs bun install), then exec bun dev in
+          // the foreground. HOSTNAME/HOST=0.0.0.0 so the tailnet sees
+          // the dev server. exec replaces the bash so Ctrl-C goes
+          // straight to bun.
+          `printf '[freestyle-vm-ssh] waiting for ~/cmux/web…\\n' && ` +
+          `while [ ! -f $HOME/cmux/web/package.json ]; do sleep 1; done && ` +
+          `cd $HOME/cmux/web && ` +
+          `printf '[freestyle-vm-ssh] starting bun dev on :3000\\n\\n' && ` +
+          `exec env CMUX_PORT=3000 HOSTNAME=0.0.0.0 HOST=0.0.0.0 ` +
+          `CMUX_DEV_START_DB=0 CMUX_DEV_STOP_DB_ON_EXIT=0 bun dev --hostname 0.0.0.0`
+        : args.attachMode === "dev-tail"
+          ? `printf '[freestyle-vm-ssh] tailing /tmp/cmux-dev.log on ${args.vmId}\\n\\n' && ` +
+            `while [ ! -f /tmp/cmux-dev.log ]; do sleep 0.5; done && ` +
+            `tail -n 500 -F /tmp/cmux-dev.log`
+          : // shell-attach: cd ~/cmux when it exists, else $HOME.
+            `cd \$HOME/cmux 2>/dev/null || cd \$HOME; exec bash -l`;
     const finalArgs = [
       "-e", "ssh",
       "-p", "22",
@@ -504,6 +519,9 @@ function parseArgs(argv) {
       case "--attach-dev-tail":
         out.attachMode = "dev-tail";
         break;
+      case "--attach-dev-start":
+        out.attachMode = "dev-start";
+        break;
       case "--attach-shell":
         out.attachMode = "shell-attach";
         break;
@@ -576,8 +594,13 @@ function buildCmuxCloneBootstrap() {
   // Idempotent: clones manaflow-ai/cmux into ~/cmux on the first run, then
   // `git pull --ff-only` on every subsequent run. Writes a stub
   // ~/.secrets/cmuxterm-dev.env so cmux's dev-local.sh script doesn't bail
-  // on missing secrets, runs `bun install` in web/, then launches `bun dev`
-  // on port 3000 in the background unless something is already listening.
+  // on missing secrets, then runs `bun install` in web/ so the dedicated
+  // dev-server pane can run `bun dev` immediately without re-installing.
+  //
+  // We deliberately do NOT start the dev server here anymore: cmux-home's
+  // task workspace dedicates a foreground pane to `bun dev` via the
+  // --attach-dev-start helper mode, so the user can see live logs +
+  // restart with Ctrl-C instead of tailing a backgrounded log file.
   return [
     "set -e",
     "if [ ! -d $HOME/cmux/.git ]; then",
@@ -600,22 +623,8 @@ function buildCmuxCloneBootstrap() {
     "NEXT_PUBLIC_STACK_PUBLISHABLE_CLIENT_KEY=stub",
     "STUB",
     "fi",
-    'if ! ss -tnlp 2>/dev/null | grep -q ":3000 "; then',
-    '  echo "[freestyle-vm-ssh] starting cmux web dev server on port 3000…"',
-    "  cd $HOME/cmux/web && bun install --silent >/tmp/cmux-bun-install.log 2>&1 || true",
-    // cmux web's dev-local.sh prefers CMUX_PORT over PORT. Bind to 3000 so
-    // the tailnet sees the dev server (HOSTNAME=0.0.0.0 → all interfaces;
-    // tailscale userspace tun routes inbound traffic for the tailnet IP).
-    //
-    // setsid puts the dev server in its own session + process group so
-    // SIGHUP from the closing SSH session doesn't cascade into bun → bash
-    // → next. nohup alone isn't enough because the SIGHUP-ignore doesn't
-    // survive bun's `exec` of bash + dev-local.sh's child processes.
-    "  cd $HOME/cmux/web && setsid -f bash -c 'CMUX_PORT=3000 HOSTNAME=0.0.0.0 HOST=0.0.0.0 CMUX_DEV_START_DB=0 CMUX_DEV_STOP_DB_ON_EXIT=0 exec bun dev --hostname 0.0.0.0' </dev/null >/tmp/cmux-dev.log 2>&1",
-    '  printf "[freestyle-vm-ssh] dev server starting on :3000; log at /tmp/cmux-dev.log\\n"',
-    "else",
-    '  echo "[freestyle-vm-ssh] dev server already listening on :3000"',
-    "fi",
+    'echo "[freestyle-vm-ssh] bun install in cmux/web (so dev pane starts fast)…"',
+    "cd $HOME/cmux/web && bun install --silent >/tmp/cmux-bun-install.log 2>&1 || true",
   ].join("\n");
 }
 
