@@ -1200,7 +1200,7 @@ function buildTaskLayout(opts: {
     promptFlag;
   const tailCmd = `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail`;
   return {
-    direction: "right",
+    direction: "horizontal",
     split: 0.5,
     children: [
       {
@@ -1211,7 +1211,7 @@ function buildTaskLayout(opts: {
         },
       },
       {
-        direction: "down",
+        direction: "vertical",
         split: 0.65,
         children: [
           {
