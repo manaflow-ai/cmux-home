@@ -120,26 +120,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
-  // Each VM runs its dev server on port 3000 internally. We forward
-  // that to a deterministic mac-side port via ssh -L baked into the
-  // cmux ssh command, because the freestyle russh gateway sits in
-  // front of the VM with tailscale userspace networking — userspace
-  // mode doesn't accept inbound TCP, so the browser can't dial the
-  // VM's tailnet IP directly.
-  //
-  // Hash vmId[:8] into [30000, 39999) so concurrent VMs don't fight
-  // over the same mac socket. (Two VMs hashing into the same bucket
-  // would conflict; vanishingly rare with 10k buckets and ~10 VMs).
-  const macPortForVm = useCallback((vmId: string): number => {
-    let h = 0;
-    for (let i = 0; i < Math.min(vmId.length, 16); i += 1) {
-      h = (h * 31 + vmId.charCodeAt(i)) >>> 0;
-    }
-    return 30000 + (h % 10000);
-  }, []);
+  // With cmuxd-ws attach the workspace gets a local SOCKS5 proxy
+  // (cmux's app reports it as `remote.proxy.url`) that tunnels traffic
+  // through the daemon's WebSocket back to the VM's localhost.
+  // Browser panes routed through this proxy can dial `http://127.0.0.1:3000`
+  // and reach the VM's dev server with no per-VM mac port allocation.
   const browserUrlForVm = useCallback(
-    (vmId: string): string => `http://127.0.0.1:${macPortForVm(vmId)}`,
-    [macPortForVm],
+    (_vmId: string): string => "http://127.0.0.1:3000",
+    [],
   );
 
   const commands = useMemo(defaultAgentCommands, []);
