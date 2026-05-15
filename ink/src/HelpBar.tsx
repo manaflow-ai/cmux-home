@@ -11,10 +11,39 @@ export interface HelpBarProps {
   readonly selectedIsGroup: boolean;
   readonly showShortcuts: boolean;
   readonly statusOverride: string | null; // for "press ctrl+X to quit"
+  // When mode === "vm", which state the highlighted VM is in. Drives the
+  // per-row hint text so the user knows which keys are meaningful right now.
+  readonly selectedVmState?:
+    | "starting"
+    | "running"
+    | "suspending"
+    | "suspended"
+    | "stopped"
+    | "lost"
+    | null;
 }
 
 function toggleAgent(kind: AgentKind): AgentKind {
   return kind === "codex" ? "claude" : "codex";
+}
+
+function vmHintText(state: NonNullable<HelpBarProps["selectedVmState"]> | null): string {
+  switch (state) {
+    case "running":
+      return " · enter cmux ssh in · ctrl+f fork into new VM · ctrl+o local workspace · ctrl+x destroy · type a task above to spawn another";
+    case "starting":
+      return " · vm is starting… · ctrl+x destroy (cancel) · type a task above to spawn another";
+    case "suspending":
+      return " · vm is suspending… · type a task above to spawn another";
+    case "suspended":
+      return " · enter to resume + cmux ssh in · ctrl+x destroy · type a task above to spawn another";
+    case "stopped":
+      return " · enter to start + cmux ssh in · ctrl+x destroy · type a task above to spawn another";
+    case "lost":
+      return " · vm is lost (gateway unreachable) · ctrl+x destroy · type a task above to spawn another";
+    default:
+      return " · enter open sandbox · ctrl+f fork · ctrl+o local workspace · ctrl+x destroy · ? for shortcuts";
+  }
 }
 
 function planLabel(planMode: boolean): string {
@@ -105,9 +134,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
     return (
       <Box>
         <CurrentMode provider={props.provider} planMode={props.planMode} />
-        <Text color={COLORS.muted}>
-          {" · enter open sandbox · ctrl+f fork · ctrl+o local workspace · ctrl+x destroy · ? for shortcuts"}
-        </Text>
+        <Text color={COLORS.muted}>{vmHintText(props.selectedVmState ?? null)}</Text>
       </Box>
     );
   }
@@ -116,7 +143,7 @@ function HelpBarBase(props: HelpBarProps): React.JSX.Element {
       <Box>
         <CurrentMode provider={props.provider} planMode={props.planMode} />
         <Text color={COLORS.muted}>
-          {" · enter new VM from FREESTYLE_SANDBOX_SNAPSHOT · ? for shortcuts"}
+          {" · enter new VM from FREESTYLE_SANDBOX_SNAPSHOT · type a task above to spawn a sandbox · ? for shortcuts"}
         </Text>
       </Box>
     );

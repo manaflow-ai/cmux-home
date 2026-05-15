@@ -307,12 +307,27 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     () => buildVisibleRows(workspaces, collapsedGroups),
     [workspaces, collapsedGroups],
   );
-  const vms = freestyleSummary?.vms ?? [];
+  // Only show running / transitioning VMs in the list. Stopped, suspended,
+  // and lost VMs are kept in vmsById so any task workspaces that already
+  // point at them can still resolve their parent VM in the tree view, but
+  // they aren't rendered as their own rows (most are stale dev sandboxes
+  // that aren't useful to act on, and they crowd the list).
+  const allVms = freestyleSummary?.vms ?? [];
+  const vms = useMemo(
+    () =>
+      allVms.filter(
+        (vm) =>
+          vm.state === "running" ||
+          vm.state === "starting" ||
+          vm.state === "suspending",
+      ),
+    [allVms],
+  );
   const vmsById = useMemo(() => {
     const map = new Map<string, FreestyleSummary["vms"][number]>();
-    for (const vm of vms) map.set(vm.id, vm);
+    for (const vm of allVms) map.set(vm.id, vm);
     return map;
-  }, [vms]);
+  }, [allVms]);
 
   // Build a vmId → child workspaces map by parsing the description we wrote
   // when spawning a cloud sandbox (`freestyle vm <vmId> running codex with…`).
@@ -345,12 +360,13 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const vmHeaderLabel = useMemo(() => {
     if (!freestyle.isEnabled()) return "";
     if (freestyleError) return `Freestyle VMs (error)`;
-    const total = freestyleSummary?.totalCount ?? vms.length;
-    const running = freestyleSummary?.runningCount ?? 0;
-    return running > 0
-      ? `Freestyle VMs (${total}, ${running} running)`
-      : `Freestyle VMs (${total})`;
-  }, [freestyle, freestyleSummary, freestyleError, vms.length]);
+    const total = freestyleSummary?.totalCount ?? allVms.length;
+    const shown = vms.length;
+    const hidden = Math.max(0, total - shown);
+    return hidden > 0
+      ? `Freestyle VMs (${shown} live, ${hidden} idle hidden)`
+      : `Freestyle VMs (${shown})`;
+  }, [freestyle, freestyleSummary, freestyleError, allVms.length, vms.length]);
   // Build the parent → children map for forked VMs. A VM with no parent in
   // forkParents (and no name-based parent hint) is treated as a root.
   const forkChildren = useMemo(() => {
@@ -1119,6 +1135,11 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           selectedIsGroup={selectedIsGroup}
           showShortcuts={showShortcuts}
           statusOverride={statusOverride}
+          selectedVmState={
+            selectedRow?.kind === "vm"
+              ? (vmsById.get(selectedRow.vmId)?.state ?? null)
+              : null
+          }
         />
       </Box>
     </Box>
