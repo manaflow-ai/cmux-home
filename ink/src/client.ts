@@ -87,14 +87,55 @@ export class CmuxClient {
     url: string;
     direction?: "right" | "left" | "up" | "down";
     focus?: boolean;
-  }): Promise<void> {
-    await this.rpc("pane.create", {
+  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
+    const result = (await this.rpc("pane.create", {
       workspace_id: input.workspaceId,
       type: "browser",
       direction: input.direction ?? "right",
       url: input.url,
       focus: input.focus ?? false,
-    });
+    })) as { pane_ref?: string; surface_ref?: string } | undefined;
+    if (!result?.pane_ref || !result?.surface_ref) return null;
+    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+  }
+
+  async createTerminalPane(input: {
+    workspaceId: string;
+    direction?: "right" | "left" | "up" | "down";
+    focus?: boolean;
+  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
+    const result = (await this.rpc("pane.create", {
+      workspace_id: input.workspaceId,
+      type: "terminal",
+      direction: input.direction ?? "right",
+      focus: input.focus ?? false,
+    })) as { pane_ref?: string; surface_ref?: string } | undefined;
+    if (!result?.pane_ref || !result?.surface_ref) return null;
+    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+  }
+
+  async splitSurface(input: {
+    workspaceId: string;
+    surfaceRef: string;
+    direction: "left" | "right" | "up" | "down";
+    type?: "terminal" | "browser";
+    url?: string;
+    focus?: boolean;
+  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
+    const result = (await this.rpc("surface.split", {
+      workspace_id: input.workspaceId,
+      surface: input.surfaceRef,
+      direction: input.direction,
+      type: input.type ?? "terminal",
+      url: input.url,
+      focus: input.focus ?? false,
+    })) as { pane_ref?: string; surface_ref?: string } | undefined;
+    if (!result?.pane_ref || !result?.surface_ref) return null;
+    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+  }
+
+  async sendText(surfaceRef: string, text: string): Promise<void> {
+    await this.rpc("surface.send_text", { surface: surfaceRef, text });
   }
 
   async submitPrompt(workspaceId: string, message: string): Promise<void> {

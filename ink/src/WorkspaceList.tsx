@@ -77,7 +77,9 @@ export interface WorkspaceListProps {
   readonly spinnerTick: number;
 }
 
-export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
+export const WorkspaceList = React.memo(WorkspaceListBase);
+
+function WorkspaceListBase(props: WorkspaceListProps): React.JSX.Element {
   const slice = props.rows
     .map((row, index) => ({ row, index }))
     .slice(props.scroll, props.scroll + props.height);
@@ -112,25 +114,41 @@ export function WorkspaceList(props: WorkspaceListProps): React.JSX.Element {
         if (row.kind === "vm") {
           const vm = props.vmsById.get(row.vmId);
           if (!vm) return null;
+          // Compute marker string here so static (running / stopped / lost /
+          // suspended) rows get a stable string prop — React.memo on VmRow
+          // then short-circuits the render for them, and only the
+          // starting/suspending rows actually re-render per spinner tick.
+          const isMoving = vm.state === "starting" || vm.state === "suspending";
+          const marker = isMoving
+            ? SPINNER_FRAMES[props.spinnerTick % SPINNER_FRAMES.length]!
+            : VM_STATE_GLYPH[vm.state];
           return (
             <VmRow
               key={`vm-${vm.id}-${index}`}
               vm={vm}
               selected={selected}
               width={props.width}
-              spinnerTick={props.spinnerTick}
+              marker={marker}
               depth={row.depth ?? 0}
             />
           );
         }
         const ws = props.workspaces[row.workspaceIndex]!;
+        const wsState = agentState(ws);
+        const wsGroup = displayGroup(wsState);
+        const wsMarker =
+          wsGroup === "working"
+            ? SPINNER_FRAMES[props.spinnerTick % SPINNER_FRAMES.length]!
+            : wsGroup === "needs-attention"
+              ? " "
+              : "∙";
         return (
           <WorkspaceRow
             key={`w-${ws.id}-${index}`}
             workspace={ws}
             selected={selected}
             width={props.width}
-            spinnerTick={props.spinnerTick}
+            marker={wsMarker}
             depth={row.depth ?? 0}
           />
         );
@@ -161,23 +179,19 @@ const VmRow = React.memo(function VmRow({
   vm,
   selected,
   width,
-  spinnerTick,
+  marker,
   depth = 0,
 }: {
   vm: VmRowEntry;
   selected: boolean;
   width: number;
-  spinnerTick: number;
+  marker: string;
   depth?: number;
 }): React.JSX.Element {
   const baseBg = selected ? COLORS.selectedBg : undefined;
   const baseColor = COLORS.muted;
   const titleColor = selected ? COLORS.selectedTitleFg : COLORS.muted;
   const stateColor = VM_STATE_COLOR[vm.state];
-  const isMoving = vm.state === "starting" || vm.state === "suspending";
-  const marker = isMoving
-    ? SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length]!
-    : VM_STATE_GLYPH[vm.state];
 
   const indent = depth > 0 ? "  ".repeat(depth - 1) + "└─ " : "";
   const indentWidth = cellWidth(indent);
@@ -248,13 +262,13 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
   workspace,
   selected,
   width,
-  spinnerTick,
+  marker,
   depth = 0,
 }: {
   workspace: Workspace;
   selected: boolean;
   width: number;
-  spinnerTick: number;
+  marker: string;
   depth?: number;
 }): React.JSX.Element {
   const state = agentState(workspace);
@@ -263,12 +277,6 @@ const WorkspaceRow = React.memo(function WorkspaceRow({
 
   const unreadText =
     workspace.unreadNotifications > 0 || group === "needs-attention" ? "  ∙" : "   ";
-  const marker =
-    group === "working"
-      ? SPINNER_FRAMES[spinnerTick % SPINNER_FRAMES.length]!
-      : group === "needs-attention"
-        ? " "
-        : "∙";
 
   const indent = depth > 0 ? "  ".repeat(depth - 1) + "└─ " : "";
   const indentWidth = cellWidth(indent);

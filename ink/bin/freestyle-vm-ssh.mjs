@@ -200,6 +200,42 @@ try {
   }
 
   const remoteSteps = [];
+
+  // Dev-tail attach: skip bootstrap entirely, just ssh in and follow the
+  // dev server log that the main attach session set up.
+  if (args.attachMode === "dev-tail") {
+    const remoteHost = `${args.vmId}+${args.user}@vm-ssh.freestyle.sh`;
+    const tailCmd =
+      `printf '[freestyle-vm-ssh] tailing /tmp/cmux-dev.log on ${args.vmId}\\n\\n' && ` +
+      `while [ ! -f /tmp/cmux-dev.log ]; do sleep 0.5; done && ` +
+      `tail -n 500 -F /tmp/cmux-dev.log`;
+    const finalArgs = [
+      "-e", "ssh",
+      "-p", "22",
+      "-o", "StrictHostKeyChecking=accept-new",
+      "-o", "UserKnownHostsFile=/tmp/freestyle-known-hosts",
+      "-o", "LogLevel=ERROR",
+      "-o", "ServerAliveInterval=30",
+      "-o", "ServerAliveCountMax=4",
+      "-tt", remoteHost, tailCmd,
+    ];
+    const child = spawn("sshpass", finalArgs, {
+      stdio: "inherit",
+      env: { ...process.env, SSHPASS: token },
+    });
+    child.on("exit", async (code, signal) => {
+      await cleanup();
+      if (signal) process.kill(process.pid, signal);
+      else process.exit(code ?? 0);
+    });
+    child.on("error", async (err) => {
+      process.stderr.write(`sshpass exec failed: ${err.message}\n`);
+      await cleanup();
+      process.exit(127);
+    });
+    return; // skip the normal bootstrap path
+  }
+
   if (args.tailscale && tailscaleAuthKey) {
     const tsHostname = args.tailscaleHostname ?? `fs-${args.vmId.slice(0, 8)}`;
     const tsScript = buildTailscaleBootstrap({
@@ -369,6 +405,7 @@ function parseArgs(argv) {
     codexPrompt: null,
     cloneCmux: false,
     devServerMacPort: null,
+    attachMode: "shell",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -433,6 +470,9 @@ function parseArgs(argv) {
         }
         break;
       }
+      case "--attach-dev-tail":
+        out.attachMode = "dev-tail";
+        break;
     }
   }
   if (out.forwardPorts.length === 0) {

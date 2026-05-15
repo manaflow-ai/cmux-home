@@ -390,10 +390,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         }
       };
       for (const vm of vms) {
-        if (forkParents.has(vm.id)) continue;
+        // Skip forks whose parent IS present (the parent's emitVm will pick
+        // them up). Forks whose parent has been destroyed still need to show
+        // up — they're handled by the orphan loop below.
+        const parentId = forkParents.get(vm.id);
+        if (parentId && vmsById.has(parentId)) continue;
         emitVm(vm, 0);
       }
-      // Surface any forked VMs whose parent isn't in the list (defensive).
+      // Defensive: any VM not emitted yet (race during refresh) goes as root.
       for (const vm of vms) {
         if (!emittedVm.has(vm.id)) emitVm(vm, 0);
       }
@@ -431,16 +435,20 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     }
   }, [selected, listScroll, listHeight]);
 
-  // Reset selection if out of range (e.g. snapshot refresh shrinks list).
+  // Snap selection to a real selectable row when the row layout shifts
+  // (e.g. we removed the workspace sections, or selected fell off the end
+  // after a refresh, or the row at `selected` is now a blank).
   useEffect(() => {
     if (visibleRows.length === 0) {
       if (selected !== 0) setSelected(0);
       return;
     }
-    if (selected >= visibleRows.length) {
-      setSelected(visibleRows.length - 1);
-    }
-  }, [visibleRows.length, selected]);
+    const at = visibleRows[selected];
+    if (at && isSelectableRow(at) && selected < visibleRows.length) return;
+    // Find the first selectable row from the current position.
+    const next = selectableRowAfter(visibleRows, -1);
+    if (next >= 0 && next !== selected) setSelected(next);
+  }, [visibleRows, selected]);
 
   const selectedRow = visibleRows[selected];
   const selectedIsGroup = selectedRow?.kind === "header";
@@ -653,10 +661,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           ? ` --codex-prompt ${shellQuote(prompt.trim())}`
           : "";
         const devPort = allocDevPort();
+        const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
+          ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
+          : "";
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
           `--clone-cmux ` +
           `--dev-server-mac-port ${devPort}` +
+          acctFlag +
           promptArg;
         const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
         const workspaceId = await client.createWorkspace({
@@ -666,16 +678,13 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           cwd: resolvedCwd,
           focus: false,
         });
-        try {
-          await client.createBrowserPane({
-            workspaceId,
-            url: `http://127.0.0.1:${devPort}`,
-            direction: "right",
-            focus: false,
-          });
-        } catch (err) {
-          setStatusLine(`fork workspace open, browser pane failed: ${(err as Error).message}`);
-        }
+        await openTaskRightSide({
+          client,
+          workspaceId,
+          vmId,
+          devPort,
+          setStatusLine,
+        });
         if (prompt && prompt.trim()) {
           setComposer(EMPTY_COMPOSER);
           setComposerMode({ kind: "new" });
@@ -735,11 +744,15 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           setStatusLine(`vm ${shortId} ready, opening workspace…`);
         }
         const devPort = allocDevPort();
+        const acctFlag = process.env.SUBROUTER_CODEX_ACCOUNT_ID?.trim()
+          ? ` --subrouter-account-id ${shellQuote(process.env.SUBROUTER_CODEX_ACCOUNT_ID.trim())}`
+          : "";
         const cmd =
           `node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} ` +
           `--clone-cmux ` +
-          `--dev-server-mac-port ${devPort} ` +
-          `--codex-prompt ${shellQuote(trimmed)}`;
+          `--dev-server-mac-port ${devPort}` +
+          acctFlag +
+          ` --codex-prompt ${shellQuote(trimmed)}`;
         const workspaceId = await client.createWorkspace({
           title: `task: ${preview}`,
           description: `freestyle vm ${vmId} running codex with:\n${trimmed}`,
@@ -747,18 +760,13 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           cwd: resolvedCwd,
           focus: false,
         });
-        try {
-          await client.createBrowserPane({
-            workspaceId,
-            url: `http://127.0.0.1:${devPort}`,
-            direction: "right",
-            focus: false,
-          });
-        } catch (err) {
-          setStatusLine(
-            `task workspace open, browser pane failed: ${(err as Error).message}`,
-          );
-        }
+        await openTaskRightSide({
+          client,
+          workspaceId,
+          vmId,
+          devPort,
+          setStatusLine,
+        });
         setComposer(EMPTY_COMPOSER);
         setComposerMode({ kind: "new" });
         setStatusLine(`task workspace ${workspaceId.slice(0, 8)} for vm ${shortId} (dev :${devPort})`);
@@ -1190,6 +1198,106 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
     prompt = (countMatch[2] ?? "").trim();
   }
   return { name, count, prompt };
+}
+
+/**
+ * Set up the right side of a task workspace:
+ *   - Top right: terminal that ssh's into the VM and tails the dev log
+ *     (`tail -F /tmp/cmux-dev.log`), so the user sees the dev server boot.
+ *   - Once the forwarded dev port responds, split that tail surface
+ *     downward (so the layout becomes: top=tail, bottom=browser) and
+ *     point the browser at http://127.0.0.1:<devPort>.
+ *
+ * Fire-and-forget; the caller awaits the initial pane creation, but the
+ * port poll + browser split happen in the background so the cmux-home
+ * composer is unblocked.
+ */
+async function openTaskRightSide(opts: {
+  client: CmuxClient;
+  workspaceId: string;
+  vmId: string;
+  devPort: number;
+  setStatusLine: (s: string) => void;
+}): Promise<void> {
+  const { client, workspaceId, vmId, devPort, setStatusLine } = opts;
+  let tailSurface: string | null = null;
+  try {
+    const tail = await client.createTerminalPane({
+      workspaceId,
+      direction: "right",
+      focus: false,
+    });
+    if (tail) {
+      tailSurface = tail.surfaceRef;
+      // Boot the dev-log tail in the new pane. Pre-pend a `clear` so old
+      // shell noise doesn't show.
+      const tailCmd = `clear && node ${shellQuote(VM_SSH_SCRIPT)} ${shellQuote(vmId)} --attach-dev-tail\n`;
+      // Small grace period so the new terminal's shell is ready to accept
+      // input; without it the first `cmux send-text` lands before bash is
+      // up and the command gets eaten.
+      await new Promise<void>((r) => setTimeout(r, 700));
+      try {
+        await client.sendText(tail.surfaceRef, tailCmd);
+      } catch (err) {
+        setStatusLine(`tail send failed: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    setStatusLine(`tail pane failed: ${(err as Error).message}; opening browser anyway`);
+  }
+
+  // Wait for the dev server on the SSH-forwarded mac port before opening
+  // the browser pane. This avoids the browser sitting on a 'connection
+  // refused' screen while the VM bootstraps.
+  void (async () => {
+    const ready = await waitForLocalPort(devPort, 180_000);
+    if (!ready) {
+      setStatusLine(`dev :${devPort} not ready after 3 min; opening browser anyway`);
+    }
+    try {
+      if (tailSurface) {
+        await client.splitSurface({
+          workspaceId,
+          surfaceRef: tailSurface,
+          direction: "down",
+          type: "browser",
+          url: `http://127.0.0.1:${devPort}`,
+          focus: false,
+        });
+      } else {
+        await client.createBrowserPane({
+          workspaceId,
+          url: `http://127.0.0.1:${devPort}`,
+          direction: "right",
+          focus: false,
+        });
+      }
+    } catch (err) {
+      setStatusLine(`browser pane failed: ${(err as Error).message}`);
+    }
+  })();
+}
+
+async function waitForLocalPort(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const url = `http://127.0.0.1:${port}/`;
+  while (Date.now() < deadline) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 1_500);
+      try {
+        // Any response (even 500) means the dev server is listening.
+        await fetch(url, { signal: ctrl.signal });
+        return true;
+      } finally {
+        clearTimeout(t);
+      }
+    } catch {
+      // ECONNREFUSED / abort: not ready yet
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+  }
+  return false;
 }
 
 async function waitForFreestyleHealthz(
