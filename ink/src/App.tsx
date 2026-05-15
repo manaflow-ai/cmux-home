@@ -1272,31 +1272,58 @@ async function openTaskWorkspace(opts: {
 
   // 4. Add the three auxiliary panes. cmux ssh leaves a focused
   //    workspace with one terminal panel, so pane.create has a target.
-  //    The dev pane runs `bun dev` in the foreground (visible logs +
-  //    Ctrl-C restartable) instead of tailing a backgrounded log file.
+  //
+  // We anchor each split on an explicit surface_id from listPaneSurfaces
+  // so consecutive calls don't fight over the "focused pane" — passing
+  // focus:false leaves focused on the codex pane, and without explicit
+  // surface_id pane.create would split the codex pane every time,
+  // collapsing later splits.
+  //
+  // Final layout:
+  //   ┌──────────────────────┬──────────────────────┐
+  //   │  codex (cmux ssh)    │  browser → devUrl    │
+  //   ├──────────────────────┼──────────────────────┤
+  //   │  shell (~/cmux)      │  dev: bun dev        │
+  //   └──────────────────────┴──────────────────────┘
   const devCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-start`;
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
-    await client.createPane({
+    const initialSurfaces = await client.listPaneSurfaces(workspaceRef);
+    const codexSurface = initialSurfaces[0];
+    if (!codexSurface) {
+      setStatusLine(`opened cmux ssh, but no codex surface to anchor splits`);
+      return workspaceRef;
+    }
+    // Top-right: browser, anchored on codex pane.
+    const browser = await client.createPane({
       workspaceId: workspaceRef,
       type: "browser",
       direction: "right",
       url: devUrl,
       focus: false,
+      surfaceRef: codexSurface,
     });
-    await client.createPane({
-      workspaceId: workspaceRef,
-      type: "terminal",
-      direction: "down",
-      initialCommand: devCmd,
-      focus: false,
-    });
+    // Bottom-right: dev server, anchored on the browser pane (split it
+    // down).
+    if (browser?.surfaceRef) {
+      await client.createPane({
+        workspaceId: workspaceRef,
+        type: "terminal",
+        direction: "down",
+        initialCommand: devCmd,
+        focus: false,
+        surfaceRef: browser.surfaceRef,
+      });
+    }
+    // Bottom-left: bash shell, anchored on the codex pane (split it
+    // down).
     await client.createPane({
       workspaceId: workspaceRef,
       type: "terminal",
       direction: "down",
       initialCommand: shellCmd,
       focus: false,
+      surfaceRef: codexSurface,
     });
   } catch (err) {
     setStatusLine(`opened cmux ssh, aux panes failed: ${(err as Error).message}`);
