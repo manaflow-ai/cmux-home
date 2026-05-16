@@ -245,6 +245,7 @@ enum UiEvent {
     CmuxEvent(EventFrame),
     Snapshot(Result<RefreshSnapshot, String>),
     WorkspaceSnapshot(Result<WorkspaceRefresh, String>),
+    SubmitResult(std::result::Result<SubmitSuccess, SubmitFailure>),
     StreamError(String),
 }
 
@@ -270,6 +271,38 @@ struct WorkspaceRefresh {
     workspace_id: String,
     workspace: Option<WorkspaceStatus>,
     loaded_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct SubmitRequest {
+    pending_id: String,
+    socket_path: String,
+    workspace_cwd: String,
+    terminal_path: Option<String>,
+    provider: AgentKind,
+    plan_mode: bool,
+    prompt: String,
+    images: Vec<String>,
+    title: String,
+    latest_message: String,
+    command: String,
+    command_accepts_prompt: bool,
+    submit_template: Option<String>,
+    rename_template: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubmitSuccess {
+    pending_id: String,
+    workspace_id: String,
+    title: String,
+    latest_message: String,
+}
+
+#[derive(Debug)]
+struct SubmitFailure {
+    pending_id: String,
+    error: String,
 }
 
 #[derive(Debug)]
@@ -477,6 +510,12 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        let pending_workspaces = self
+            .workspaces
+            .iter()
+            .filter(|workspace| is_pending_workspace_id(&workspace.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let previous = self
             .workspaces
             .iter()
@@ -498,6 +537,15 @@ impl App {
                 workspace
             })
             .collect();
+        for pending in pending_workspaces.into_iter().rev() {
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == pending.id)
+            {
+                self.workspaces.insert(0, pending);
+            }
+        }
         if self.view_mode == ViewMode::Workspaces {
             let visible = visible_rows(&self.workspaces, &self.collapsed_groups);
             self.selected = previously_selected_id
@@ -837,7 +885,7 @@ impl App {
         true
     }
 
-    fn submit_new_workspace(&mut self) -> Result<()> {
+    fn submit_new_workspace(&mut self, submit_tx: &Sender<SubmitRequest>) -> Result<()> {
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let images = self.image_paths.clone();
         let start_prompt = self.agent_start_prompt(&prompt, &images);
@@ -852,40 +900,39 @@ impl App {
             format!("{}: {}", self.agent_label(), one_line_preview(&prompt, 42))
         };
         let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
-        let mut params = json!({
-            "title": title,
-            "description": prompt,
-            "initial_command": command,
-            "cwd": self.workspace_cwd,
-            "focus": false,
-        });
-        if let Some(path) = self.terminal_path.as_deref() {
-            params["initial_env"] = json!({ "PATH": path });
-        }
-        let mut client = CmuxClient::new(self.socket_path.clone());
-        let created = client.v2("workspace.create", params)?;
-        let workspace_id = string_field(&created, "workspace_id")
-            .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
-        let _ = client.v1("refresh-surfaces");
-        self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
-        self.select_workspace_by_id(&workspace_id);
-        if !command_accepts_prompt {
-            self.spawn_submit_hook(&workspace_id, &prompt, &title, &images);
-        }
-        self.spawn_rename_hook(&workspace_id, &prompt, &title);
-        if !prompt.is_empty() || !images.is_empty() {
-            let _ = client.v2(
-                "workspace.prompt_submit",
-                json!({ "workspace_id": workspace_id, "message": prompt }),
-            );
-        }
         self.record_prompt_history(&prompt, &images);
+        self.persist_state();
+        let pending_id = format!("pending:{}:{}", now_millis(), self.history.len());
+        let request = SubmitRequest {
+            pending_id: pending_id.clone(),
+            socket_path: self.socket_path.clone(),
+            workspace_cwd: self.workspace_cwd.clone(),
+            terminal_path: self.terminal_path.clone(),
+            provider: self.provider,
+            plan_mode: self.plan_mode,
+            prompt,
+            images,
+            title: title.clone(),
+            latest_message: latest_message.clone(),
+            command,
+            command_accepts_prompt,
+            submit_template: self.submit_template().map(str::to_string),
+            rename_template: self.rename_template.clone(),
+        };
+        self.upsert_optimistic_workspace(pending_id.clone(), title, latest_message);
+        self.select_workspace_by_id(&pending_id);
         self.composer = new_composer();
         self.image_paths.clear();
         self.selected_image = None;
         self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::NewWorkspace;
-        self.status_line = format!("started {} workspace", self.agent_label());
+        self.status_line = format!("starting {} workspace", self.agent_label());
+        if let Err(err) = submit_tx.send(request) {
+            let request = err.0;
+            self.remove_pending_workspace(&request.pending_id);
+            self.restore_draft(draft_from_submit_request(&request));
+            self.status_line = "start failed before queueing".to_string();
+        }
         Ok(())
     }
 
@@ -895,21 +942,7 @@ impl App {
         title: String,
         latest_message: String,
     ) {
-        let workspace = WorkspaceStatus {
-            id: workspace_id.clone(),
-            title,
-            latest_message: latest_message.clone(),
-            selected: false,
-            pinned: false,
-            statuses: HashMap::new(),
-            unread_notifications: 0,
-            conversation: Some(ConversationSnapshot {
-                actor: ConversationActor::User,
-                preview: latest_message.clone(),
-                modified_at: SystemTime::now(),
-            }),
-            updated_at: Some(Instant::now()),
-        };
+        let workspace = optimistic_workspace_status(&workspace_id, title, latest_message);
         if let Some(existing) = self
             .workspaces
             .iter_mut()
@@ -918,6 +951,56 @@ impl App {
             *existing = workspace;
         } else {
             self.workspaces.insert(0, workspace);
+        }
+    }
+
+    fn apply_submit_success(&mut self, success: SubmitSuccess) {
+        let workspace = optimistic_workspace_status(
+            &success.workspace_id,
+            success.title,
+            success.latest_message,
+        );
+        if let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == success.pending_id)
+        {
+            self.workspaces[index] = workspace;
+            let mut row_index = 0usize;
+            self.workspaces.retain(|workspace| {
+                let keep = workspace.id != success.workspace_id || row_index == index;
+                row_index += 1;
+                keep
+            });
+        } else {
+            self.upsert_optimistic_workspace(
+                success.workspace_id.clone(),
+                workspace.title,
+                workspace.latest_message,
+            );
+        }
+        self.select_workspace_by_id(&success.workspace_id);
+        self.status_line = "started workspace".to_string();
+    }
+
+    fn apply_submit_failure(&mut self, failure: SubmitFailure) {
+        self.remove_pending_workspace(&failure.pending_id);
+        self.status_line = format!(
+            "start failed, saved to history: {}",
+            truncate(&failure.error, 80)
+        );
+    }
+
+    fn remove_pending_workspace(&mut self, pending_id: &str) {
+        self.workspaces
+            .retain(|workspace| workspace.id != pending_id);
+        if self.view_mode == ViewMode::Workspaces {
+            self.selected = self.selected.min(
+                visible_rows(&self.workspaces, &self.collapsed_groups)
+                    .len()
+                    .saturating_sub(1),
+            );
+            self.clamp_list_scroll(1);
         }
     }
 
@@ -1599,77 +1682,6 @@ impl App {
             AgentKind::Claude => self.claude_submit_template.as_deref(),
         }
     }
-
-    fn spawn_submit_hook(&self, workspace_id: &str, prompt: &str, title: &str, images: &[String]) {
-        let Some(template) = self.submit_template() else {
-            return;
-        };
-        if template.trim().is_empty() {
-            return;
-        }
-        let mode = if self.plan_mode { "plan" } else { "build" };
-        let Ok(payload_path) = write_submit_payload(SubmitPayload {
-            workspace_id,
-            prompt,
-            title,
-            agent: self.provider.label(),
-            mode,
-            workspace_cwd: &self.workspace_cwd,
-            socket: &self.socket_path,
-            images,
-        }) else {
-            return;
-        };
-        let payload_path_string = payload_path.display().to_string();
-        let rendered = render_command_template(
-            template,
-            &[
-                ("payload", &payload_path_string),
-                ("workspace_id", workspace_id),
-                ("socket", &self.socket_path),
-            ],
-        );
-        let mut command = Command::new("sh");
-        configure_workspace_hook_command(
-            &mut command,
-            &rendered,
-            &self.workspace_cwd,
-            &self.socket_path,
-            workspace_id,
-        );
-        let _ = command.spawn();
-    }
-
-    fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
-        let Some(template) = self.rename_template.as_deref() else {
-            return;
-        };
-        if template.trim().is_empty() {
-            return;
-        }
-        let mode = if self.plan_mode { "plan" } else { "build" };
-        let rendered = render_command_template(
-            template,
-            &[
-                ("workspace_id", workspace_id),
-                ("prompt", prompt),
-                ("title", title),
-                ("agent", self.provider.label()),
-                ("mode", mode),
-                ("workspace_cwd", &self.workspace_cwd),
-                ("socket", &self.socket_path),
-            ],
-        );
-        let mut command = Command::new("sh");
-        configure_workspace_hook_command(
-            &mut command,
-            &rendered,
-            &self.workspace_cwd,
-            &self.socket_path,
-            workspace_id,
-        );
-        let _ = command.spawn();
-    }
 }
 
 fn new_composer() -> TextArea<'static> {
@@ -1903,19 +1915,66 @@ fn draft_from_parts(
     }
 }
 
+fn draft_from_submit_request(request: &SubmitRequest) -> PersistedDraft {
+    let lines = if request.prompt.is_empty() {
+        vec![String::new()]
+    } else {
+        request.prompt.lines().map(str::to_string).collect()
+    };
+    draft_from_parts(
+        lines,
+        request.images.clone(),
+        request.provider,
+        request.plan_mode,
+    )
+}
+
+fn is_pending_workspace_id(workspace_id: &str) -> bool {
+    workspace_id.starts_with("pending:")
+}
+
+fn optimistic_workspace_status(
+    workspace_id: &str,
+    title: String,
+    latest_message: String,
+) -> WorkspaceStatus {
+    WorkspaceStatus {
+        id: workspace_id.to_string(),
+        title,
+        latest_message: latest_message.clone(),
+        selected: false,
+        pinned: false,
+        statuses: HashMap::new(),
+        unread_notifications: 0,
+        conversation: Some(ConversationSnapshot {
+            actor: ConversationActor::User,
+            preview: latest_message,
+            modified_at: SystemTime::now(),
+        }),
+        updated_at: Some(Instant::now()),
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut app = App::new(args);
     let (ui_tx, ui_rx) = mpsc::channel();
     let (refresh_tx, refresh_rx) = mpsc::channel();
+    let (submit_tx, submit_rx) = mpsc::channel();
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
+    spawn_submit_worker(submit_rx, ui_tx.clone());
     spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
-    run_tui(&mut app, ui_rx, refresh_tx)
+    run_tui(&mut app, ui_rx, refresh_tx, submit_tx)
 }
 
-fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshRequest>) -> Result<()> {
+fn run_tui(
+    app: &mut App,
+    rx: Receiver<UiEvent>,
+    refresh_tx: Sender<RefreshRequest>,
+    submit_tx: Sender<SubmitRequest>,
+) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
     execute!(
@@ -1952,6 +2011,8 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                         app.finish_loading();
                         app.status_line = format!("refresh failed: {err}");
                     }
+                    UiEvent::SubmitResult(Ok(success)) => app.apply_submit_success(success),
+                    UiEvent::SubmitResult(Err(failure)) => app.apply_submit_failure(failure),
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
                 }
             }
@@ -1962,7 +2023,7 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        match handle_key(app, key)? {
+                        match handle_key(app, key, &submit_tx)? {
                             KeyAction::Continue => {}
                             KeyAction::Quit => break,
                             KeyAction::Refresh(reason) => {
@@ -2011,7 +2072,11 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
     result
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
+fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    submit_tx: &Sender<SubmitRequest>,
+) -> Result<KeyAction> {
     match key {
         KeyEvent {
             code: KeyCode::Char(ch @ ('c' | 'd')),
@@ -2060,7 +2125,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) => {
             app.open_workspace_view();
         }
-        _ if app.composer_is_active() => return handle_composer_key(app, key),
+        _ if app.composer_is_active() => return handle_composer_key(app, key, submit_tx),
         KeyEvent {
             code: KeyCode::Char('r'),
             modifiers: KeyModifiers::CONTROL,
@@ -2229,7 +2294,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             if app.composer_has_text() {
-                app.submit_new_workspace()?;
+                app.submit_new_workspace(submit_tx)?;
                 return Ok(KeyAction::Continue);
             }
             if app.toggle_selected_group() {
@@ -2263,7 +2328,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
     Ok(KeyAction::Continue)
 }
 
-fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
+fn handle_composer_key(
+    app: &mut App,
+    key: KeyEvent,
+    submit_tx: &Sender<SubmitRequest>,
+) -> Result<KeyAction> {
     match key {
         KeyEvent {
             code: KeyCode::Enter,
@@ -2277,7 +2346,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
                 if handle_composer_command(app) {
                     return Ok(KeyAction::Continue);
                 }
-                app.submit_new_workspace()?;
+                app.submit_new_workspace(submit_tx)?;
                 return Ok(KeyAction::Continue);
             }
             ComposerMode::RenameWorkspace(workspace_id) => {
@@ -4262,6 +4331,134 @@ fn refresh_request_reason(request: &RefreshRequest) -> &str {
     }
 }
 
+fn spawn_submit_worker(requests: Receiver<SubmitRequest>, tx: Sender<UiEvent>) {
+    thread::spawn(move || {
+        while let Ok(request) = requests.recv() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = run_submit_request(request);
+                let _ = tx.send(UiEvent::SubmitResult(result));
+            });
+        }
+    });
+}
+
+fn run_submit_request(request: SubmitRequest) -> std::result::Result<SubmitSuccess, SubmitFailure> {
+    match submit_request_inner(&request) {
+        Ok(workspace_id) => Ok(SubmitSuccess {
+            pending_id: request.pending_id,
+            workspace_id,
+            title: request.title,
+            latest_message: request.latest_message,
+        }),
+        Err(err) => Err(SubmitFailure {
+            pending_id: request.pending_id,
+            error: err.to_string(),
+        }),
+    }
+}
+
+fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
+    let mut params = json!({
+        "title": &request.title,
+        "description": &request.prompt,
+        "initial_command": &request.command,
+        "cwd": &request.workspace_cwd,
+        "focus": false,
+    });
+    if let Some(path) = request.terminal_path.as_deref() {
+        params["initial_env"] = json!({ "PATH": path });
+    }
+
+    let mut client = CmuxClient::new(request.socket_path.clone());
+    let created = client.v2("workspace.create", params)?;
+    let workspace_id = string_field(&created, "workspace_id")
+        .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+    let _ = client.v1("refresh-surfaces");
+    if !request.command_accepts_prompt {
+        spawn_submit_hook_for_request(request, &workspace_id);
+    }
+    spawn_rename_hook_for_request(request, &workspace_id);
+    if !request.prompt.is_empty() || !request.images.is_empty() {
+        let _ = client.v2(
+            "workspace.prompt_submit",
+            json!({ "workspace_id": workspace_id, "message": &request.prompt }),
+        );
+    }
+    Ok(workspace_id)
+}
+
+fn spawn_submit_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
+    let Some(template) = request.submit_template.as_deref() else {
+        return;
+    };
+    if template.trim().is_empty() {
+        return;
+    }
+    let mode = if request.plan_mode { "plan" } else { "build" };
+    let Ok(payload_path) = write_submit_payload(SubmitPayload {
+        workspace_id,
+        prompt: &request.prompt,
+        title: &request.title,
+        agent: request.provider.label(),
+        mode,
+        workspace_cwd: &request.workspace_cwd,
+        socket: &request.socket_path,
+        images: &request.images,
+    }) else {
+        return;
+    };
+    let payload_path_string = payload_path.display().to_string();
+    let rendered = render_command_template(
+        template,
+        &[
+            ("payload", &payload_path_string),
+            ("workspace_id", workspace_id),
+            ("socket", &request.socket_path),
+        ],
+    );
+    let mut command = Command::new("sh");
+    configure_workspace_hook_command(
+        &mut command,
+        &rendered,
+        &request.workspace_cwd,
+        &request.socket_path,
+        workspace_id,
+    );
+    let _ = command.spawn();
+}
+
+fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
+    let Some(template) = request.rename_template.as_deref() else {
+        return;
+    };
+    if template.trim().is_empty() {
+        return;
+    }
+    let mode = if request.plan_mode { "plan" } else { "build" };
+    let rendered = render_command_template(
+        template,
+        &[
+            ("workspace_id", workspace_id),
+            ("prompt", &request.prompt),
+            ("title", &request.title),
+            ("agent", request.provider.label()),
+            ("mode", mode),
+            ("workspace_cwd", &request.workspace_cwd),
+            ("socket", &request.socket_path),
+        ],
+    );
+    let mut command = Command::new("sh");
+    configure_workspace_hook_command(
+        &mut command,
+        &rendered,
+        &request.workspace_cwd,
+        &request.socket_path,
+        workspace_id,
+    );
+    let _ = command.spawn();
+}
+
 fn spawn_refresh_worker(
     socket_path: String,
     requests: Receiver<RefreshRequest>,
@@ -5389,6 +5586,136 @@ mod tests {
 
         assert!(app.loading_reason.is_none());
         assert!(app.loading_started_at.is_none());
+    }
+
+    #[test]
+    fn submitting_prompt_queues_background_work_and_preserves_history() {
+        let state_path = std::env::temp_dir().join(format!(
+            "cmux-home-submit-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = fs::remove_file(&state_path);
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.state_path = state_path.clone();
+        app.history.clear();
+        app.stashes.clear();
+        app.composer = composer_from_lines(vec!["instant submit".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        let (tx, rx) = mpsc::channel();
+
+        app.submit_new_workspace(&tx).expect("queue submit");
+
+        let request = rx.try_recv().expect("background submit request");
+        assert_eq!(request.prompt, "instant submit");
+        assert!(!app.composer_has_input());
+        assert!(app
+            .workspaces
+            .first()
+            .is_some_and(|workspace| workspace.id.starts_with("pending:")));
+
+        let protected: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("protected state")).unwrap();
+        assert_eq!(
+            protected.draft.as_ref().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+        assert_eq!(
+            protected.history.first().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+
+        app.persist_state();
+        let cleared: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("cleared state")).unwrap();
+        assert!(cleared.draft.is_none());
+        assert_eq!(
+            cleared.history.first().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn refresh_preserves_pending_submission_rows() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.workspaces = vec![optimistic_workspace_status(
+            "pending:1",
+            "codex: instant submit".to_string(),
+            "instant submit".to_string(),
+        )];
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: Vec::new(),
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, "pending:1");
+        assert_eq!(
+            display_group(app.workspaces[0].agent_state()),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn submit_success_replaces_pending_row_without_duplicates() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.workspaces = vec![
+            optimistic_workspace_status(
+                "workspace:7",
+                "codex: instant submit".to_string(),
+                "instant submit".to_string(),
+            ),
+            optimistic_workspace_status(
+                "pending:1",
+                "codex: instant submit".to_string(),
+                "instant submit".to_string(),
+            ),
+        ];
+
+        app.apply_submit_success(SubmitSuccess {
+            pending_id: "pending:1".to_string(),
+            workspace_id: "workspace:7".to_string(),
+            title: "codex: instant submit".to_string(),
+            latest_message: "instant submit".to_string(),
+        });
+
+        let matches = app
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.id == "workspace:7")
+            .count();
+        assert_eq!(matches, 1);
+        assert!(app
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != "pending:1"));
     }
 
     #[test]
