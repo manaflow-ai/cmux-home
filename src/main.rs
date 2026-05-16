@@ -2464,7 +2464,7 @@ fn handle_composer_command(app: &mut App) -> bool {
         return true;
     }
 
-    if text.starts_with('/') || text.starts_with('$') {
+    if text.starts_with('/') {
         if complete_autocomplete_selection(app) {
             return true;
         }
@@ -4990,6 +4990,27 @@ mod tests {
                 ComposerReferenceKind::Skill,
             ]
         );
+    }
+
+    #[test]
+    fn dollar_skill_prompt_is_not_treated_as_command() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec![
+            "$auto-issue https://github.com/manaflow-ai/cmux/issues/4228 reproduce and fix"
+                .to_string(),
+        ]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(!complete_autocomplete_selection(&mut app));
+        assert!(!handle_composer_command(&mut app));
     }
 
     #[test]
