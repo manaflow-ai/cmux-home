@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -307,6 +307,7 @@ struct App {
     view_mode: ViewMode,
     image_paths: Vec<String>,
     selected_image: Option<ImageSelection>,
+    composer_drag_anchor: Option<(usize, usize)>,
     stashes: Vec<PersistedDraft>,
     history: Vec<PersistedDraft>,
     state_path: PathBuf,
@@ -316,6 +317,8 @@ struct App {
     status_line: String,
     last_quit_tap: Option<(char, Instant)>,
     last_refresh: Option<Instant>,
+    loading_reason: Option<String>,
+    loading_started_at: Option<Instant>,
     started_at: Instant,
 }
 
@@ -405,6 +408,7 @@ impl App {
             view_mode: ViewMode::Workspaces,
             image_paths: Vec::new(),
             selected_image: None,
+            composer_drag_anchor: None,
             stashes: persisted.stashes,
             history: persisted.history,
             state_path,
@@ -414,6 +418,8 @@ impl App {
             status_line: "starting".to_string(),
             last_quit_tap: None,
             last_refresh: None,
+            loading_reason: Some("startup".to_string()),
+            loading_started_at: Some(Instant::now()),
             started_at: Instant::now(),
         };
         if let Some(provider) = persisted
@@ -525,6 +531,7 @@ impl App {
         }
         self.clamp_list_scroll(1);
         self.last_refresh = Some(snapshot.loaded_at);
+        self.finish_loading();
         self.status_line = format!("{} workspaces ({})", self.workspaces.len(), snapshot.reason);
     }
 
@@ -568,7 +575,18 @@ impl App {
             self.clamp_list_scroll(1);
         }
         self.last_refresh = Some(snapshot.loaded_at);
+        self.finish_loading();
         self.status_line = snapshot.reason;
+    }
+
+    fn begin_loading(&mut self, reason: impl Into<String>) {
+        self.loading_reason = Some(reason.into());
+        self.loading_started_at = Some(Instant::now());
+    }
+
+    fn finish_loading(&mut self) {
+        self.loading_reason = None;
+        self.loading_started_at = None;
     }
 
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
@@ -864,6 +882,8 @@ impl App {
         self.record_prompt_history(&prompt, &images);
         self.composer = new_composer();
         self.image_paths.clear();
+        self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::NewWorkspace;
         self.status_line = format!("started {} workspace", self.agent_label());
         Ok(())
@@ -954,6 +974,7 @@ impl App {
         };
         self.composer = composer_from_lines(vec![workspace.title]);
         self.composer.select_all();
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::RenameWorkspace(workspace.id);
         self.status_line = "renaming workspace".to_string();
         true
@@ -981,6 +1002,7 @@ impl App {
         self.composer = new_composer();
         self.image_paths.clear();
         self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::NewWorkspace;
         self.sync_focus_after_composer_change();
     }
@@ -1049,6 +1071,7 @@ impl App {
         self.composer = composer_from_lines(non_empty_lines(draft.lines));
         self.image_paths = draft.image_paths;
         self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
@@ -1919,12 +1942,14 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                     }
                     UiEvent::Snapshot(Ok(snapshot)) => app.apply_refresh(snapshot),
                     UiEvent::Snapshot(Err(err)) => {
+                        app.finish_loading();
                         app.status_line = format!("refresh failed: {err}");
                     }
                     UiEvent::WorkspaceSnapshot(Ok(snapshot)) => {
                         app.apply_workspace_refresh(snapshot)
                     }
                     UiEvent::WorkspaceSnapshot(Err(err)) => {
+                        app.finish_loading();
                         app.status_line = format!("refresh failed: {err}");
                     }
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
@@ -1965,6 +1990,7 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                 && last_refresh_request.elapsed() >= Duration::from_millis(250)
             {
                 if let Some(reason) = pending_refresh.take() {
+                    app.begin_loading(refresh_request_reason(&reason));
                     let _ = refresh_tx.send(reason);
                     last_refresh_request = Instant::now();
                 }
@@ -2552,6 +2578,9 @@ fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestionMatch> {
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
+    if handle_composer_mouse(app, &mouse, area) {
+        return;
+    }
     let reserved_bottom = app.bottom_reserved_height(area.height, area.width);
     let workspace_end = area.height.saturating_sub(reserved_bottom);
     if mouse.row >= workspace_end {
@@ -2612,6 +2641,212 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
         }
         _ => {}
     }
+}
+
+fn handle_composer_mouse(app: &mut App, mouse: &MouseEvent, area: Rect) -> bool {
+    let composer_area = composer_area(app, area);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !mouse_in_rect(mouse, composer_area) {
+                return false;
+            }
+            let Some(position) = composer_position_from_mouse(app, composer_area, mouse) else {
+                return true;
+            };
+            app.composer_drag_anchor = Some(position);
+            app.composer.cancel_selection();
+            app.selected_image = None;
+            move_composer_cursor_to(&mut app.composer, position);
+            app.sync_focus_after_composer_change();
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(anchor) = app.composer_drag_anchor else {
+                return false;
+            };
+            let Some(position) = composer_position_from_mouse_clamped(app, composer_area, mouse)
+            else {
+                return true;
+            };
+            set_composer_selection(app, anchor, position);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(anchor) = app.composer_drag_anchor.take() {
+                if let Some(position) =
+                    composer_position_from_mouse_clamped(app, composer_area, mouse)
+                {
+                    set_composer_selection(app, anchor, position);
+                    copy_composer_selection_to_clipboard(app);
+                }
+                return true;
+            }
+            mouse_in_rect(mouse, composer_area)
+        }
+        _ => false,
+    }
+}
+
+fn mouse_in_rect(mouse: &MouseEvent, area: Rect) -> bool {
+    mouse.row >= area.y
+        && mouse.row < area.bottom()
+        && mouse.column >= area.x
+        && mouse.column < area.right()
+}
+
+fn composer_area(app: &App, area: Rect) -> Rect {
+    let composer_height = app.composer_height(area.height, area.width);
+    let help_height = app.help_height();
+    let composer_y = area
+        .bottom()
+        .saturating_sub(help_height)
+        .saturating_sub(1)
+        .saturating_sub(composer_height);
+    Rect::new(area.x, composer_y, area.width, composer_height)
+}
+
+fn composer_position_from_mouse(
+    app: &App,
+    area: Rect,
+    mouse: &MouseEvent,
+) -> Option<(usize, usize)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let visible_start = composer_visible_start(app, area.height as usize, area.width);
+    let target_visual_row =
+        visible_start.saturating_add(usize::from(mouse.row.saturating_sub(area.y)));
+    let target_col = usize::from(mouse.column.saturating_sub(area.x));
+    let mut visual_row = 0usize;
+    let lines = app.composer.lines();
+    for (row, text) in lines.iter().enumerate() {
+        let text_width = composer_text_width(area.width, row);
+        let visual_count = visual_line_count_for_text(text, text_width);
+        if target_visual_row < visual_row.saturating_add(visual_count) {
+            let chunk_index = target_visual_row.saturating_sub(visual_row);
+            let prompt_width = composer_prompt_width(row);
+            let chunk_col = target_col.saturating_sub(prompt_width).min(text_width);
+            let col = chunk_index
+                .saturating_mul(text_width)
+                .saturating_add(chunk_col)
+                .min(text.chars().count());
+            return Some((row, col));
+        }
+        visual_row = visual_row.saturating_add(visual_count);
+    }
+
+    lines
+        .last()
+        .map(|line| (lines.len().saturating_sub(1), line.chars().count()))
+}
+
+fn composer_position_from_mouse_clamped(
+    app: &App,
+    area: Rect,
+    mouse: &MouseEvent,
+) -> Option<(usize, usize)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let row = mouse.row.max(area.y).min(area.bottom().saturating_sub(1));
+    let column = mouse.column.max(area.x).min(area.right().saturating_sub(1));
+    let clamped = MouseEvent {
+        kind: mouse.kind,
+        column,
+        row,
+        modifiers: mouse.modifiers,
+    };
+    composer_position_from_mouse(app, area, &clamped)
+}
+
+fn set_composer_selection(app: &mut App, anchor: (usize, usize), position: (usize, usize)) {
+    if anchor == position {
+        app.composer.cancel_selection();
+        move_composer_cursor_to(&mut app.composer, position);
+        return;
+    }
+    app.composer.cancel_selection();
+    move_composer_cursor_to(&mut app.composer, anchor);
+    app.composer.start_selection();
+    move_composer_cursor_to(&mut app.composer, position);
+}
+
+fn move_composer_cursor_to(textarea: &mut TextArea<'static>, position: (usize, usize)) {
+    let row = position.0.min(u16::MAX as usize) as u16;
+    let col = position.1.min(u16::MAX as usize) as u16;
+    textarea.move_cursor(CursorMove::Jump(row, col));
+}
+
+fn copy_composer_selection_to_clipboard(app: &mut App) {
+    let Some(range) = app.composer.selection_range() else {
+        return;
+    };
+    let text = selected_text_from_range(app.composer.lines(), range);
+    if text.is_empty() {
+        return;
+    }
+    match copy_to_clipboard(&text) {
+        Ok(()) => {
+            let count = text.chars().count();
+            app.status_line = format!("copied {count} chars");
+        }
+        Err(err) => {
+            app.status_line = format!("copy failed: {err}");
+        }
+    }
+}
+
+fn selected_text_from_range(lines: &[String], range: ((usize, usize), (usize, usize))) -> String {
+    let ((start_row, start_col), (end_row, end_col)) = normalize_text_range(range);
+    if lines.is_empty() || start_row >= lines.len() || end_row >= lines.len() {
+        return String::new();
+    }
+    if start_row == end_row {
+        return char_slice(&lines[start_row], start_col, end_col);
+    }
+
+    let mut chunks = Vec::new();
+    chunks.push(char_slice(
+        &lines[start_row],
+        start_col,
+        lines[start_row].chars().count(),
+    ));
+    chunks.extend(lines[start_row + 1..end_row].iter().cloned());
+    chunks.push(char_slice(&lines[end_row], 0, end_col));
+    chunks.join("\n")
+}
+
+fn normalize_text_range(
+    range: ((usize, usize), (usize, usize)),
+) -> ((usize, usize), (usize, usize)) {
+    let (start, end) = range;
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = start.min(chars.len());
+    let end = end.min(chars.len()).max(start);
+    chars[start..end].iter().collect()
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawn pbcopy")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes()).context("write pbcopy")?;
+    }
+    let status = child.wait().context("wait for pbcopy")?;
+    if !status.success() {
+        bail!("pbcopy exited with {status}");
+    }
+    Ok(())
 }
 
 fn handle_paste(app: &mut App, text: &str) {
@@ -3338,6 +3573,11 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    if app.workspaces.is_empty() && app.loading_reason.is_some() {
+        let line = render_loading_line(app, area.width as usize);
+        frame.render_widget(Paragraph::new(vec![line]), area);
+        return;
+    }
     app.ensure_selected_visible(area.height);
     let spinner_tick = (app.started_at.elapsed().as_millis() / 140) as usize;
     let lines = visible_rows(&app.workspaces, &app.collapsed_groups)
@@ -3359,6 +3599,51 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+    draw_loading_badge(frame, area, app);
+}
+
+fn render_loading_line(app: &App, width: usize) -> Line<'static> {
+    let label = format!("  {}", loading_label(app));
+    let text = truncate(&label, width);
+    let trailing = width.saturating_sub(text.chars().count());
+    Line::from(Span::styled(
+        format!("{text}{}", " ".repeat(trailing)),
+        muted_style(),
+    ))
+}
+
+fn draw_loading_badge(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.height == 0 || app.loading_reason.is_none() {
+        return;
+    }
+    let label = format!(" {} ", loading_label(app));
+    let width = (label.chars().count() as u16).min(area.width);
+    if width == 0 {
+        return;
+    }
+    let x = area.right().saturating_sub(width);
+    frame.render_widget(
+        Paragraph::new(truncate(&label, width as usize)).style(muted_style()),
+        Rect::new(x, area.y, width, 1),
+    );
+}
+
+fn loading_label(app: &App) -> String {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tick = (app.started_at.elapsed().as_millis() / 140) as usize;
+    let reason = app.loading_reason.as_deref().unwrap_or("loading");
+    let elapsed = app
+        .loading_started_at
+        .map(|started| started.elapsed().as_secs())
+        .unwrap_or(0);
+    if elapsed > 0 {
+        format!(
+            "{} loading {reason} {elapsed}s",
+            spinner[tick % spinner.len()]
+        )
+    } else {
+        format!("{} loading {reason}", spinner[tick % spinner.len()])
+    }
 }
 
 fn autocomplete_height(app: &App, available_height: u16) -> u16 {
@@ -3967,6 +4252,13 @@ fn merge_refresh_request(
         (_, Some(RefreshRequest::All(reason))) => Some(RefreshRequest::All(reason)),
         (_, Some(next)) => Some(next),
         (current, None) => current,
+    }
+}
+
+fn refresh_request_reason(request: &RefreshRequest) -> &str {
+    match request {
+        RefreshRequest::All(reason) => reason,
+        RefreshRequest::Workspace { reason, .. } => reason,
     }
 }
 
@@ -5011,6 +5303,92 @@ mod tests {
 
         assert!(!complete_autocomplete_selection(&mut app));
         assert!(!handle_composer_command(&mut app));
+    }
+
+    #[test]
+    fn selected_text_from_range_handles_multiline_text() {
+        let lines = vec![
+            "first line".to_string(),
+            "middle".to_string(),
+            "last line".to_string(),
+        ];
+
+        let selected = selected_text_from_range(&lines, ((0, 6), (2, 4)));
+
+        assert_eq!(selected, "line\nmiddle\nlast");
+    }
+
+    #[test]
+    fn composer_mouse_position_accounts_for_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["abcdef".to_string()]);
+        let area = Rect::new(0, 0, 5, 3);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let position = composer_position_from_mouse(&app, area, &mouse);
+
+        assert_eq!(position, Some((0, 4)));
+    }
+
+    #[test]
+    fn composer_mouse_selection_sets_textarea_selection_range() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+
+        set_composer_selection(&mut app, (0, 6), (0, 11));
+
+        assert_eq!(app.composer.selection_range(), Some(((0, 6), (0, 11))));
+        assert_eq!(
+            selected_text_from_range(
+                app.composer.lines(),
+                app.composer.selection_range().unwrap()
+            ),
+            "world"
+        );
+    }
+
+    #[test]
+    fn refresh_snapshot_clears_loading_state() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.begin_loading("test");
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: Vec::new(),
+            loaded_at: Instant::now(),
+        });
+
+        assert!(app.loading_reason.is_none());
+        assert!(app.loading_started_at.is_none());
     }
 
     #[test]
