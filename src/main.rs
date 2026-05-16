@@ -116,6 +116,20 @@ struct FuzzyMatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerReferenceKind {
+    Command,
+    File,
+    Skill,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ComposerHighlightRange {
+    start: usize,
+    end: usize,
+    kind: ComposerReferenceKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusTarget {
     MainContent,
     Autocomplete,
@@ -3055,30 +3069,52 @@ fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<
         return spans;
     }
 
-    let refs = image_token_refs(text);
-    if refs.is_empty() {
+    let image_refs = image_token_refs(text);
+    let reference_refs = composer_reference_ranges(app, text);
+    if image_refs.is_empty() && reference_refs.is_empty() {
         spans.push(Span::styled(text.to_string(), input_style()));
         return spans;
     }
 
     let chars = text.chars().collect::<Vec<_>>();
+    let image_ranges = image_refs
+        .into_iter()
+        .map(|(start, end, image_number)| (start, end, Some(image_number), None))
+        .chain(
+            reference_refs
+                .into_iter()
+                .map(|range| (range.start, range.end, None, Some(range.kind))),
+        )
+        .collect::<Vec<_>>();
+    let mut ranges = image_ranges;
+    ranges.sort_by_key(|(start, end, _, _)| (*start, *end));
     let mut cursor = 0;
-    for (start, end, image_number) in refs {
+    for (start, end, image_number, reference_kind) in ranges {
+        if start < cursor || start >= end || end > chars.len() {
+            continue;
+        }
         if cursor < start {
             spans.push(Span::styled(
                 chars[cursor..start].iter().collect::<String>(),
                 input_style(),
             ));
         }
-        let selected = app.selected_image.as_ref().is_some_and(|selection| {
-            selection.row == row
-                && selection.start == start
-                && selection.end == end
-                && Some(selection.image_index) == image_number.checked_sub(1)
-        });
+        let style = if let Some(image_number) = image_number {
+            let selected = app.selected_image.as_ref().is_some_and(|selection| {
+                selection.row == row
+                    && selection.start == start
+                    && selection.end == end
+                    && Some(selection.image_index) == image_number.checked_sub(1)
+            });
+            image_token_style(selected)
+        } else if let Some(kind) = reference_kind {
+            composer_reference_style(kind)
+        } else {
+            input_style()
+        };
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
-            image_token_style(selected),
+            style,
         ));
         cursor = end;
     }
@@ -3149,6 +3185,59 @@ fn append_selected_text_spans(
             input_style(),
         ));
     }
+}
+
+fn composer_reference_ranges(app: &App, text: &str) -> Vec<ComposerHighlightRange> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let marker = chars[index];
+        if !matches!(marker, '$' | '/' | '@')
+            || (index > 0 && !chars[index - 1].is_whitespace())
+            || index + 1 >= chars.len()
+            || chars[index + 1].is_whitespace()
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut end = index + 1;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        let body = chars[index + 1..end].iter().collect::<String>();
+        let kind = match marker {
+            '@' => Some(ComposerReferenceKind::File),
+            '$' => Some(ComposerReferenceKind::Skill),
+            '/' if command_name_exists(&body) => Some(ComposerReferenceKind::Command),
+            '/' if skill_name_exists(&app.skills, &body) => Some(ComposerReferenceKind::Skill),
+            '/' => Some(ComposerReferenceKind::Command),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            ranges.push(ComposerHighlightRange {
+                start: index,
+                end,
+                kind,
+            });
+        }
+        index = end;
+    }
+    ranges
+}
+
+fn command_name_exists(name: &str) -> bool {
+    let command = format!("/{name}");
+    COMMAND_SUGGESTIONS
+        .iter()
+        .any(|suggestion| suggestion.command == command)
+}
+
+fn skill_name_exists(skills: &[SkillEntry], name: &str) -> bool {
+    skills
+        .iter()
+        .any(|skill| skill.name.eq_ignore_ascii_case(name))
 }
 
 fn composer_prompt_width(row: usize) -> usize {
@@ -3712,6 +3801,14 @@ fn image_token_style(selected: bool) -> Style {
         style.bg(Color::Rgb(55, 55, 55))
     } else {
         style
+    }
+}
+
+fn composer_reference_style(kind: ComposerReferenceKind) -> Style {
+    match kind {
+        ComposerReferenceKind::Command => purple_style(),
+        ComposerReferenceKind::File => Style::default().fg(Color::Rgb(86, 156, 214)),
+        ComposerReferenceKind::Skill => Style::default().fg(Color::Rgb(175, 150, 255)),
     }
 }
 
@@ -4861,6 +4958,38 @@ mod tests {
         assert!(text.ends_with(".md.file"));
         assert!(text.contains('…'));
         assert!(positions.contains(&0));
+    }
+
+    #[test]
+    fn composer_reference_ranges_classify_inline_refs() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "verify".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/verify/SKILL.md"),
+        }];
+
+        let ranges = composer_reference_ranges(&app, "use $verify @src/main.rs /history /verify");
+
+        assert_eq!(
+            ranges.iter().map(|range| range.kind).collect::<Vec<_>>(),
+            vec![
+                ComposerReferenceKind::Skill,
+                ComposerReferenceKind::File,
+                ComposerReferenceKind::Command,
+                ComposerReferenceKind::Skill,
+            ]
+        );
     }
 
     #[test]
