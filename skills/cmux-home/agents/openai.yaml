@@ -1,0 +1,4 @@
+interface:
+  display_name: "cmux-home"
+  short_description: "Develop and customize the cmux-home launcher."
+  default_prompt: "Use $cmux-home to explain this launcher and adapt it for my cmux workflow."
