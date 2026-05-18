@@ -3886,6 +3886,10 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         frame.render_widget(Paragraph::new(vec![line]), area);
         return;
     }
+    if app.workspaces.is_empty() {
+        draw_empty_workspace_state(frame, area);
+        return;
+    }
     app.ensure_selected_visible(area.height);
     let rows = visible_rows(&app.workspaces, &app.collapsed_groups);
     let spinner_tick = (app.started_at.elapsed().as_millis() / 140) as usize;
@@ -3911,6 +3915,59 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), area);
     draw_scroll_indicators(frame, area, app.list_scroll, total_rows, area.height);
     draw_loading_badge(frame, area, app);
+}
+
+fn draw_empty_workspace_state(frame: &mut Frame<'_>, area: Rect) {
+    let logo = welcome_icon_lines();
+    let logo_height = logo.len() as u16;
+    if area.width == 0 || area.height < logo_height {
+        return;
+    }
+    let y = area.y + area.height.saturating_sub(logo_height) / 2;
+    for (index, line) in logo.into_iter().enumerate() {
+        let width = line_width(&line) as u16;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect::new(x, y + index as u16, width.min(area.width), 1),
+        );
+    }
+}
+
+fn welcome_icon_lines() -> Vec<Line<'static>> {
+    vec![
+        welcome_icon_line(0, "  ::"),
+        welcome_icon_line(1, "    ::::"),
+        welcome_icon_line(2, "      ::::::"),
+        welcome_icon_line(3, "        ::::::"),
+        welcome_icon_line(4, "      ::::::"),
+        welcome_icon_line(5, "    ::::"),
+        welcome_icon_line(6, "  ::"),
+    ]
+}
+
+fn welcome_icon_line(index: usize, text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, welcome_icon_style(index)))
+}
+
+fn welcome_icon_style(index: usize) -> Style {
+    let colors = [
+        Color::Rgb(0, 212, 255),
+        Color::Rgb(24, 181, 250),
+        Color::Rgb(48, 150, 245),
+        Color::Rgb(72, 119, 241),
+        Color::Rgb(96, 88, 239),
+        Color::Rgb(110, 73, 238),
+        Color::Rgb(124, 58, 237),
+    ];
+    Style::default().fg(colors[index.min(colors.len() - 1)])
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
 }
 
 fn render_loading_line(app: &App, width: usize) -> Line<'static> {
@@ -6042,6 +6099,19 @@ mod tests {
         assert_eq!(scroll_indicator_visibility(2, 8, 3), (true, true));
         assert_eq!(scroll_indicator_visibility(5, 8, 3), (true, false));
         assert_eq!(scroll_indicator_visibility(0, 8, 0), (false, false));
+    }
+
+    #[test]
+    fn welcome_icon_lines_match_cmux_welcome_mark() {
+        let lines = welcome_icon_lines();
+
+        assert_eq!(lines.len(), 7);
+        assert_eq!(
+            lines.iter().map(line_width).collect::<Vec<_>>(),
+            vec![4, 8, 12, 14, 12, 8, 4]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(0, 212, 255)));
+        assert_eq!(lines[6].spans[0].style.fg, Some(Color::Rgb(124, 58, 237)));
     }
 
     #[test]
