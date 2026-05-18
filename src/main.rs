@@ -3714,8 +3714,10 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     app.ensure_selected_visible(area.height);
+    let rows = visible_rows(&app.workspaces, &app.collapsed_groups);
     let spinner_tick = (app.started_at.elapsed().as_millis() / 140) as usize;
-    let lines = visible_rows(&app.workspaces, &app.collapsed_groups)
+    let total_rows = rows.len();
+    let lines = rows
         .into_iter()
         .enumerate()
         .skip(app.list_scroll)
@@ -3734,6 +3736,7 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+    draw_scroll_indicators(frame, area, app.list_scroll, total_rows, area.height);
     draw_loading_badge(frame, area, app);
 }
 
@@ -4024,6 +4027,59 @@ fn draw_draft_list(
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+    draw_scroll_indicators(frame, area, app.list_scroll, drafts.len(), viewport);
+}
+
+fn draw_scroll_indicators(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: usize,
+    total_rows: usize,
+    viewport_rows: u16,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (has_above, has_below) = scroll_indicator_visibility(scroll, total_rows, viewport_rows);
+    if area.height == 1 && has_above && has_below {
+        draw_scroll_indicator(frame, area, area.y, "↕ more");
+        return;
+    }
+    if has_above {
+        draw_scroll_indicator(frame, area, area.y, "↑ more");
+    }
+    if has_below {
+        draw_scroll_indicator(frame, area, area.bottom().saturating_sub(1), "↓ more");
+    }
+}
+
+fn draw_scroll_indicator(frame: &mut Frame<'_>, area: Rect, y: u16, label: &str) {
+    let label = format!(" {label} ");
+    let width = (label.chars().count() as u16).min(area.width);
+    if width == 0 {
+        return;
+    }
+    let x = area.right().saturating_sub(width);
+    frame.render_widget(
+        Paragraph::new(truncate(&label, width as usize)).style(muted_style()),
+        Rect::new(x, y, width, 1),
+    );
+}
+
+fn scroll_indicator_visibility(
+    scroll: usize,
+    total_rows: usize,
+    viewport_rows: u16,
+) -> (bool, bool) {
+    let viewport_rows = usize::from(viewport_rows);
+    if total_rows == 0 || viewport_rows == 0 {
+        return (false, false);
+    }
+    let scroll = scroll.min(total_rows.saturating_sub(1));
+    (
+        scroll > 0,
+        scroll.saturating_add(viewport_rows) < total_rows,
+    )
 }
 
 fn render_stash_row(
@@ -5703,6 +5759,15 @@ mod tests {
 
         assert!(app.loading_reason.is_none());
         assert!(app.loading_started_at.is_none());
+    }
+
+    #[test]
+    fn scroll_indicator_visibility_tracks_hidden_rows() {
+        assert_eq!(scroll_indicator_visibility(0, 3, 3), (false, false));
+        assert_eq!(scroll_indicator_visibility(0, 8, 3), (false, true));
+        assert_eq!(scroll_indicator_visibility(2, 8, 3), (true, true));
+        assert_eq!(scroll_indicator_visibility(5, 8, 3), (true, false));
+        assert_eq!(scroll_indicator_visibility(0, 8, 0), (false, false));
     }
 
     #[test]
