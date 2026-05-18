@@ -2029,7 +2029,9 @@ fn run_tui(
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        match handle_key(app, key, &submit_tx)? {
+                        let size = terminal.size()?;
+                        let screen_area = Rect::new(0, 0, size.width, size.height);
+                        match handle_key(app, key, &submit_tx, screen_area)? {
                             KeyAction::Continue => {}
                             KeyAction::Quit => break,
                             KeyAction::Refresh(reason) => {
@@ -2082,6 +2084,7 @@ fn handle_key(
     app: &mut App,
     key: KeyEvent,
     submit_tx: &Sender<SubmitRequest>,
+    screen_area: Rect,
 ) -> Result<KeyAction> {
     match key {
         KeyEvent {
@@ -2131,7 +2134,9 @@ fn handle_key(
         } if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) => {
             app.open_workspace_view();
         }
-        _ if app.composer_is_active() => return handle_composer_key(app, key, submit_tx),
+        _ if app.composer_is_active() => {
+            return handle_composer_key(app, key, submit_tx, screen_area);
+        }
         KeyEvent {
             code: KeyCode::Char('r'),
             modifiers: KeyModifiers::CONTROL,
@@ -2338,6 +2343,7 @@ fn handle_composer_key(
     app: &mut App,
     key: KeyEvent,
     submit_tx: &Sender<SubmitRequest>,
+    screen_area: Rect,
 ) -> Result<KeyAction> {
     match key {
         KeyEvent {
@@ -2506,14 +2512,16 @@ fn handle_composer_key(
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            move_to_line_start_or_previous_line(&mut app.composer);
+            app.selected_image = None;
+            move_to_visual_line_start_or_previous_line(app, composer_area(app, screen_area).width);
         }
         KeyEvent {
             code: KeyCode::Char('e'),
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            move_to_line_end_or_next_line(&mut app.composer);
+            app.selected_image = None;
+            move_to_visual_line_end_or_next_line(app, composer_area(app, screen_area).width);
         }
         _ => {
             app.selected_image = None;
@@ -3167,29 +3175,63 @@ fn move_cursor_to_col(textarea: &mut TextArea<'static>, current_col: usize, targ
     }
 }
 
-fn move_to_line_start_or_previous_line(textarea: &mut TextArea<'static>) {
-    let Some((_, row, col)) = composer_line_at_cursor(textarea) else {
+fn move_to_visual_line_start_or_previous_line(app: &mut App, width: u16) {
+    let Some((index, line)) = current_composer_visual_line(app, width) else {
         return;
     };
-    if col == 0 && row > 0 {
-        textarea.move_cursor(CursorMove::Up);
-        textarea.move_cursor(CursorMove::Head);
+    let (_, col) = app.composer.cursor();
+    let target = if col == line.start_col && index > 0 {
+        let previous = wrapped_composer_layout(app, width)
+            .into_iter()
+            .nth(index - 1)
+            .unwrap_or(line);
+        (previous.source_row, previous.start_col)
     } else {
-        textarea.move_cursor(CursorMove::Head);
-    }
+        (line.source_row, line.start_col)
+    };
+    move_composer_cursor_to(&mut app.composer, target);
 }
 
-fn move_to_line_end_or_next_line(textarea: &mut TextArea<'static>) {
-    let Some((line, row, col)) = composer_line_at_cursor(textarea) else {
+fn move_to_visual_line_end_or_next_line(app: &mut App, width: u16) {
+    let layout = wrapped_composer_layout(app, width);
+    let Some((index, line)) = current_composer_visual_line_from_layout(app, &layout) else {
         return;
     };
-    let line_len = line.chars().count();
-    if col == line_len && row + 1 < textarea.lines().len() {
-        textarea.move_cursor(CursorMove::Down);
-        textarea.move_cursor(CursorMove::End);
+    let (_, col) = app.composer.cursor();
+    let target = if col == line.end_col && index + 1 < layout.len() {
+        let next = &layout[index + 1];
+        (next.source_row, next.end_col)
     } else {
-        textarea.move_cursor(CursorMove::End);
+        (line.source_row, line.end_col)
+    };
+    move_composer_cursor_to(&mut app.composer, target);
+}
+
+fn current_composer_visual_line(app: &App, width: u16) -> Option<(usize, ComposerVisualLine)> {
+    let layout = wrapped_composer_layout(app, width);
+    current_composer_visual_line_from_layout(app, &layout)
+        .map(|(index, line)| (index, line.clone()))
+}
+
+fn current_composer_visual_line_from_layout<'a>(
+    app: &App,
+    layout: &'a [ComposerVisualLine],
+) -> Option<(usize, &'a ComposerVisualLine)> {
+    let (cursor_row, cursor_col) = app.composer.cursor();
+    let mut fallback = None;
+    for (index, line) in layout.iter().enumerate() {
+        if line.source_row != cursor_row {
+            continue;
+        }
+        fallback = Some((index, line));
+        if cursor_col >= line.start_col && cursor_col <= line.end_col {
+            return Some((index, line));
+        }
+        if cursor_col < line.start_col {
+            return Some((index, line));
+        }
     }
+    fallback
 }
 
 fn open_image_token_at_cursor(app: &mut App) -> bool {
@@ -5689,6 +5731,33 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_a_e_use_visual_wrapped_lines() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        move_to_visual_line_start_or_previous_line(&mut app, 10);
+        assert_eq!(app.composer.cursor(), (0, 6));
+
+        move_to_visual_line_start_or_previous_line(&mut app, 10);
+        assert_eq!(app.composer.cursor(), (0, 0));
+
+        move_to_visual_line_end_or_next_line(&mut app, 10);
+        assert_eq!(app.composer.cursor(), (0, 5));
+
+        move_to_visual_line_end_or_next_line(&mut app, 10);
+        assert_eq!(app.composer.cursor(), (0, 11));
+    }
+
+    #[test]
     fn composer_mouse_position_uses_word_wrapping() {
         let mut app = App::new(Args {
             socket: Some("/tmp/cmux-home-test.sock".to_string()),
@@ -5922,6 +5991,7 @@ mod tests {
             claude_plan_command: "claude --permission-mode plan".to_string(),
         });
         app.provider = AgentKind::Codex;
+        app.plan_mode = false;
 
         let (command, accepts_prompt) = app.render_agent_command(&[], "hello");
 
