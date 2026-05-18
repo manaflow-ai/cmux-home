@@ -1,14 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
@@ -20,19 +19,51 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ignore::WalkBuilder;
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tui_textarea::{CursorMove, TextArea};
+
+mod cmux_client;
+mod commands;
+mod config;
+mod events;
+mod model;
+mod skills;
+mod util;
+
+use cmux_client::CmuxClient;
+use commands::{
+    configure_workspace_hook_command, render_command_template, render_command_template_parts,
+    write_submit_payload, SubmitPayload,
+};
+use config::{load_config, load_persisted_state, state_path, PersistedDraft, PersistedState};
+use events::{
+    event_name, event_title, event_workspace_id, notification_is_unread,
+    preserve_optimistic_submission, workspace_from_created_event, EventFrame,
+};
+use model::{
+    display_group, AgentKind, AgentState, ConversationActor, ConversationSnapshot, WorkspaceStatus,
+};
+use skills::{load_skill_entries, SkillEntry};
+use util::{
+    contains_any, now_millis, one_line_preview, shell_quote, shell_words, time_ago, truncate,
+    user_home,
+};
 
 const COMPOSER_PLACEHOLDER: &str = "describe a task for a new workspace";
 const COMPOSER_PROMPT: &str = "❯ ";
 const COMPOSER_CONTINUATION_PROMPT: &str = "  ";
+const MAX_AUTOCOMPLETE_ROWS: usize = 8;
+const MAX_AUTOCOMPLETE_ITEMS: usize = 100;
+const MAX_FILE_REFERENCES: usize = 20_000;
 const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
     CommandSuggestion {
         command: "/history",
@@ -52,6 +83,128 @@ const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
 struct CommandSuggestion {
     command: &'static str,
     detail: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommandSuggestionMatch {
+    command: &'static str,
+    detail: &'static str,
+    positions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AutocompleteKind {
+    Command,
+    File,
+    Skill,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutocompleteItem {
+    kind: AutocompleteKind,
+    label: String,
+    label_match_positions: Vec<usize>,
+    insert_text: String,
+    detail: String,
+    detail_match_positions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FuzzyMatch {
+    score: u32,
+    positions: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerReferenceKind {
+    Command,
+    File,
+    Skill,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ComposerHighlightRange {
+    start: usize,
+    end: usize,
+    kind: ComposerReferenceKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FocusTarget {
+    MainContent,
+    Autocomplete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SelectionDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutocompleteMarker {
+    Slash,
+    Dollar,
+    At,
+}
+
+impl AutocompleteMarker {
+    fn as_char(self) -> char {
+        match self {
+            Self::Slash => '/',
+            Self::Dollar => '$',
+            Self::At => '@',
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AutocompleteQuery {
+    marker: AutocompleteMarker,
+    raw: String,
+    search: String,
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SelectionState {
+    selected: usize,
+    scroll: usize,
+}
+
+impl SelectionState {
+    fn clamp(&mut self, len: usize) {
+        if len == 0 {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(len.saturating_sub(1));
+        self.scroll = self.scroll.min(len.saturating_sub(1));
+    }
+
+    fn select_previous(&mut self, len: usize) {
+        self.clamp(len);
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn select_next(&mut self, len: usize) {
+        self.clamp(len);
+        self.selected = self.selected.saturating_add(1).min(len.saturating_sub(1));
+    }
+
+    fn ensure_visible(&mut self, viewport_height: usize, len: usize) {
+        self.clamp(len);
+        let height = viewport_height.max(1);
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll.saturating_add(height) {
+            self.scroll = self.selected.saturating_add(1).saturating_sub(height);
+        }
+        self.scroll = self.scroll.min(len.saturating_sub(height));
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -87,137 +240,12 @@ struct Args {
     claude_plan_command: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AgentKind {
-    Codex,
-    Claude,
-}
-
-impl AgentKind {
-    fn toggle(self) -> Self {
-        match self {
-            AgentKind::Codex => AgentKind::Claude,
-            AgentKind::Claude => AgentKind::Codex,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            AgentKind::Codex => "codex",
-            AgentKind::Claude => "claude",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label {
-            "codex" => Some(AgentKind::Codex),
-            "claude" => Some(AgentKind::Claude),
-            _ => None,
-        }
-    }
-
-    fn color(self) -> Color {
-        match self {
-            AgentKind::Codex => Color::Rgb(102, 217, 239),
-            AgentKind::Claude => Color::Rgb(215, 119, 87),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum AgentState {
-    Empty,
-    Idle,
-    Working,
-    NeedsAttention,
-    Unknown,
-}
-
-impl AgentState {
-    fn label(self) -> &'static str {
-        match self {
-            AgentState::Empty => "empty",
-            AgentState::Idle => "idle",
-            AgentState::Working => "working",
-            AgentState::NeedsAttention => "needs attention",
-            AgentState::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkspaceStatus {
-    id: String,
-    title: String,
-    latest_message: String,
-    selected: bool,
-    pinned: bool,
-    statuses: HashMap<String, String>,
-    unread_notifications: usize,
-    updated_at: Option<Instant>,
-}
-
-impl WorkspaceStatus {
-    fn agent_state(&self) -> AgentState {
-        if self.unread_notifications > 0 {
-            return AgentState::NeedsAttention;
-        }
-
-        let mut saw_status = false;
-        for (key, value) in &self.statuses {
-            let key = key.to_ascii_lowercase();
-            let value = value.to_ascii_lowercase();
-            let is_agent = key == "codex" || key == "claude" || key == "claude_code";
-            if !is_agent {
-                continue;
-            }
-            saw_status = true;
-            if contains_any(
-                &value,
-                &[
-                    "error", "failed", "failure", "blocked", "denied", "rejected",
-                ],
-            ) {
-                return AgentState::NeedsAttention;
-            }
-            if contains_any(&value, &["running", "working", "thinking", "busy"]) {
-                return AgentState::Working;
-            }
-            if contains_any(&value, &["idle", "done", "complete", "completed"]) {
-                return AgentState::Idle;
-            }
-        }
-
-        if saw_status {
-            AgentState::Unknown
-        } else {
-            AgentState::Empty
-        }
-    }
-
-    fn fingerprint(&self) -> String {
-        let mut statuses = self
-            .statuses
-            .iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>();
-        statuses.sort();
-        format!(
-            "{}|{}|{}|{}|{}",
-            self.title,
-            self.latest_message,
-            self.agent_state().label(),
-            self.unread_notifications,
-            statuses.join("|")
-        )
-    }
-}
-
 #[derive(Debug)]
 enum UiEvent {
     CmuxEvent(EventFrame),
     Snapshot(Result<RefreshSnapshot, String>),
     WorkspaceSnapshot(Result<WorkspaceRefresh, String>),
+    SubmitResult(std::result::Result<SubmitSuccess, SubmitFailure>),
     StreamError(String),
 }
 
@@ -245,6 +273,38 @@ struct WorkspaceRefresh {
     loaded_at: Instant,
 }
 
+#[derive(Clone, Debug)]
+struct SubmitRequest {
+    pending_id: String,
+    socket_path: String,
+    workspace_cwd: String,
+    terminal_path: Option<String>,
+    provider: AgentKind,
+    plan_mode: bool,
+    prompt: String,
+    images: Vec<String>,
+    title: String,
+    latest_message: String,
+    command: String,
+    command_accepts_prompt: bool,
+    submit_template: Option<String>,
+    rename_template: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubmitSuccess {
+    pending_id: String,
+    workspace_id: String,
+    title: String,
+    latest_message: String,
+}
+
+#[derive(Debug)]
+struct SubmitFailure {
+    pending_id: String,
+    error: String,
+}
+
 #[derive(Debug)]
 enum KeyAction {
     Continue,
@@ -255,6 +315,11 @@ enum KeyAction {
 struct App {
     socket_path: String,
     workspace_cwd: String,
+    codex_bin: String,
+    claude_bin: String,
+    terminal_path: Option<String>,
+    codex_env_args: String,
+    claude_env_args: String,
     codex_template: String,
     codex_plan_template: String,
     codex_submit_template: Option<String>,
@@ -262,15 +327,20 @@ struct App {
     claude_plan_template: String,
     claude_submit_template: Option<String>,
     rename_template: Option<String>,
+    skills: Vec<SkillEntry>,
+    file_references: Vec<FileReference>,
     provider: AgentKind,
     plan_mode: bool,
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     selected: usize,
     list_scroll: usize,
+    focus_target: FocusTarget,
+    autocomplete: SelectionState,
     view_mode: ViewMode,
     image_paths: Vec<String>,
     selected_image: Option<ImageSelection>,
+    composer_drag_anchor: Option<(usize, usize)>,
     stashes: Vec<PersistedDraft>,
     history: Vec<PersistedDraft>,
     state_path: PathBuf,
@@ -280,6 +350,8 @@ struct App {
     status_line: String,
     last_quit_tap: Option<(char, Instant)>,
     last_refresh: Option<Instant>,
+    loading_reason: Option<String>,
+    loading_started_at: Option<Instant>,
     started_at: Instant,
 }
 
@@ -304,66 +376,9 @@ struct ImageSelection {
     image_index: usize,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct PersistedState {
-    draft: Option<PersistedDraft>,
-    #[serde(default)]
-    stashes: Vec<PersistedDraft>,
-    #[serde(default)]
-    history: Vec<PersistedDraft>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    plan_mode: Option<bool>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AppConfig {
-    #[serde(default)]
-    agents: AgentConfig,
-    #[serde(default)]
-    rename: RenameConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AgentConfig {
-    #[serde(default)]
-    codex: AgentCommandConfig,
-    #[serde(default)]
-    claude: AgentCommandConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct AgentCommandConfig {
-    command: Option<String>,
-    plan_command: Option<String>,
-    submit_command: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RenameConfig {
-    command: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct PersistedDraft {
-    lines: Vec<String>,
-    image_paths: Vec<String>,
-    provider: String,
-    plan_mode: bool,
-    saved_at_ms: u64,
-}
-
-#[derive(Serialize)]
-struct SubmitPayload<'a> {
-    workspace_id: &'a str,
-    prompt: &'a str,
-    title: &'a str,
-    agent: &'a str,
-    mode: &'a str,
-    workspace_cwd: &'a str,
-    socket: &'a str,
-    images: &'a [String],
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileReference {
+    path: String,
 }
 
 impl App {
@@ -383,9 +398,21 @@ impl App {
         let state_path = state_path();
         let persisted = load_persisted_state(&state_path);
         let config = load_config(args.config.as_ref());
+        let skills = load_skill_entries(&workspace_cwd);
+        let file_references = load_file_references(&workspace_cwd);
+        let codex_bin = resolve_agent_executable("codex", "CMUX_HOME_CODEX_BIN");
+        let claude_bin = resolve_agent_executable("claude", "CMUX_HOME_CLAUDE_BIN");
+        let terminal_path = std::env::var("PATH").ok();
+        let codex_env_args = env_args(&["CODEX_HOME"]);
+        let claude_env_args = env_args(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME"]);
         let mut app = Self {
             socket_path,
             workspace_cwd,
+            codex_bin,
+            claude_bin,
+            terminal_path,
+            codex_env_args,
+            claude_env_args,
             codex_template: config.agents.codex.command.unwrap_or(args.codex_command),
             codex_plan_template: config
                 .agents
@@ -401,15 +428,20 @@ impl App {
                 .unwrap_or(args.claude_plan_command),
             claude_submit_template: config.agents.claude.submit_command,
             rename_template: config.rename.command,
+            skills,
+            file_references,
             provider: AgentKind::Codex,
             plan_mode: false,
             show_shortcuts: false,
             workspaces: Vec::new(),
             selected: 0,
             list_scroll: 0,
+            focus_target: FocusTarget::MainContent,
+            autocomplete: SelectionState::default(),
             view_mode: ViewMode::Workspaces,
             image_paths: Vec::new(),
             selected_image: None,
+            composer_drag_anchor: None,
             stashes: persisted.stashes,
             history: persisted.history,
             state_path,
@@ -419,6 +451,8 @@ impl App {
             status_line: "starting".to_string(),
             last_quit_tap: None,
             last_refresh: None,
+            loading_reason: Some("startup".to_string()),
+            loading_started_at: Some(Instant::now()),
             started_at: Instant::now(),
         };
         if let Some(provider) = persisted
@@ -476,30 +510,42 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        let pending_workspaces = self
+            .workspaces
+            .iter()
+            .filter(|workspace| is_pending_workspace_id(&workspace.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let previous = self
             .workspaces
             .iter()
-            .map(|workspace| {
-                (
-                    workspace.id.clone(),
-                    (workspace.fingerprint(), workspace.updated_at),
-                )
-            })
+            .map(|workspace| (workspace.id.clone(), workspace.clone()))
             .collect::<HashMap<_, _>>();
         self.workspaces = snapshot
             .workspaces
             .into_iter()
             .map(|mut workspace| {
-                workspace.updated_at = previous
-                    .get(&workspace.id)
-                    .and_then(|(fingerprint, updated_at)| {
-                        (fingerprint == &workspace.fingerprint()).then_some(*updated_at)
-                    })
-                    .flatten()
-                    .or(Some(snapshot.loaded_at));
+                if let Some(existing) = previous.get(&workspace.id) {
+                    preserve_optimistic_submission(existing, &mut workspace);
+                    workspace.updated_at = (existing.fingerprint() == workspace.fingerprint())
+                        .then_some(existing.updated_at)
+                        .flatten()
+                        .or(Some(snapshot.loaded_at));
+                } else {
+                    workspace.updated_at = Some(snapshot.loaded_at);
+                }
                 workspace
             })
             .collect();
+        for pending in pending_workspaces.into_iter().rev() {
+            if !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == pending.id)
+            {
+                self.workspaces.insert(0, pending);
+            }
+        }
         if self.view_mode == ViewMode::Workspaces {
             let visible = visible_rows(&self.workspaces, &self.collapsed_groups);
             self.selected = previously_selected_id
@@ -533,6 +579,7 @@ impl App {
         }
         self.clamp_list_scroll(1);
         self.last_refresh = Some(snapshot.loaded_at);
+        self.finish_loading();
         self.status_line = format!("{} workspaces ({})", self.workspaces.len(), snapshot.reason);
     }
 
@@ -543,13 +590,15 @@ impl App {
                     .workspaces
                     .iter()
                     .find(|workspace| workspace.id == refreshed.id);
-                refreshed.updated_at = previous
-                    .and_then(|workspace| {
-                        (workspace.fingerprint() == refreshed.fingerprint())
-                            .then_some(workspace.updated_at)
-                    })
-                    .flatten()
-                    .or(Some(snapshot.loaded_at));
+                if let Some(existing) = previous {
+                    preserve_optimistic_submission(existing, &mut refreshed);
+                    refreshed.updated_at = (existing.fingerprint() == refreshed.fingerprint())
+                        .then_some(existing.updated_at)
+                        .flatten()
+                        .or(Some(snapshot.loaded_at));
+                } else {
+                    refreshed.updated_at = Some(snapshot.loaded_at);
+                }
                 if let Some(existing) = self
                     .workspaces
                     .iter_mut()
@@ -557,7 +606,7 @@ impl App {
                 {
                     *existing = refreshed;
                 } else {
-                    self.workspaces.push(refreshed);
+                    self.workspaces.insert(0, refreshed);
                 }
             }
             None => {
@@ -574,7 +623,18 @@ impl App {
             self.clamp_list_scroll(1);
         }
         self.last_refresh = Some(snapshot.loaded_at);
+        self.finish_loading();
         self.status_line = snapshot.reason;
+    }
+
+    fn begin_loading(&mut self, reason: impl Into<String>) {
+        self.loading_reason = Some(reason.into());
+        self.loading_started_at = Some(Instant::now());
+    }
+
+    fn finish_loading(&mut self) {
+        self.loading_reason = None;
+        self.loading_started_at = None;
     }
 
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
@@ -590,22 +650,8 @@ impl App {
                 {
                     return None;
                 }
-                self.workspaces.push(WorkspaceStatus {
-                    id: workspace_id.to_string(),
-                    title: event_title(frame)
-                        .unwrap_or_else(|| workspace_id.chars().take(8).collect()),
-                    latest_message: event_description(frame)
-                        .unwrap_or_else(|| "standing by for task".to_string()),
-                    selected: frame
-                        .payload
-                        .get("selected")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    pinned: false,
-                    statuses: HashMap::new(),
-                    unread_notifications: 0,
-                    updated_at: Some(Instant::now()),
-                });
+                self.workspaces
+                    .insert(0, workspace_from_created_event(frame, workspace_id));
                 Some(RefreshRequest::Workspace {
                     workspace_id: workspace_id.to_string(),
                     reason: "workspace created".to_string(),
@@ -839,11 +885,10 @@ impl App {
         true
     }
 
-    fn submit_new_workspace(&mut self) -> Result<()> {
+    fn submit_new_workspace(&mut self, submit_tx: &Sender<SubmitRequest>) -> Result<()> {
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let images = self.image_paths.clone();
         let start_prompt = self.agent_start_prompt(&prompt, &images);
-        let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
         let latest_message = if prompt.is_empty() {
             "standing by for task".to_string()
         } else {
@@ -854,36 +899,40 @@ impl App {
         } else {
             format!("{}: {}", self.agent_label(), one_line_preview(&prompt, 42))
         };
-        let mut client = CmuxClient::new(self.socket_path.clone());
-        let created = client.v2(
-            "workspace.create",
-            json!({
-                "title": title,
-                "description": prompt,
-                "initial_command": command,
-                "cwd": self.workspace_cwd,
-                "focus": true,
-            }),
-        )?;
-        let workspace_id = string_field(&created, "workspace_id")
-            .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
-        self.upsert_optimistic_workspace(workspace_id.clone(), title.clone(), latest_message);
-        self.select_workspace_by_id(&workspace_id);
-        if !command_accepts_prompt {
-            self.spawn_submit_hook(&workspace_id, &prompt, &title, &images);
-        }
-        self.spawn_rename_hook(&workspace_id, &prompt, &title);
-        if !prompt.is_empty() || !images.is_empty() {
-            let _ = client.v2(
-                "workspace.prompt_submit",
-                json!({ "workspace_id": workspace_id, "message": prompt }),
-            );
-        }
+        let (command, command_accepts_prompt) = self.render_agent_command(&images, &start_prompt);
         self.record_prompt_history(&prompt, &images);
+        self.persist_state();
+        let pending_id = format!("pending:{}:{}", now_millis(), self.history.len());
+        let request = SubmitRequest {
+            pending_id: pending_id.clone(),
+            socket_path: self.socket_path.clone(),
+            workspace_cwd: self.workspace_cwd.clone(),
+            terminal_path: self.terminal_path.clone(),
+            provider: self.provider,
+            plan_mode: self.plan_mode,
+            prompt,
+            images,
+            title: title.clone(),
+            latest_message: latest_message.clone(),
+            command,
+            command_accepts_prompt,
+            submit_template: self.submit_template().map(str::to_string),
+            rename_template: self.rename_template.clone(),
+        };
+        self.upsert_optimistic_workspace(pending_id.clone(), title, latest_message);
+        self.select_workspace_by_id(&pending_id);
         self.composer = new_composer();
         self.image_paths.clear();
+        self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::NewWorkspace;
-        self.status_line = format!("started {} workspace", self.agent_label());
+        self.status_line = format!("starting {} workspace", self.agent_label());
+        if let Err(err) = submit_tx.send(request) {
+            let request = err.0;
+            self.remove_pending_workspace(&request.pending_id);
+            self.restore_draft(draft_from_submit_request(&request));
+            self.status_line = "start failed before queueing".to_string();
+        }
         Ok(())
     }
 
@@ -893,16 +942,7 @@ impl App {
         title: String,
         latest_message: String,
     ) {
-        let workspace = WorkspaceStatus {
-            id: workspace_id.clone(),
-            title,
-            latest_message,
-            selected: false,
-            pinned: false,
-            statuses: HashMap::new(),
-            unread_notifications: 0,
-            updated_at: Some(Instant::now()),
-        };
+        let workspace = optimistic_workspace_status(&workspace_id, title, latest_message);
         if let Some(existing) = self
             .workspaces
             .iter_mut()
@@ -910,7 +950,57 @@ impl App {
         {
             *existing = workspace;
         } else {
-            self.workspaces.push(workspace);
+            self.workspaces.insert(0, workspace);
+        }
+    }
+
+    fn apply_submit_success(&mut self, success: SubmitSuccess) {
+        let workspace = optimistic_workspace_status(
+            &success.workspace_id,
+            success.title,
+            success.latest_message,
+        );
+        if let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == success.pending_id)
+        {
+            self.workspaces[index] = workspace;
+            let mut row_index = 0usize;
+            self.workspaces.retain(|workspace| {
+                let keep = workspace.id != success.workspace_id || row_index == index;
+                row_index += 1;
+                keep
+            });
+        } else {
+            self.upsert_optimistic_workspace(
+                success.workspace_id.clone(),
+                workspace.title,
+                workspace.latest_message,
+            );
+        }
+        self.select_workspace_by_id(&success.workspace_id);
+        self.status_line = "started workspace".to_string();
+    }
+
+    fn apply_submit_failure(&mut self, failure: SubmitFailure) {
+        self.remove_pending_workspace(&failure.pending_id);
+        self.status_line = format!(
+            "start failed, saved to history: {}",
+            truncate(&failure.error, 80)
+        );
+    }
+
+    fn remove_pending_workspace(&mut self, pending_id: &str) {
+        self.workspaces
+            .retain(|workspace| workspace.id != pending_id);
+        if self.view_mode == ViewMode::Workspaces {
+            self.selected = self.selected.min(
+                visible_rows(&self.workspaces, &self.collapsed_groups)
+                    .len()
+                    .saturating_sub(1),
+            );
+            self.clamp_list_scroll(1);
         }
     }
 
@@ -967,6 +1057,7 @@ impl App {
         };
         self.composer = composer_from_lines(vec![workspace.title]);
         self.composer.select_all();
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::RenameWorkspace(workspace.id);
         self.status_line = "renaming workspace".to_string();
         true
@@ -994,7 +1085,9 @@ impl App {
         self.composer = new_composer();
         self.image_paths.clear();
         self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.composer_mode = ComposerMode::NewWorkspace;
+        self.sync_focus_after_composer_change();
     }
 
     fn stash_current_draft(&mut self) {
@@ -1037,13 +1130,15 @@ impl App {
         self.view_mode = ViewMode::Stashes;
         self.selected = self.selected.min(self.stashes.len().saturating_sub(1));
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = format!("{} stashes", self.stashes.len());
     }
 
     fn open_history_view(&mut self) {
         self.view_mode = ViewMode::History;
-        self.selected = self.selected.min(self.history.len().saturating_sub(1));
+        self.selected = 0;
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = format!("{} prompts", self.history.len());
     }
 
@@ -1051,6 +1146,7 @@ impl App {
         self.view_mode = ViewMode::Workspaces;
         self.selected = 0;
         self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
         self.status_line = "main".to_string();
     }
 
@@ -1058,9 +1154,11 @@ impl App {
         self.composer = composer_from_lines(non_empty_lines(draft.lines));
         self.image_paths = draft.image_paths;
         self.selected_image = None;
+        self.composer_drag_anchor = None;
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
+        self.sync_focus_after_composer_change();
     }
 
     fn record_prompt_history(&mut self, prompt: &str, images: &[String]) {
@@ -1074,13 +1172,7 @@ impl App {
         };
         self.history.insert(
             0,
-            PersistedDraft {
-                lines,
-                image_paths: images.to_vec(),
-                provider: self.provider.label().to_string(),
-                plan_mode: self.plan_mode,
-                saved_at_ms: now_millis(),
-            },
+            draft_from_parts(lines, images.to_vec(), self.provider, self.plan_mode),
         );
     }
 
@@ -1088,13 +1180,12 @@ impl App {
         if !self.composer_has_input() && self.image_paths.is_empty() {
             return None;
         }
-        Some(PersistedDraft {
-            lines: self.composer.lines().to_vec(),
-            image_paths: self.image_paths.clone(),
-            provider: self.provider.label().to_string(),
-            plan_mode: self.plan_mode,
-            saved_at_ms: now_millis(),
-        })
+        Some(draft_from_parts(
+            self.composer.lines().to_vec(),
+            self.image_paths.clone(),
+            self.provider,
+            self.plan_mode,
+        ))
     }
 
     fn persist_state(&self) {
@@ -1176,6 +1267,241 @@ impl App {
         self.composer_has_input() || matches!(self.composer_mode, ComposerMode::RenameWorkspace(_))
     }
 
+    fn autocomplete_query(&self) -> Option<AutocompleteQuery> {
+        if self.composer_mode != ComposerMode::NewWorkspace {
+            return None;
+        }
+        autocomplete_query_at_cursor(&self.composer)
+    }
+
+    fn autocomplete_items(&self) -> Vec<AutocompleteItem> {
+        let Some(query) = self.autocomplete_query() else {
+            return Vec::new();
+        };
+        let mut items = Vec::new();
+        match query.marker {
+            AutocompleteMarker::Slash => {
+                items.extend(command_suggestions_for_query(&query.raw).into_iter().map(
+                    |suggestion| {
+                        let insert_text = if suggestion.command == "/stash save" {
+                            "/stash save ".to_string()
+                        } else {
+                            suggestion.command.to_string()
+                        };
+                        AutocompleteItem {
+                            kind: AutocompleteKind::Command,
+                            label: suggestion.command.to_string(),
+                            label_match_positions: suggestion.positions,
+                            insert_text,
+                            detail: suggestion.detail.to_string(),
+                            detail_match_positions: Vec::new(),
+                        }
+                    },
+                ));
+                items.extend(self.skill_autocomplete_items(&query));
+            }
+            AutocompleteMarker::Dollar => items.extend(self.skill_autocomplete_items(&query)),
+            AutocompleteMarker::At => items.extend(self.file_autocomplete_items(&query)),
+        }
+        items.truncate(MAX_AUTOCOMPLETE_ITEMS);
+        items
+    }
+
+    fn skill_autocomplete_items(&self, query: &AutocompleteQuery) -> Vec<AutocompleteItem> {
+        let search = query.search.trim();
+        if search.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let pattern = fuzzy_pattern(search);
+        let mut matcher = fuzzy_matcher(false);
+        let mut buf = Vec::new();
+        let mut positions = Vec::new();
+        let mut matches = self
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let candidate = if skill.description.is_empty() {
+                    skill.name.clone()
+                } else {
+                    format!("{} {}", skill.name, skill.description)
+                };
+                let full_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &candidate,
+                    &mut buf,
+                    &mut positions,
+                )?;
+                let title_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &skill.name,
+                    &mut buf,
+                    &mut positions,
+                );
+                let name = skill.name.to_ascii_lowercase();
+                let search = search.to_ascii_lowercase();
+                let source_match = skill
+                    .sources
+                    .iter()
+                    .any(|source| source.contains(self.provider.label()));
+                let prefix_match = search.is_empty() || name.starts_with(&search);
+                let title_score = title_match.as_ref().map(|item| item.score).unwrap_or(0);
+                let score = full_match.score + title_score.saturating_mul(3);
+                Some((score, source_match, prefix_match, title_match, skill))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(
+            |(score_a, source_a, prefix_a, _, skill_a),
+             (score_b, source_b, prefix_b, _, skill_b)| {
+                score_b
+                    .cmp(score_a)
+                    .then_with(|| source_b.cmp(source_a))
+                    .then_with(|| prefix_b.cmp(prefix_a))
+                    .then_with(|| skill_a.priority.cmp(&skill_b.priority))
+                    .then_with(|| skill_a.name.cmp(&skill_b.name))
+            },
+        );
+        let marker = query.marker.as_char();
+        matches
+            .into_iter()
+            .map(|(_, _, _, title_match, skill)| {
+                let source = skill.sources.join(", ");
+                let detail = if skill.description.is_empty() {
+                    format!("skill · {source}")
+                } else {
+                    format!("skill · {source} · {}", skill.description)
+                };
+                AutocompleteItem {
+                    kind: AutocompleteKind::Skill,
+                    label: format!("{marker}{}", skill.name),
+                    label_match_positions: title_match
+                        .map(|item| shift_positions(&item.positions, 1))
+                        .unwrap_or_default(),
+                    insert_text: format!("{marker}{} ", skill.name),
+                    detail,
+                    detail_match_positions: Vec::new(),
+                }
+            })
+            .collect()
+    }
+
+    fn file_autocomplete_items(&self, query: &AutocompleteQuery) -> Vec<AutocompleteItem> {
+        let search = query.search.trim();
+        if search.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let pattern = fuzzy_pattern(search);
+        let mut matcher = fuzzy_matcher(true);
+        let mut buf = Vec::new();
+        let mut positions = Vec::new();
+        let mut matches = self
+            .file_references
+            .iter()
+            .filter_map(|file| {
+                let path_match = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &file.path,
+                    &mut buf,
+                    &mut positions,
+                )?;
+                let title = file_reference_title(&file.path);
+                let title_match =
+                    fuzzy_match_candidate(&pattern, &mut matcher, title, &mut buf, &mut positions);
+                let title_lower = title.to_ascii_lowercase();
+                let search_lower = search.to_ascii_lowercase();
+                let title_rank =
+                    file_title_rank(&search_lower, &title_lower, title_match.is_some());
+                let path_depth = file_path_depth(&file.path);
+                let mut score = path_match.score;
+                if let Some(title_match) = title_match.as_ref() {
+                    score = score.saturating_add(title_match.score.saturating_mul(5));
+                    if title_rank == 4 {
+                        score = score.saturating_add(20_000);
+                    } else if title_rank == 3 {
+                        score = score.saturating_add(10_000);
+                    } else if title_rank == 2 {
+                        score = score.saturating_add(5_000);
+                    }
+                }
+                Some((title_rank, path_depth, score, path_match, title_match, file))
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(
+            |(title_rank_a, depth_a, score_a, _, _, file_a),
+             (title_rank_b, depth_b, score_b, _, _, file_b)| {
+                title_rank_b
+                    .cmp(title_rank_a)
+                    .then_with(|| depth_a.cmp(depth_b))
+                    .then_with(|| score_b.cmp(score_a))
+                    .then_with(|| file_a.path.len().cmp(&file_b.path.len()))
+                    .then_with(|| file_a.path.cmp(&file_b.path))
+            },
+        );
+        matches
+            .into_iter()
+            .take(MAX_AUTOCOMPLETE_ITEMS)
+            .map(|(_, _, _, path_match, title_match, file)| {
+                let title = file_reference_title(&file.path);
+                AutocompleteItem {
+                    kind: AutocompleteKind::File,
+                    label: format!("@{title}"),
+                    label_match_positions: title_match
+                        .map(|item| shift_positions(&item.positions, 1))
+                        .unwrap_or_default(),
+                    insert_text: format!("@{} ", file.path),
+                    detail: file.path.clone(),
+                    detail_match_positions: path_match.positions,
+                }
+            })
+            .collect()
+    }
+
+    fn autocomplete_is_active(&self) -> bool {
+        self.autocomplete_query().is_some()
+    }
+
+    fn sync_focus_after_composer_change(&mut self) {
+        if self.autocomplete_is_active() {
+            self.focus_target = FocusTarget::Autocomplete;
+            self.clamp_autocomplete_selection();
+        } else if self.focus_target == FocusTarget::Autocomplete {
+            self.focus_target = FocusTarget::MainContent;
+            self.autocomplete = SelectionState::default();
+        }
+    }
+
+    fn clamp_autocomplete_selection(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.clamp(len);
+    }
+
+    fn select_previous_autocomplete(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.select_previous(len);
+    }
+
+    fn select_next_autocomplete(&mut self) {
+        let len = self.autocomplete_items().len();
+        self.autocomplete.select_next(len);
+    }
+
+    fn move_focused_selection(&mut self, direction: SelectionDirection) -> bool {
+        if self.focus_target == FocusTarget::Autocomplete && self.autocomplete_is_active() {
+            match direction {
+                SelectionDirection::Previous => self.select_previous_autocomplete(),
+                SelectionDirection::Next => self.select_next_autocomplete(),
+            }
+            return true;
+        }
+        match direction {
+            SelectionDirection::Previous => self.select_previous_main(),
+            SelectionDirection::Next => self.select_next_main(),
+        }
+        true
+    }
+
     fn composer_height(&self, screen_height: u16, screen_width: u16) -> u16 {
         if self.composer_is_active() {
             let max_height = ((u32::from(screen_height) * 3) / 4).max(1) as u16;
@@ -1198,6 +1524,14 @@ impl App {
     }
 
     fn select_previous(&mut self) {
+        self.move_focused_selection(SelectionDirection::Previous);
+    }
+
+    fn select_next(&mut self) {
+        self.move_focused_selection(SelectionDirection::Next);
+    }
+
+    fn select_previous_main(&mut self) {
         if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self.selected.saturating_sub(1);
             return;
@@ -1206,7 +1540,7 @@ impl App {
         self.selected = selectable_row_before(&rows, self.selected).unwrap_or(self.selected);
     }
 
-    fn select_next(&mut self) {
+    fn select_next_main(&mut self) {
         if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
             self.selected = self
                 .selected
@@ -1283,22 +1617,6 @@ impl App {
         }
     }
 
-    fn provider_toggle_label(&self) -> &'static str {
-        self.provider.toggle().label()
-    }
-
-    fn provider_toggle_kind(&self) -> AgentKind {
-        self.provider.toggle()
-    }
-
-    fn plan_toggle_label(&self) -> &'static str {
-        if self.plan_mode {
-            "build"
-        } else {
-            "plan"
-        }
-    }
-
     fn toggle_provider(&mut self) {
         self.provider = self.provider.toggle();
         self.status_line = format!("agent {}", self.agent_label());
@@ -1339,10 +1657,23 @@ impl App {
             .join(" ");
         let command = render_command_template_parts(
             template,
-            &[("workspace_cwd", &self.workspace_cwd), ("prompt", prompt)],
-            &[("image_args", &image_args)],
+            &[
+                ("workspace_cwd", &self.workspace_cwd),
+                ("prompt", prompt),
+                ("codex_bin", &self.codex_bin),
+                ("claude_bin", &self.claude_bin),
+                (
+                    "terminal_path",
+                    self.terminal_path.as_deref().unwrap_or_default(),
+                ),
+            ],
+            &[
+                ("image_args", &image_args),
+                ("codex_env", &self.codex_env_args),
+                ("claude_env", &self.claude_env_args),
+            ],
         );
-        (command, accepts_prompt)
+        (wrap_agent_terminal_command(&command), accepts_prompt)
     }
 
     fn submit_template(&self) -> Option<&str> {
@@ -1351,112 +1682,215 @@ impl App {
             AgentKind::Claude => self.claude_submit_template.as_deref(),
         }
     }
-
-    fn spawn_submit_hook(&self, workspace_id: &str, prompt: &str, title: &str, images: &[String]) {
-        let Some(template) = self.submit_template() else {
-            return;
-        };
-        if template.trim().is_empty() {
-            return;
-        }
-        let mode = if self.plan_mode { "plan" } else { "build" };
-        let Ok(payload_path) = write_submit_payload(SubmitPayload {
-            workspace_id,
-            prompt,
-            title,
-            agent: self.provider.label(),
-            mode,
-            workspace_cwd: &self.workspace_cwd,
-            socket: &self.socket_path,
-            images,
-        }) else {
-            return;
-        };
-        let payload_path_string = payload_path.display().to_string();
-        let rendered = render_command_template(
-            template,
-            &[
-                ("payload", &payload_path_string),
-                ("workspace_id", workspace_id),
-                ("socket", &self.socket_path),
-            ],
-        );
-        let mut command = Command::new("sh");
-        configure_workspace_hook_command(
-            &mut command,
-            &rendered,
-            &self.workspace_cwd,
-            &self.socket_path,
-            workspace_id,
-        );
-        let _ = command.spawn();
-    }
-
-    fn spawn_rename_hook(&self, workspace_id: &str, prompt: &str, title: &str) {
-        let Some(template) = self.rename_template.as_deref() else {
-            return;
-        };
-        if template.trim().is_empty() {
-            return;
-        }
-        let mode = if self.plan_mode { "plan" } else { "build" };
-        let rendered = render_command_template(
-            template,
-            &[
-                ("workspace_id", workspace_id),
-                ("prompt", prompt),
-                ("title", title),
-                ("agent", self.provider.label()),
-                ("mode", mode),
-                ("workspace_cwd", &self.workspace_cwd),
-                ("socket", &self.socket_path),
-            ],
-        );
-        let mut command = Command::new("sh");
-        configure_workspace_hook_command(
-            &mut command,
-            &rendered,
-            &self.workspace_cwd,
-            &self.socket_path,
-            workspace_id,
-        );
-        let _ = command.spawn();
-    }
-}
-
-fn configure_workspace_hook_command(
-    command: &mut Command,
-    rendered: &str,
-    workspace_cwd: &str,
-    socket_path: &str,
-    workspace_id: &str,
-) {
-    command
-        .arg("-lc")
-        .arg(rendered)
-        .current_dir(workspace_cwd)
-        .env("CMUX_SOCKET_PATH", socket_path)
-        .env("CMUX_WORKSPACE_ID", workspace_id)
-        .env_remove("CMUX_SURFACE_ID")
-        .env_remove("CMUX_TAB_ID")
-        .env_remove("CMUX_PANEL_ID")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
 }
 
 fn new_composer() -> TextArea<'static> {
-    let mut composer = TextArea::default();
+    configure_composer(TextArea::default())
+}
+
+fn composer_from_lines(lines: Vec<String>) -> TextArea<'static> {
+    configure_composer(TextArea::new(lines))
+}
+
+fn configure_composer(mut composer: TextArea<'static>) -> TextArea<'static> {
     composer.set_placeholder_text("");
     composer.set_cursor_line_style(Style::default());
     composer
 }
 
-fn composer_from_lines(lines: Vec<String>) -> TextArea<'static> {
-    let mut composer = TextArea::new(lines);
-    composer.set_placeholder_text("");
-    composer.set_cursor_line_style(Style::default());
-    composer
+fn autocomplete_query_at_cursor(textarea: &TextArea<'static>) -> Option<AutocompleteQuery> {
+    let (line, row, col) = composer_line_at_cursor(textarea)?;
+    let chars = line.chars().collect::<Vec<_>>();
+    let cursor = col.min(chars.len());
+    if cursor == 0 {
+        return None;
+    }
+
+    let mut start_col = cursor;
+    while start_col > 0 && !chars[start_col - 1].is_whitespace() {
+        start_col -= 1;
+    }
+    let raw = chars[start_col..cursor].iter().collect::<String>();
+    let marker = match raw.chars().next()? {
+        '/' => AutocompleteMarker::Slash,
+        '$' => AutocompleteMarker::Dollar,
+        '@' => AutocompleteMarker::At,
+        _ => return None,
+    };
+
+    Some(AutocompleteQuery {
+        marker,
+        search: raw.chars().skip(1).collect::<String>(),
+        raw,
+        row,
+        start_col,
+        end_col: cursor,
+    })
+}
+
+fn load_file_references(workspace_cwd: &str) -> Vec<FileReference> {
+    let root = PathBuf::from(workspace_cwd);
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .standard_filters(true)
+        .hidden(true)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                ".git" | ".next" | ".turbo" | ".venv" | "DerivedData" | "node_modules" | "target"
+            )
+        });
+
+    let mut files = Vec::new();
+    for entry in builder.build().flatten() {
+        if files.len() >= MAX_FILE_REFERENCES {
+            break;
+        }
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
+            continue;
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(&root).unwrap_or(path);
+        let display = relative.to_string_lossy().replace('\\', "/");
+        if display.is_empty() {
+            continue;
+        }
+        files.push(FileReference { path: display });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+fn fuzzy_pattern(query: &str) -> Pattern {
+    Pattern::new(
+        query.trim(),
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    )
+}
+
+fn fuzzy_matcher(path_mode: bool) -> FuzzyMatcher {
+    let mut config = if path_mode {
+        FuzzyConfig::DEFAULT.match_paths()
+    } else {
+        FuzzyConfig::DEFAULT
+    };
+    if !path_mode {
+        config.prefer_prefix = true;
+    }
+    FuzzyMatcher::new(config)
+}
+
+fn fuzzy_match_candidate(
+    pattern: &Pattern,
+    matcher: &mut FuzzyMatcher,
+    candidate: &str,
+    buf: &mut Vec<char>,
+    positions: &mut Vec<u32>,
+) -> Option<FuzzyMatch> {
+    positions.clear();
+    let score = pattern.indices(Utf32Str::new(candidate, buf), matcher, positions)?;
+    positions.sort_unstable();
+    positions.dedup();
+    Some(FuzzyMatch {
+        score,
+        positions: positions
+            .iter()
+            .map(|position| *position as usize)
+            .collect(),
+    })
+}
+
+fn shift_positions(positions: &[usize], offset: usize) -> Vec<usize> {
+    positions
+        .iter()
+        .map(|position| position.saturating_add(offset))
+        .collect()
+}
+
+fn file_reference_title(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn file_title_rank(search_lower: &str, title_lower: &str, title_matches: bool) -> u8 {
+    if search_lower.is_empty() {
+        return 0;
+    }
+    if title_lower == search_lower {
+        4
+    } else if title_lower.starts_with(search_lower) {
+        3
+    } else if title_lower.contains(search_lower) {
+        2
+    } else if title_matches {
+        1
+    } else {
+        0
+    }
+}
+
+fn file_path_depth(path: &str) -> usize {
+    path.chars().filter(|ch| *ch == '/').count()
+}
+
+fn resolve_agent_executable(name: &str, override_env: &str) -> String {
+    if let Some(value) = std::env::var_os(override_env) {
+        let path = PathBuf::from(value);
+        if is_executable_file(&path) {
+            return path.display().to_string();
+        }
+    }
+    if name == "claude" {
+        if let Some(path) = resolve_executable_with_filter(name, |path| {
+            !path
+                .to_string_lossy()
+                .contains("/Applications/cmux.app/Contents/Resources/bin/")
+        }) {
+            return path;
+        }
+    }
+    resolve_executable_with_filter(name, |_| true).unwrap_or_else(|| name.to_string())
+}
+
+fn resolve_executable_with_filter<F>(name: &str, filter: F) -> Option<String>
+where
+    F: Fn(&Path) -> bool,
+{
+    if name.contains('/') {
+        let path = Path::new(name);
+        return (is_executable_file(path) && filter(path)).then(|| name.to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) && filter(&candidate) {
+            return Some(candidate.display().to_string());
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+fn env_args(names: &[&str]) -> String {
+    names
+        .iter()
+        .filter_map(|name| {
+            let value = std::env::var(name).ok()?;
+            (!value.is_empty()).then(|| format!("{name}={}", shell_quote(&value)))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn non_empty_lines(mut lines: Vec<String>) -> Vec<String> {
@@ -1466,150 +1900,65 @@ fn non_empty_lines(mut lines: Vec<String>) -> Vec<String> {
     lines
 }
 
-fn state_path() -> PathBuf {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_home).join("cmux-home/state.json");
+fn draft_from_parts(
+    lines: Vec<String>,
+    image_paths: Vec<String>,
+    provider: AgentKind,
+    plan_mode: bool,
+) -> PersistedDraft {
+    PersistedDraft {
+        lines,
+        image_paths,
+        provider: provider.label().to_string(),
+        plan_mode,
+        saved_at_ms: now_millis(),
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share/cmux-home/state.json")
 }
 
-fn load_persisted_state(path: &PathBuf) -> PersistedState {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+fn draft_from_submit_request(request: &SubmitRequest) -> PersistedDraft {
+    let lines = if request.prompt.is_empty() {
+        vec![String::new()]
+    } else {
+        request.prompt.lines().map(str::to_string).collect()
+    };
+    draft_from_parts(
+        lines,
+        request.images.clone(),
+        request.provider,
+        request.plan_mode,
+    )
 }
 
-fn load_config(path: Option<&PathBuf>) -> AppConfig {
-    path.and_then(|path| fs::read(path).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+fn is_pending_workspace_id(workspace_id: &str) -> bool {
+    workspace_id.starts_with("pending:")
 }
 
-fn render_command_template(template: &str, values: &[(&str, &str)]) -> String {
-    render_command_template_parts(template, values, &[])
-}
-
-fn render_command_template_parts(
-    template: &str,
-    quoted_values: &[(&str, &str)],
-    raw_values: &[(&str, &str)],
-) -> String {
-    let mut rendered = template.to_string();
-    for (key, value) in quoted_values {
-        rendered = rendered.replace(&format!("{{{key}}}"), &shell_quote(value));
+fn optimistic_workspace_status(
+    workspace_id: &str,
+    title: String,
+    latest_message: String,
+) -> WorkspaceStatus {
+    WorkspaceStatus {
+        id: workspace_id.to_string(),
+        title,
+        latest_message: latest_message.clone(),
+        selected: false,
+        pinned: false,
+        statuses: HashMap::new(),
+        unread_notifications: 0,
+        conversation: Some(ConversationSnapshot {
+            actor: ConversationActor::User,
+            preview: latest_message,
+            modified_at: SystemTime::now(),
+        }),
+        updated_at: Some(Instant::now()),
     }
-    for (key, value) in raw_values {
-        rendered = rendered.replace(&format!("{{{key}}}"), value);
-    }
-    rendered
 }
 
-fn write_submit_payload(payload: SubmitPayload<'_>) -> Result<PathBuf> {
-    let safe_workspace = payload
-        .workspace_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
-        .take(48)
-        .collect::<String>();
-    let path = std::env::temp_dir().join(format!(
-        "cmux-home-submit-{}-{}-{}.json",
-        std::process::id(),
-        now_millis(),
-        safe_workspace
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("create submit payload {}", path.display()))?;
-    let bytes = serde_json::to_vec_pretty(&payload).context("serialize submit payload")?;
-    file.write_all(&bytes)
-        .with_context(|| format!("write submit payload {}", path.display()))?;
-    Ok(path)
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-struct CmuxClient {
-    path: String,
-}
-
-impl CmuxClient {
-    fn new(path: String) -> Self {
-        Self { path }
-    }
-
-    fn v2(&mut self, method: &str, params: Value) -> Result<Value> {
-        let request = json!({
-            "id": format!("cmux-home-{}", method),
-            "method": method,
-            "params": params,
-        });
-        let response = self.send_line(&request.to_string())?;
-        let value: Value = serde_json::from_str(response.trim())
-            .with_context(|| format!("invalid JSON response for {method}: {response}"))?;
-        if value.get("ok").and_then(Value::as_bool) != Some(true) {
-            bail!("{} failed: {}", method, value);
-        }
-        Ok(value.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    fn v1(&mut self, command: &str) -> Result<String> {
-        self.send_line(command)
-    }
-
-    fn send_line(&mut self, line: &str) -> Result<String> {
-        let mut stream =
-            UnixStream::connect(&self.path).with_context(|| format!("connect {}", self.path))?;
-        stream
-            .set_read_timeout(Some(Duration::from_millis(1500)))
-            .context("set read timeout")?;
-        stream
-            .write_all(format!("{line}\n").as_bytes())
-            .context("write socket command")?;
-
-        let mut response = Vec::new();
-        let mut buf = [0_u8; 4096];
-        let mut saw_newline = false;
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    response.extend_from_slice(&buf[..n]);
-                    if response.contains(&b'\n') {
-                        saw_newline = true;
-                        if is_complete_single_line_response(&response) {
-                            break;
-                        }
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(120)))
-                            .ok();
-                    }
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::WouldBlock
-                        || err.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    if saw_newline {
-                        break;
-                    }
-                    return Err(err).context("read socket response");
-                }
-                Err(err) => return Err(err).context("read socket response"),
-            }
-        }
-        String::from_utf8(response).context("socket response was not UTF-8")
-    }
+fn wrap_agent_terminal_command(command: &str) -> String {
+    let script =
+        format!("{command}\nstty sane 2>/dev/null || true\nexec \"${{SHELL:-/bin/zsh}}\" -l");
+    format!("/bin/zsh -lc {}", shell_quote(&script))
 }
 
 fn main() -> Result<()> {
@@ -1617,14 +1966,21 @@ fn main() -> Result<()> {
     let mut app = App::new(args);
     let (ui_tx, ui_rx) = mpsc::channel();
     let (refresh_tx, refresh_rx) = mpsc::channel();
+    let (submit_tx, submit_rx) = mpsc::channel();
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
+    spawn_submit_worker(submit_rx, ui_tx.clone());
     spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
-    run_tui(&mut app, ui_rx, refresh_tx)
+    run_tui(&mut app, ui_rx, refresh_tx, submit_tx)
 }
 
-fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshRequest>) -> Result<()> {
+fn run_tui(
+    app: &mut App,
+    rx: Receiver<UiEvent>,
+    refresh_tx: Sender<RefreshRequest>,
+    submit_tx: Sender<SubmitRequest>,
+) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
     execute!(
@@ -1651,14 +2007,18 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                     }
                     UiEvent::Snapshot(Ok(snapshot)) => app.apply_refresh(snapshot),
                     UiEvent::Snapshot(Err(err)) => {
+                        app.finish_loading();
                         app.status_line = format!("refresh failed: {err}");
                     }
                     UiEvent::WorkspaceSnapshot(Ok(snapshot)) => {
                         app.apply_workspace_refresh(snapshot)
                     }
                     UiEvent::WorkspaceSnapshot(Err(err)) => {
+                        app.finish_loading();
                         app.status_line = format!("refresh failed: {err}");
                     }
+                    UiEvent::SubmitResult(Ok(success)) => app.apply_submit_success(success),
+                    UiEvent::SubmitResult(Err(failure)) => app.apply_submit_failure(failure),
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
                 }
             }
@@ -1669,7 +2029,7 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        match handle_key(app, key)? {
+                        match handle_key(app, key, &submit_tx)? {
                             KeyAction::Continue => {}
                             KeyAction::Quit => break,
                             KeyAction::Refresh(reason) => {
@@ -1697,6 +2057,7 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
                 && last_refresh_request.elapsed() >= Duration::from_millis(250)
             {
                 if let Some(reason) = pending_refresh.take() {
+                    app.begin_loading(refresh_request_reason(&reason));
                     let _ = refresh_tx.send(reason);
                     last_refresh_request = Instant::now();
                 }
@@ -1717,7 +2078,11 @@ fn run_tui(app: &mut App, rx: Receiver<UiEvent>, refresh_tx: Sender<RefreshReque
     result
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
+fn handle_key(
+    app: &mut App,
+    key: KeyEvent,
+    submit_tx: &Sender<SubmitRequest>,
+) -> Result<KeyAction> {
     match key {
         KeyEvent {
             code: KeyCode::Char(ch @ ('c' | 'd')),
@@ -1766,7 +2131,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) => {
             app.open_workspace_view();
         }
-        _ if app.composer_is_active() => return handle_composer_key(app, key),
+        _ if app.composer_is_active() => return handle_composer_key(app, key, submit_tx),
         KeyEvent {
             code: KeyCode::Char('r'),
             modifiers: KeyModifiers::CONTROL,
@@ -1825,6 +2190,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             app.composer.insert_newline();
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::Tab, ..
@@ -1838,7 +2204,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            if !complete_command_suggestion(app) {
+            if !complete_autocomplete_selection(app) {
                 app.toggle_provider();
             }
         }
@@ -1849,9 +2215,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_before_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1861,9 +2229,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_after_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1873,6 +2243,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1882,6 +2253,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -1928,7 +2300,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             if app.composer_has_text() {
-                app.submit_new_workspace()?;
+                app.submit_new_workspace(submit_tx)?;
                 return Ok(KeyAction::Continue);
             }
             if app.toggle_selected_group() {
@@ -1956,12 +2328,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
+            app.sync_focus_after_composer_change();
         }
     }
     Ok(KeyAction::Continue)
 }
 
-fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
+fn handle_composer_key(
+    app: &mut App,
+    key: KeyEvent,
+    submit_tx: &Sender<SubmitRequest>,
+) -> Result<KeyAction> {
     match key {
         KeyEvent {
             code: KeyCode::Enter,
@@ -1969,10 +2346,13 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => match app.composer_mode.clone() {
             ComposerMode::NewWorkspace if app.composer_has_text() => {
+                if complete_autocomplete_selection(app) {
+                    return Ok(KeyAction::Continue);
+                }
                 if handle_composer_command(app) {
                     return Ok(KeyAction::Continue);
                 }
-                app.submit_new_workspace()?;
+                app.submit_new_workspace(submit_tx)?;
                 return Ok(KeyAction::Continue);
             }
             ComposerMode::RenameWorkspace(workspace_id) => {
@@ -1992,6 +2372,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             ..
         } => {
             app.composer.insert_newline();
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::BackTab,
@@ -2016,7 +2397,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            if !complete_command_suggestion(app) {
+            if !complete_autocomplete_selection(app) {
                 app.toggle_provider();
             }
         }
@@ -2032,9 +2413,11 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_before_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2044,9 +2427,11 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if delete_image_token_after_cursor(&mut app.composer) {
                 app.selected_image = None;
+                app.sync_focus_after_composer_change();
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2056,6 +2441,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2065,6 +2451,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
+                app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
@@ -2074,6 +2461,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
         } => {
             app.selected_image = None;
             app.composer.input(key);
+            app.sync_focus_after_composer_change();
         }
         KeyEvent {
             code: KeyCode::Char(' '),
@@ -2084,7 +2472,34 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
                 app.selected_image = None;
                 app.composer.input(key);
                 normalize_composer_image_paths(app);
+                app.sync_focus_after_composer_change();
             }
+        }
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if app.autocomplete_is_active() => {
+            app.focus_target = FocusTarget::Autocomplete;
+            app.select_previous_autocomplete();
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if app.autocomplete_is_active() => {
+            app.focus_target = FocusTarget::Autocomplete;
+            app.select_next_autocomplete();
         }
         KeyEvent {
             code: KeyCode::Char('a'),
@@ -2104,6 +2519,7 @@ fn handle_composer_key(app: &mut App, key: KeyEvent) -> Result<KeyAction> {
             app.selected_image = None;
             app.composer.input(key);
             normalize_composer_image_paths(app);
+            app.sync_focus_after_composer_change();
         }
     }
     Ok(KeyAction::Continue)
@@ -2137,13 +2553,12 @@ fn handle_composer_command(app: &mut App) -> bool {
         if draft_text.is_empty() {
             app.status_line = "nothing to stash".to_string();
         } else {
-            app.stashes.push(PersistedDraft {
-                lines: draft_text.lines().map(str::to_string).collect(),
-                image_paths: Vec::new(),
-                provider: app.provider.label().to_string(),
-                plan_mode: app.plan_mode,
-                saved_at_ms: now_millis(),
-            });
+            app.stashes.push(draft_from_parts(
+                draft_text.lines().map(str::to_string).collect(),
+                Vec::new(),
+                app.provider,
+                app.plan_mode,
+            ));
             app.reset_composer();
             app.status_line = format!("stashed draft {}", app.stashes.len());
         }
@@ -2151,7 +2566,7 @@ fn handle_composer_command(app: &mut App) -> bool {
     }
 
     if text.starts_with('/') {
-        if complete_command_suggestion(app) {
+        if complete_autocomplete_selection(app) {
             return true;
         }
         app.status_line = "unknown command".to_string();
@@ -2161,68 +2576,130 @@ fn handle_composer_command(app: &mut App) -> bool {
     false
 }
 
-fn complete_command_suggestion(app: &mut App) -> bool {
-    let Some(query) = slash_command_query(app) else {
+fn complete_autocomplete_selection(app: &mut App) -> bool {
+    let Some(query) = app.autocomplete_query() else {
         return false;
     };
-    let Some(suggestion) = command_suggestions_for_query(&query).into_iter().next() else {
+    let items = app.autocomplete_items();
+    let Some(item) = items.get(app.autocomplete.selected).cloned() else {
         return false;
     };
-    let current = query.trim_end();
-    if current == suggestion.command {
+    let current_text = app.composer.lines().join("\n").trim().to_string();
+    if item.kind == AutocompleteKind::Command && current_text == item.insert_text.trim_end() {
         return false;
     }
-    let text = if suggestion.command == "/stash save" {
-        "/stash save ".to_string()
-    } else {
-        suggestion.command.to_string()
+    let mut lines = app.composer.lines().to_vec();
+    let Some(line) = lines.get_mut(query.row) else {
+        return false;
     };
-    app.composer = composer_from_lines(vec![text]);
-    app.composer.move_cursor(CursorMove::End);
+    let chars = line.chars().collect::<Vec<_>>();
+    let start_col = query.start_col.min(chars.len());
+    let end_col = query.end_col.min(chars.len()).max(start_col);
+    let before = chars[..start_col].iter().collect::<String>();
+    let mut after = chars[end_col..].iter().collect::<String>();
+    if item.insert_text.ends_with(' ') && after.chars().next().is_some_and(char::is_whitespace) {
+        after = after.chars().skip(1).collect::<String>();
+    }
+    *line = format!("{before}{}{after}", item.insert_text);
+
+    let cursor_col = start_col + item.insert_text.chars().count();
+    app.composer = composer_from_lines(lines);
+    for _ in 0..query.row {
+        app.composer.move_cursor(CursorMove::Down);
+    }
+    for _ in 0..cursor_col {
+        app.composer.move_cursor(CursorMove::Forward);
+    }
     app.selected_image = None;
-    app.status_line = format!("command {}", suggestion.command);
+    app.status_line = match item.kind {
+        AutocompleteKind::Command => format!("command {}", item.label),
+        AutocompleteKind::File => format!("file {}", item.label),
+        AutocompleteKind::Skill => format!("skill {}", item.label),
+    };
+    app.sync_focus_after_composer_change();
     true
 }
 
-fn slash_command_query(app: &App) -> Option<String> {
-    if app.composer_mode != ComposerMode::NewWorkspace {
-        return None;
-    }
-    let text = app.composer.lines().join("\n");
-    let trimmed = text.trim_start();
-    trimmed.starts_with('/').then(|| trimmed.to_string())
-}
-
-fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestion> {
-    let query = query.trim_start();
-    COMMAND_SUGGESTIONS
+fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestionMatch> {
+    let search = query.trim_start().trim_start_matches('/').trim();
+    let pattern = fuzzy_pattern(search);
+    let mut matcher = fuzzy_matcher(false);
+    let mut buf = Vec::new();
+    let mut positions = Vec::new();
+    let mut matches = COMMAND_SUGGESTIONS
         .iter()
         .copied()
-        .filter(|suggestion| suggestion.command.starts_with(query))
+        .filter_map(|suggestion| {
+            let candidate = suggestion.command.trim_start_matches('/');
+            let match_item =
+                fuzzy_match_candidate(&pattern, &mut matcher, candidate, &mut buf, &mut positions)?;
+            Some((match_item.score, match_item.positions, suggestion))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(score_a, _, suggestion_a), (score_b, _, suggestion_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| suggestion_a.command.len().cmp(&suggestion_b.command.len()))
+            .then_with(|| suggestion_a.command.cmp(suggestion_b.command))
+    });
+    matches
+        .into_iter()
+        .map(|(_, positions, suggestion)| CommandSuggestionMatch {
+            command: suggestion.command,
+            detail: suggestion.detail,
+            positions: shift_positions(&positions, 1),
+        })
         .collect()
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
+    if handle_composer_mouse(app, &mouse, area) {
+        return;
+    }
     let reserved_bottom = app.bottom_reserved_height(area.height, area.width);
     let workspace_end = area.height.saturating_sub(reserved_bottom);
     if mouse.row >= workspace_end {
         return;
     }
+    let autocomplete_rows = autocomplete_height(app, workspace_end);
+    let autocomplete_start = workspace_end.saturating_sub(autocomplete_rows);
 
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.scroll_list(-3, workspace_end);
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                app.autocomplete.scroll = app.autocomplete.scroll.saturating_sub(3);
+            } else {
+                app.scroll_list(-3, autocomplete_start);
+            }
         }
         MouseEventKind::ScrollDown => {
-            app.scroll_list(3, workspace_end);
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                let len = app.autocomplete_items().len();
+                app.autocomplete.scroll = app.autocomplete.scroll.saturating_add(3).min(len);
+            } else {
+                app.scroll_list(3, autocomplete_start);
+            }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if app.autocomplete_is_active() && mouse.row >= autocomplete_start {
+                let relative = usize::from(mouse.row.saturating_sub(autocomplete_start));
+                if relative > 0 {
+                    let index = app.autocomplete.scroll.saturating_add(relative - 1);
+                    let len = app.autocomplete_items().len();
+                    if index < len {
+                        app.autocomplete.selected = index;
+                        app.focus_target = FocusTarget::Autocomplete;
+                    }
+                }
+                return;
+            }
             if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) {
                 if mouse.row > 0 {
                     let row = app
                         .list_scroll
                         .saturating_add(usize::from(mouse.row.saturating_sub(1)));
                     app.selected = row.min(app.active_draft_list_len().saturating_sub(1));
+                    app.focus_target = FocusTarget::MainContent;
                 }
                 return;
             }
@@ -2234,10 +2711,210 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
                 Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
             ) {
                 app.selected = visible_index;
+                app.focus_target = FocusTarget::MainContent;
             }
         }
         _ => {}
     }
+}
+
+fn handle_composer_mouse(app: &mut App, mouse: &MouseEvent, area: Rect) -> bool {
+    let composer_area = composer_area(app, area);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !mouse_in_rect(mouse, composer_area) {
+                return false;
+            }
+            let Some(position) = composer_position_from_mouse(app, composer_area, mouse) else {
+                return true;
+            };
+            app.composer_drag_anchor = Some(position);
+            app.composer.cancel_selection();
+            app.selected_image = None;
+            move_composer_cursor_to(&mut app.composer, position);
+            app.sync_focus_after_composer_change();
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(anchor) = app.composer_drag_anchor else {
+                return false;
+            };
+            let Some(position) = composer_position_from_mouse_clamped(app, composer_area, mouse)
+            else {
+                return true;
+            };
+            set_composer_selection(app, anchor, position);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if let Some(anchor) = app.composer_drag_anchor.take() {
+                if let Some(position) =
+                    composer_position_from_mouse_clamped(app, composer_area, mouse)
+                {
+                    set_composer_selection(app, anchor, position);
+                    copy_composer_selection_to_clipboard(app);
+                }
+                return true;
+            }
+            mouse_in_rect(mouse, composer_area)
+        }
+        _ => false,
+    }
+}
+
+fn mouse_in_rect(mouse: &MouseEvent, area: Rect) -> bool {
+    mouse.row >= area.y
+        && mouse.row < area.bottom()
+        && mouse.column >= area.x
+        && mouse.column < area.right()
+}
+
+fn composer_area(app: &App, area: Rect) -> Rect {
+    let composer_height = app.composer_height(area.height, area.width);
+    let help_height = app.help_height();
+    let composer_y = area
+        .bottom()
+        .saturating_sub(help_height)
+        .saturating_sub(1)
+        .saturating_sub(composer_height);
+    Rect::new(area.x, composer_y, area.width, composer_height)
+}
+
+fn composer_position_from_mouse(
+    app: &App,
+    area: Rect,
+    mouse: &MouseEvent,
+) -> Option<(usize, usize)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let visible_start = composer_visible_start(app, area.height as usize, area.width);
+    let target_visual_row =
+        visible_start.saturating_add(usize::from(mouse.row.saturating_sub(area.y)));
+    let target_col = usize::from(mouse.column.saturating_sub(area.x));
+    let layout = wrapped_composer_layout(app, area.width);
+    if let Some(line) = layout.get(target_visual_row) {
+        let prompt_width = composer_prompt_width(line.source_row);
+        let chunk_width = line.end_col.saturating_sub(line.start_col);
+        let chunk_col = target_col.saturating_sub(prompt_width).min(chunk_width);
+        return Some((line.source_row, line.start_col.saturating_add(chunk_col)));
+    }
+
+    app.composer.lines().last().map(|line| {
+        (
+            app.composer.lines().len().saturating_sub(1),
+            line.chars().count(),
+        )
+    })
+}
+
+fn composer_position_from_mouse_clamped(
+    app: &App,
+    area: Rect,
+    mouse: &MouseEvent,
+) -> Option<(usize, usize)> {
+    if area.height == 0 || area.width == 0 {
+        return None;
+    }
+    let row = mouse.row.max(area.y).min(area.bottom().saturating_sub(1));
+    let column = mouse.column.max(area.x).min(area.right().saturating_sub(1));
+    let clamped = MouseEvent {
+        kind: mouse.kind,
+        column,
+        row,
+        modifiers: mouse.modifiers,
+    };
+    composer_position_from_mouse(app, area, &clamped)
+}
+
+fn set_composer_selection(app: &mut App, anchor: (usize, usize), position: (usize, usize)) {
+    if anchor == position {
+        app.composer.cancel_selection();
+        move_composer_cursor_to(&mut app.composer, position);
+        return;
+    }
+    app.composer.cancel_selection();
+    move_composer_cursor_to(&mut app.composer, anchor);
+    app.composer.start_selection();
+    move_composer_cursor_to(&mut app.composer, position);
+}
+
+fn move_composer_cursor_to(textarea: &mut TextArea<'static>, position: (usize, usize)) {
+    let row = position.0.min(u16::MAX as usize) as u16;
+    let col = position.1.min(u16::MAX as usize) as u16;
+    textarea.move_cursor(CursorMove::Jump(row, col));
+}
+
+fn copy_composer_selection_to_clipboard(app: &mut App) {
+    let Some(range) = app.composer.selection_range() else {
+        return;
+    };
+    let text = selected_text_from_range(app.composer.lines(), range);
+    if text.is_empty() {
+        return;
+    }
+    match copy_to_clipboard(&text) {
+        Ok(()) => {
+            let count = text.chars().count();
+            app.status_line = format!("copied {count} chars");
+        }
+        Err(err) => {
+            app.status_line = format!("copy failed: {err}");
+        }
+    }
+}
+
+fn selected_text_from_range(lines: &[String], range: ((usize, usize), (usize, usize))) -> String {
+    let ((start_row, start_col), (end_row, end_col)) = normalize_text_range(range);
+    if lines.is_empty() || start_row >= lines.len() || end_row >= lines.len() {
+        return String::new();
+    }
+    if start_row == end_row {
+        return char_slice(&lines[start_row], start_col, end_col);
+    }
+
+    let mut chunks = Vec::new();
+    chunks.push(char_slice(
+        &lines[start_row],
+        start_col,
+        lines[start_row].chars().count(),
+    ));
+    chunks.extend(lines[start_row + 1..end_row].iter().cloned());
+    chunks.push(char_slice(&lines[end_row], 0, end_col));
+    chunks.join("\n")
+}
+
+fn normalize_text_range(
+    range: ((usize, usize), (usize, usize)),
+) -> ((usize, usize), (usize, usize)) {
+    let (start, end) = range;
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn char_slice(text: &str, start: usize, end: usize) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    let start = start.min(chars.len());
+    let end = end.min(chars.len()).max(start);
+    chars[start..end].iter().collect()
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("spawn pbcopy")?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes()).context("write pbcopy")?;
+    }
+    let status = child.wait().context("wait for pbcopy")?;
+    if !status.success() {
+        bail!("pbcopy exited with {status}");
+    }
+    Ok(())
 }
 
 fn handle_paste(app: &mut App, text: &str) {
@@ -2264,6 +2941,7 @@ fn handle_paste(app: &mut App, text: &str) {
         app.selected_image = None;
         app.composer.insert_str(text);
     }
+    app.sync_focus_after_composer_change();
 }
 
 fn normalize_composer_image_paths(app: &mut App) {
@@ -2318,43 +2996,6 @@ fn normalize_composer_image_paths(app: &mut App) {
         app.composer.move_cursor(CursorMove::Forward);
     }
     select_image_token_at_cursor(app);
-}
-
-fn shell_words(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for ch in text.trim().chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && quote != Some('\'') {
-            escaped = true;
-            continue;
-        }
-        if quote == Some(ch) {
-            quote = None;
-            continue;
-        }
-        if quote.is_none() && (ch == '\'' || ch == '"') {
-            quote = Some(ch);
-            continue;
-        }
-        if quote.is_none() && ch.is_whitespace() {
-            if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-            continue;
-        }
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
 }
 
 fn normalize_pasted_path(word: &str) -> String {
@@ -2702,26 +3343,51 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn wrapped_composer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    wrapped_composer_layout(app, width)
+        .into_iter()
+        .map(|line| Line::from(line.spans))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct ComposerVisualLine {
+    source_row: usize,
+    start_col: usize,
+    end_col: usize,
+    spans: Vec<Span<'static>>,
+}
+
+fn wrapped_composer_layout(app: &App, width: u16) -> Vec<ComposerVisualLine> {
+    let mut visual_lines = Vec::new();
     for (row, text) in app.composer.lines().iter().enumerate() {
         let text_width = composer_text_width(width, row);
         let content = render_composer_content_spans(app, row, text);
-        let chunks = wrap_spans(content, text_width);
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+        let ranges = word_wrap_ranges(text, text_width);
+        for (chunk_index, (start_col, end_col)) in ranges.into_iter().enumerate() {
             let prompt = if row == 0 && chunk_index == 0 {
                 COMPOSER_PROMPT
             } else {
                 COMPOSER_CONTINUATION_PROMPT
             };
             let mut spans = vec![Span::styled(prompt, muted_style())];
-            spans.extend(chunk);
-            lines.push(Line::from(spans));
+            spans.extend(slice_spans(&content, start_col, end_col));
+            visual_lines.push(ComposerVisualLine {
+                source_row: row,
+                start_col,
+                end_col,
+                spans,
+            });
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::raw(""));
+    if visual_lines.is_empty() {
+        visual_lines.push(ComposerVisualLine {
+            source_row: 0,
+            start_col: 0,
+            end_col: 0,
+            spans: vec![Span::raw("")],
+        });
     }
-    lines
+    visual_lines
 }
 
 fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<'static>> {
@@ -2731,30 +3397,52 @@ fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<
         return spans;
     }
 
-    let refs = image_token_refs(text);
-    if refs.is_empty() {
+    let image_refs = image_token_refs(text);
+    let reference_refs = composer_reference_ranges(app, text);
+    if image_refs.is_empty() && reference_refs.is_empty() {
         spans.push(Span::styled(text.to_string(), input_style()));
         return spans;
     }
 
     let chars = text.chars().collect::<Vec<_>>();
+    let image_ranges = image_refs
+        .into_iter()
+        .map(|(start, end, image_number)| (start, end, Some(image_number), None))
+        .chain(
+            reference_refs
+                .into_iter()
+                .map(|range| (range.start, range.end, None, Some(range.kind))),
+        )
+        .collect::<Vec<_>>();
+    let mut ranges = image_ranges;
+    ranges.sort_by_key(|(start, end, _, _)| (*start, *end));
     let mut cursor = 0;
-    for (start, end, image_number) in refs {
+    for (start, end, image_number, reference_kind) in ranges {
+        if start < cursor || start >= end || end > chars.len() {
+            continue;
+        }
         if cursor < start {
             spans.push(Span::styled(
                 chars[cursor..start].iter().collect::<String>(),
                 input_style(),
             ));
         }
-        let selected = app.selected_image.as_ref().is_some_and(|selection| {
-            selection.row == row
-                && selection.start == start
-                && selection.end == end
-                && Some(selection.image_index) == image_number.checked_sub(1)
-        });
+        let style = if let Some(image_number) = image_number {
+            let selected = app.selected_image.as_ref().is_some_and(|selection| {
+                selection.row == row
+                    && selection.start == start
+                    && selection.end == end
+                    && Some(selection.image_index) == image_number.checked_sub(1)
+            });
+            image_token_style(selected)
+        } else if let Some(kind) = reference_kind {
+            composer_reference_style(kind)
+        } else {
+            input_style()
+        };
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
-            image_token_style(selected),
+            style,
         ));
         cursor = end;
     }
@@ -2767,25 +3455,74 @@ fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<
     spans
 }
 
-fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+fn word_wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
-    let mut rows = vec![Vec::new()];
-    let mut col = 0;
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        while start < chars.len() && !ranges.is_empty() && chars[start].is_whitespace() {
+            start += 1;
+        }
+        if start >= chars.len() {
+            break;
+        }
+        let max_end = start.saturating_add(width).min(chars.len());
+        if max_end == chars.len() {
+            ranges.push((start, chars.len()));
+            break;
+        }
+        if chars[max_end].is_whitespace() {
+            ranges.push((start, max_end));
+            start = max_end + 1;
+            continue;
+        }
+        let word_break = (start + 1..max_end)
+            .rev()
+            .find(|index| chars[*index].is_whitespace())
+            .filter(|index| *index > start);
+        let end = word_break.unwrap_or(max_end).max(start + 1);
+        ranges.push((start, end));
+        start = if word_break.is_some() { end + 1 } else { end };
+    }
+    if ranges.is_empty() {
+        ranges.push((0, 0));
+    }
+    ranges
+}
+
+fn slice_spans(spans: &[Span<'static>], start: usize, end: usize) -> Vec<Span<'static>> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut sliced = Vec::new();
+    let mut offset = 0usize;
     for span in spans {
         let style = span.style;
-        let content = span.content.to_string();
-        for ch in content.chars() {
-            if col >= width {
-                rows.push(Vec::new());
-                col = 0;
-            }
-            rows.last_mut()
-                .expect("wrapped composer rows are initialized")
-                .push(Span::styled(ch.to_string(), style));
-            col += 1;
+        let chars = span.content.chars().collect::<Vec<_>>();
+        let span_start = offset;
+        let span_end = offset + chars.len();
+        if span_end <= start {
+            offset = span_end;
+            continue;
         }
+        if span_start >= end {
+            break;
+        }
+        let local_start = start.saturating_sub(span_start);
+        let local_end = end.min(span_end).saturating_sub(span_start);
+        if local_start < local_end {
+            sliced.push(Span::styled(
+                chars[local_start..local_end].iter().collect::<String>(),
+                style,
+            ));
+        }
+        offset = span_end;
     }
-    rows
+    sliced
 }
 
 fn composer_selection_for_row(app: &App, row: usize, text: &str) -> Option<(usize, usize)> {
@@ -2827,6 +3564,59 @@ fn append_selected_text_spans(
     }
 }
 
+fn composer_reference_ranges(app: &App, text: &str) -> Vec<ComposerHighlightRange> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        let marker = chars[index];
+        if !matches!(marker, '$' | '/' | '@')
+            || (index > 0 && !chars[index - 1].is_whitespace())
+            || index + 1 >= chars.len()
+            || chars[index + 1].is_whitespace()
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut end = index + 1;
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        let body = chars[index + 1..end].iter().collect::<String>();
+        let kind = match marker {
+            '@' => Some(ComposerReferenceKind::File),
+            '$' => Some(ComposerReferenceKind::Skill),
+            '/' if command_name_exists(&body) => Some(ComposerReferenceKind::Command),
+            '/' if skill_name_exists(&app.skills, &body) => Some(ComposerReferenceKind::Skill),
+            '/' => Some(ComposerReferenceKind::Command),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            ranges.push(ComposerHighlightRange {
+                start: index,
+                end,
+                kind,
+            });
+        }
+        index = end;
+    }
+    ranges
+}
+
+fn command_name_exists(name: &str) -> bool {
+    let command = format!("/{name}");
+    COMMAND_SUGGESTIONS
+        .iter()
+        .any(|suggestion| suggestion.command == command)
+}
+
+fn skill_name_exists(skills: &[SkillEntry], name: &str) -> bool {
+    skills
+        .iter()
+        .any(|skill| skill.name.eq_ignore_ascii_case(name))
+}
+
 fn composer_prompt_width(row: usize) -> usize {
     if row == 0 {
         COMPOSER_PROMPT.chars().count()
@@ -2841,42 +3631,35 @@ fn composer_text_width(width: u16, row: usize) -> usize {
         .max(1)
 }
 
-fn visual_line_count_for_text(text: &str, width: usize) -> usize {
-    let len = text.chars().count();
-    if len == 0 {
-        1
-    } else {
-        len.div_ceil(width.max(1))
-    }
-}
-
 fn composer_visual_line_count(app: &App, width: u16) -> usize {
-    app.composer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
-        .sum::<usize>()
-        .max(1)
+    wrapped_composer_layout(app, width).len().max(1)
 }
 
 fn composer_cursor_visual_position(app: &App, width: u16) -> (usize, usize) {
     let (cursor_row, cursor_col) = app.composer.cursor();
-    let visual_row_before_cursor = app
-        .composer
-        .lines()
-        .iter()
-        .enumerate()
-        .take(cursor_row)
-        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
-        .sum::<usize>();
-    let text_width = composer_text_width(width, cursor_row);
-    let (row_offset, col_offset) = if cursor_col > 0 && cursor_col % text_width == 0 {
-        ((cursor_col - 1) / text_width, text_width.saturating_sub(1))
-    } else {
-        (cursor_col / text_width, cursor_col % text_width)
-    };
-    (visual_row_before_cursor + row_offset, col_offset)
+    let layout = wrapped_composer_layout(app, width);
+    let mut fallback = (0usize, 0usize);
+    for (visual_row, line) in layout.iter().enumerate() {
+        fallback = (
+            visual_row,
+            line.end_col.saturating_sub(line.start_col).min(cursor_col),
+        );
+        if line.source_row < cursor_row {
+            continue;
+        }
+        if line.source_row > cursor_row {
+            break;
+        }
+        if cursor_col <= line.end_col {
+            return (
+                visual_row,
+                cursor_col
+                    .saturating_sub(line.start_col)
+                    .min(line.end_col.saturating_sub(line.start_col)),
+            );
+        }
+    }
+    fallback
 }
 
 fn composer_visible_start(app: &App, height: usize, width: u16) -> usize {
@@ -2907,10 +3690,10 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         );
         return;
     }
-    if slash_command_query(app).is_some() {
-        let suggestions_height = command_suggestions_height(app, area.height);
+    if app.autocomplete_is_active() {
+        let suggestions_height = autocomplete_height(app, area.height);
         if suggestions_height == 0 || suggestions_height >= area.height {
-            draw_command_suggestions(frame, area, app);
+            draw_autocomplete(frame, area, app);
             return;
         }
         let areas = Layout::default()
@@ -2918,16 +3701,23 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             .constraints([Constraint::Min(1), Constraint::Length(suggestions_height)])
             .split(area);
         draw_workspace_list(frame, areas[0], app);
-        draw_command_suggestions(frame, areas[1], app);
+        draw_autocomplete(frame, areas[1], app);
         return;
     }
     draw_workspace_list(frame, area, app);
 }
 
 fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    if app.workspaces.is_empty() && app.loading_reason.is_some() {
+        let line = render_loading_line(app, area.width as usize);
+        frame.render_widget(Paragraph::new(vec![line]), area);
+        return;
+    }
     app.ensure_selected_visible(area.height);
+    let rows = visible_rows(&app.workspaces, &app.collapsed_groups);
     let spinner_tick = (app.started_at.elapsed().as_millis() / 140) as usize;
-    let lines = visible_rows(&app.workspaces, &app.collapsed_groups)
+    let total_rows = rows.len();
+    let lines = rows
         .into_iter()
         .enumerate()
         .skip(app.list_scroll)
@@ -2946,39 +3736,251 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines), area);
+    draw_scroll_indicators(frame, area, app.list_scroll, total_rows, area.height);
+    draw_loading_badge(frame, area, app);
 }
 
-fn command_suggestions_height(app: &App, available_height: u16) -> u16 {
-    let Some(query) = slash_command_query(app) else {
+fn render_loading_line(app: &App, width: usize) -> Line<'static> {
+    let label = format!("  {}", loading_label(app));
+    let text = truncate(&label, width);
+    let trailing = width.saturating_sub(text.chars().count());
+    Line::from(Span::styled(
+        format!("{text}{}", " ".repeat(trailing)),
+        muted_style(),
+    ))
+}
+
+fn draw_loading_badge(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.height == 0 || app.loading_reason.is_none() {
+        return;
+    }
+    let label = format!(" {} ", loading_label(app));
+    let width = (label.chars().count() as u16).min(area.width);
+    if width == 0 {
+        return;
+    }
+    let x = area.right().saturating_sub(width);
+    frame.render_widget(
+        Paragraph::new(truncate(&label, width as usize)).style(muted_style()),
+        Rect::new(x, area.y, width, 1),
+    );
+}
+
+fn loading_label(app: &App) -> String {
+    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tick = (app.started_at.elapsed().as_millis() / 140) as usize;
+    let reason = app.loading_reason.as_deref().unwrap_or("loading");
+    let elapsed = app
+        .loading_started_at
+        .map(|started| started.elapsed().as_secs())
+        .unwrap_or(0);
+    if elapsed > 0 {
+        format!(
+            "{} loading {reason} {elapsed}s",
+            spinner[tick % spinner.len()]
+        )
+    } else {
+        format!("{} loading {reason}", spinner[tick % spinner.len()])
+    }
+}
+
+fn autocomplete_height(app: &App, available_height: u16) -> u16 {
+    if !app.autocomplete_is_active() {
         return 0;
-    };
-    let row_count = command_suggestions_for_query(&query).len().max(1);
-    let desired = (row_count + 1).min(4) as u16;
+    }
+    let row_count = app.autocomplete_items().len().max(1);
+    let desired = (row_count + 1).min(MAX_AUTOCOMPLETE_ROWS + 1) as u16;
     desired.min(available_height.saturating_sub(1))
 }
 
-fn draw_command_suggestions(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let query = slash_command_query(app).unwrap_or_default();
-    let suggestions = command_suggestions_for_query(&query);
-    let mut lines = vec![Line::from(Span::styled("Commands", muted_style()))];
-    if suggestions.is_empty() {
-        lines.push(Line::from(Span::styled("  no commands", muted_style())));
+fn draw_autocomplete(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let items = app.autocomplete_items();
+    let viewport = area.height.saturating_sub(1) as usize;
+    app.autocomplete.ensure_visible(viewport, items.len());
+    let title = match app.autocomplete_query().map(|query| query.marker) {
+        Some(AutocompleteMarker::Dollar) => "Skills",
+        Some(AutocompleteMarker::At) => "Files",
+        _ => "Commands and skills",
+    };
+    let mut lines = vec![Line::from(Span::styled(title, muted_style()))];
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled("  no matches", muted_style())));
     } else {
         lines.extend(
-            suggestions
+            items
                 .into_iter()
-                .take(area.height.saturating_sub(1) as usize)
-                .map(|suggestion| {
-                    Line::from(vec![
-                        Span::styled("  ", muted_style()),
-                        Span::styled(suggestion.command.to_string(), input_style()),
-                        Span::styled("  ", muted_style()),
-                        Span::styled(suggestion.detail.to_string(), muted_style()),
-                    ])
+                .enumerate()
+                .skip(app.autocomplete.scroll)
+                .take(viewport)
+                .map(|(index, item)| {
+                    render_autocomplete_row(
+                        &item,
+                        index == app.autocomplete.selected,
+                        area.width as usize,
+                    )
                 }),
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_autocomplete_row(item: &AutocompleteItem, selected: bool, width: usize) -> Line<'static> {
+    let marker = match item.kind {
+        AutocompleteKind::Command => "cmd",
+        AutocompleteKind::File => "file",
+        AutocompleteKind::Skill => "skill",
+    };
+    let label_width = 24;
+    let marker_width = 7;
+    let detail_width = width.saturating_sub(label_width + marker_width).max(8);
+    let (label, label_positions) =
+        truncate_end_with_positions(&item.label, &item.label_match_positions, label_width);
+    let label = format!("{label:<label_width$}");
+    let (detail, detail_positions) = if item.kind == AutocompleteKind::File {
+        truncate_middle_with_positions(&item.detail, &item.detail_match_positions, detail_width)
+    } else {
+        truncate_end_with_positions(&item.detail, &item.detail_match_positions, detail_width)
+    };
+    let content_width = marker_width + label_width + detail.chars().count();
+    let trailing = width.saturating_sub(content_width);
+    let base_style = if selected {
+        selected_style()
+    } else {
+        muted_style()
+    };
+    let label_style = if selected {
+        selected_title_style()
+    } else {
+        input_style()
+    };
+    let mut spans = vec![Span::styled(format!("  {marker:<4} "), base_style)];
+    spans.extend(highlighted_text_spans(
+        &label,
+        &label_positions,
+        label_style,
+        autocomplete_match_style(selected),
+    ));
+    spans.extend(highlighted_text_spans(
+        &detail,
+        &detail_positions,
+        base_style,
+        autocomplete_match_style(selected),
+    ));
+    spans.push(Span::styled(" ".repeat(trailing), base_style));
+    Line::from(spans)
+}
+
+fn highlighted_text_spans(
+    text: &str,
+    positions: &[usize],
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if positions.is_empty() {
+        return vec![Span::styled(text.to_string(), normal_style)];
+    }
+    let position_set = positions.iter().copied().collect::<HashSet<_>>();
+    let mut spans = Vec::new();
+    let mut current = String::new();
+    let mut current_is_match = false;
+    for (index, ch) in text.chars().enumerate() {
+        let is_match = position_set.contains(&index);
+        if current.is_empty() {
+            current_is_match = is_match;
+        } else if is_match != current_is_match {
+            spans.push(Span::styled(
+                std::mem::take(&mut current),
+                if current_is_match {
+                    match_style
+                } else {
+                    normal_style
+                },
+            ));
+            current_is_match = is_match;
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        spans.push(Span::styled(
+            current,
+            if current_is_match {
+                match_style
+            } else {
+                normal_style
+            },
+        ));
+    }
+    spans
+}
+
+fn truncate_end_with_positions(
+    text: &str,
+    positions: &[usize],
+    max_chars: usize,
+) -> (String, Vec<usize>) {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return (text.to_string(), positions.to_vec());
+    }
+    if max_chars <= 1 {
+        return ("…".to_string(), Vec::new());
+    }
+    let keep = max_chars.saturating_sub(1);
+    let truncated = format!("{}…", text.chars().take(keep).collect::<String>());
+    let positions = positions
+        .iter()
+        .copied()
+        .filter(|position| *position < keep)
+        .collect();
+    (truncated, positions)
+}
+
+fn truncate_middle_with_positions(
+    text: &str,
+    positions: &[usize],
+    max_chars: usize,
+) -> (String, Vec<usize>) {
+    let chars = text.chars().collect::<Vec<_>>();
+    let char_count = chars.len();
+    if char_count <= max_chars {
+        return (text.to_string(), positions.to_vec());
+    }
+    if max_chars <= 1 {
+        return ("…".to_string(), Vec::new());
+    }
+    let available = max_chars.saturating_sub(1);
+    let front = available / 2;
+    let back = available.saturating_sub(front);
+    let back_start = char_count.saturating_sub(back);
+    let truncated = format!(
+        "{}…{}",
+        chars[..front].iter().collect::<String>(),
+        chars[back_start..].iter().collect::<String>()
+    );
+    let positions = positions
+        .iter()
+        .filter_map(|position| {
+            if *position < front {
+                Some(*position)
+            } else if *position >= back_start {
+                Some(front + 1 + position.saturating_sub(back_start))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (truncated, positions)
+}
+
+fn autocomplete_match_style(selected: bool) -> Style {
+    let style = Style::default()
+        .fg(Color::Rgb(86, 156, 214))
+        .add_modifier(Modifier::BOLD);
+    if selected {
+        style.bg(Color::Rgb(55, 55, 55))
+    } else {
+        style
+    }
 }
 
 fn draw_draft_list(
@@ -3025,6 +4027,59 @@ fn draw_draft_list(
         );
     }
     frame.render_widget(Paragraph::new(lines), area);
+    draw_scroll_indicators(frame, area, app.list_scroll, drafts.len(), viewport);
+}
+
+fn draw_scroll_indicators(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    scroll: usize,
+    total_rows: usize,
+    viewport_rows: u16,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let (has_above, has_below) = scroll_indicator_visibility(scroll, total_rows, viewport_rows);
+    if area.height == 1 && has_above && has_below {
+        draw_scroll_indicator(frame, area, area.y, "↕ more");
+        return;
+    }
+    if has_above {
+        draw_scroll_indicator(frame, area, area.y, "↑ more");
+    }
+    if has_below {
+        draw_scroll_indicator(frame, area, area.bottom().saturating_sub(1), "↓ more");
+    }
+}
+
+fn draw_scroll_indicator(frame: &mut Frame<'_>, area: Rect, y: u16, label: &str) {
+    let label = format!(" {label} ");
+    let width = (label.chars().count() as u16).min(area.width);
+    if width == 0 {
+        return;
+    }
+    let x = area.right().saturating_sub(width);
+    frame.render_widget(
+        Paragraph::new(truncate(&label, width as usize)).style(muted_style()),
+        Rect::new(x, y, width, 1),
+    );
+}
+
+fn scroll_indicator_visibility(
+    scroll: usize,
+    total_rows: usize,
+    viewport_rows: u16,
+) -> (bool, bool) {
+    let viewport_rows = usize::from(viewport_rows);
+    if total_rows == 0 || viewport_rows == 0 {
+        return (false, false);
+    }
+    let scroll = scroll.min(total_rows.saturating_sub(1));
+    (
+        scroll > 0,
+        scroll.saturating_add(viewport_rows) < total_rows,
+    )
 }
 
 fn render_stash_row(
@@ -3112,14 +4167,6 @@ fn is_selectable_row(row: Option<&WorkspaceListRow>) -> bool {
         row,
         Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
     )
-}
-
-fn display_group(state: AgentState) -> AgentState {
-    match state {
-        AgentState::NeedsAttention => AgentState::NeedsAttention,
-        AgentState::Working => AgentState::Working,
-        AgentState::Idle | AgentState::Empty | AgentState::Unknown => AgentState::Idle,
-    }
 }
 
 fn render_group_header(label: String, selected: bool, width: usize) -> Line<'static> {
@@ -3233,6 +4280,14 @@ fn image_token_style(selected: bool) -> Style {
     }
 }
 
+fn composer_reference_style(kind: ComposerReferenceKind) -> Style {
+    match kind {
+        ComposerReferenceKind::Command => purple_style(),
+        ComposerReferenceKind::File => Style::default().fg(Color::Rgb(86, 156, 214)),
+        ComposerReferenceKind::Skill => Style::default().fg(Color::Rgb(175, 150, 255)),
+    }
+}
+
 fn selection_style() -> Style {
     Style::default()
         .fg(Color::Rgb(245, 245, 245))
@@ -3313,31 +4368,22 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 );
             }
             ComposerMode::NewWorkspace => {
-                if slash_command_query(app).is_some() {
+                if app.autocomplete_is_active() {
                     let mut help_spans = current_agent_mode_spans(app);
                     help_spans.push(Span::styled(
-                        " · enter run · tab complete · esc clear",
+                        " · enter/tab complete · ctrl+n/p select · esc clear",
                         muted_style(),
                     ));
                     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
                     return;
                 }
-                let plan_label = app.plan_toggle_label();
-                let plan_style = if plan_label == "plan" {
-                    purple_style()
-                } else {
-                    muted_style()
-                };
-                let toggle_kind = app.provider_toggle_kind();
                 let mut help_spans = current_agent_mode_spans(app);
                 help_spans.extend([
-                    Span::styled(" · enter create · ctrl+s stash · tab ", muted_style()),
                     Span::styled(
-                        app.provider_toggle_label().to_string(),
-                        agent_style(toggle_kind, false),
+                        " · enter create · ctrl+s stash · tab switch agent",
+                        muted_style(),
                     ),
-                    Span::styled(" · shift+tab ", muted_style()),
-                    Span::styled(plan_label.to_string(), plan_style),
+                    Span::styled(" · shift+tab switch mode", muted_style()),
                     Span::styled(" · esc clear", muted_style()),
                 ]);
                 frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
@@ -3351,23 +4397,11 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "  enter to open · space to reply · ctrl+x to delete"
     };
-    let plan_label = app.plan_toggle_label();
-    let plan_style = if plan_label == "plan" {
-        purple_style()
-    } else {
-        muted_style()
-    };
-    let toggle_kind = app.provider_toggle_kind();
     let mut help_spans = current_agent_mode_spans(app);
     help_spans.extend([
         Span::styled(format!(" · {}", prefix.trim()), muted_style()),
-        Span::styled(" · tab ", muted_style()),
-        Span::styled(
-            app.provider_toggle_label().to_string(),
-            agent_style(toggle_kind, false),
-        ),
-        Span::styled(" · shift+tab ", muted_style()),
-        Span::styled(plan_label.to_string(), plan_style),
+        Span::styled(" · tab switch agent", muted_style()),
+        Span::styled(" · shift+tab switch mode", muted_style()),
         Span::styled(" · ? for shortcuts", muted_style()),
     ]);
     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
@@ -3386,10 +4420,14 @@ fn current_agent_mode_spans(app: &App) -> Vec<Span<'static>> {
             if app.plan_mode {
                 purple_style()
             } else {
-                muted_style()
+                build_style()
             },
         ),
     ]
+}
+
+fn build_style() -> Style {
+    Style::default().fg(Color::Rgb(124, 189, 107))
 }
 
 fn purple_style() -> Style {
@@ -3406,6 +4444,141 @@ fn merge_refresh_request(
         (_, Some(next)) => Some(next),
         (current, None) => current,
     }
+}
+
+fn refresh_request_reason(request: &RefreshRequest) -> &str {
+    match request {
+        RefreshRequest::All(reason) => reason,
+        RefreshRequest::Workspace { reason, .. } => reason,
+    }
+}
+
+fn spawn_submit_worker(requests: Receiver<SubmitRequest>, tx: Sender<UiEvent>) {
+    thread::spawn(move || {
+        while let Ok(request) = requests.recv() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = run_submit_request(request);
+                let _ = tx.send(UiEvent::SubmitResult(result));
+            });
+        }
+    });
+}
+
+fn run_submit_request(request: SubmitRequest) -> std::result::Result<SubmitSuccess, SubmitFailure> {
+    match submit_request_inner(&request) {
+        Ok(workspace_id) => Ok(SubmitSuccess {
+            pending_id: request.pending_id,
+            workspace_id,
+            title: request.title,
+            latest_message: request.latest_message,
+        }),
+        Err(err) => Err(SubmitFailure {
+            pending_id: request.pending_id,
+            error: err.to_string(),
+        }),
+    }
+}
+
+fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
+    let mut params = json!({
+        "title": &request.title,
+        "description": &request.prompt,
+        "initial_command": &request.command,
+        "cwd": &request.workspace_cwd,
+        "focus": false,
+    });
+    if let Some(path) = request.terminal_path.as_deref() {
+        params["initial_env"] = json!({ "PATH": path });
+    }
+
+    let mut client = CmuxClient::new(request.socket_path.clone());
+    let created = client.v2("workspace.create", params)?;
+    let workspace_id = string_field(&created, "workspace_id")
+        .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+    let _ = client.v1("refresh-surfaces");
+    if !request.command_accepts_prompt {
+        spawn_submit_hook_for_request(request, &workspace_id);
+    }
+    spawn_rename_hook_for_request(request, &workspace_id);
+    if !request.prompt.is_empty() || !request.images.is_empty() {
+        let _ = client.v2(
+            "workspace.prompt_submit",
+            json!({ "workspace_id": workspace_id, "message": &request.prompt }),
+        );
+    }
+    Ok(workspace_id)
+}
+
+fn spawn_submit_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
+    let Some(template) = request.submit_template.as_deref() else {
+        return;
+    };
+    if template.trim().is_empty() {
+        return;
+    }
+    let mode = if request.plan_mode { "plan" } else { "build" };
+    let Ok(payload_path) = write_submit_payload(SubmitPayload {
+        workspace_id,
+        prompt: &request.prompt,
+        title: &request.title,
+        agent: request.provider.label(),
+        mode,
+        workspace_cwd: &request.workspace_cwd,
+        socket: &request.socket_path,
+        images: &request.images,
+    }) else {
+        return;
+    };
+    let payload_path_string = payload_path.display().to_string();
+    let rendered = render_command_template(
+        template,
+        &[
+            ("payload", &payload_path_string),
+            ("workspace_id", workspace_id),
+            ("socket", &request.socket_path),
+        ],
+    );
+    let mut command = Command::new("sh");
+    configure_workspace_hook_command(
+        &mut command,
+        &rendered,
+        &request.workspace_cwd,
+        &request.socket_path,
+        workspace_id,
+    );
+    let _ = command.spawn();
+}
+
+fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
+    let Some(template) = request.rename_template.as_deref() else {
+        return;
+    };
+    if template.trim().is_empty() {
+        return;
+    }
+    let mode = if request.plan_mode { "plan" } else { "build" };
+    let rendered = render_command_template(
+        template,
+        &[
+            ("workspace_id", workspace_id),
+            ("prompt", &request.prompt),
+            ("title", &request.title),
+            ("agent", request.provider.label()),
+            ("mode", mode),
+            ("workspace_cwd", &request.workspace_cwd),
+            ("socket", &request.socket_path),
+        ],
+    );
+    let mut command = Command::new("sh");
+    configure_workspace_hook_command(
+        &mut command,
+        &rendered,
+        &request.workspace_cwd,
+        &request.socket_path,
+        workspace_id,
+    );
+    let _ = command.spawn();
 }
 
 fn spawn_refresh_worker(
@@ -3456,23 +4629,26 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
-
-    let mut next = Vec::new();
     let workspaces = workspaces_payload
         .get("workspaces")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
 
+    let mut next = Vec::new();
     for item in workspaces {
-        if let Some(workspace) = workspace_from_list_item(
-            &mut client,
-            &item,
-            unread_by_workspace
-                .get(string_field(&item, "id").as_deref().unwrap_or(""))
-                .copied()
-                .unwrap_or(0),
-        ) {
+        let unread_notifications = workspace_item_keys(&item)
+            .iter()
+            .find_map(|key| unread_by_workspace.get(key))
+            .copied()
+            .unwrap_or(0);
+        let conversation = workspace_item_keys(&item)
+            .iter()
+            .find_map(|key| conversations_by_workspace.get(key));
+        if let Some(workspace) =
+            workspace_from_list_item(&mut client, &item, unread_notifications, conversation)
+        {
             next.push(workspace);
         }
     }
@@ -3488,21 +4664,37 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
-    let item = workspaces_payload
+    let workspaces = workspaces_payload
         .get("workspaces")
         .and_then(Value::as_array)
-        .and_then(|workspaces| {
-            workspaces
+        .cloned()
+        .unwrap_or_default();
+    let item = workspaces
+        .iter()
+        .find(|item| {
+            workspace_item_keys(item)
                 .iter()
-                .find(|item| string_field(item, "id").as_deref() == Some(workspace_id))
-        });
+                .any(|key| key == workspace_id)
+        })
+        .cloned();
     let Some(item) = item else {
         return Ok(None);
     };
+    let conversations_by_workspace =
+        load_conversations_by_workspace(&mut client, std::slice::from_ref(&item));
+    let unread_notifications = workspace_item_keys(&item)
+        .iter()
+        .find_map(|key| unread_by_workspace.get(key))
+        .copied()
+        .unwrap_or(0);
+    let conversation = workspace_item_keys(&item)
+        .iter()
+        .find_map(|key| conversations_by_workspace.get(key));
     Ok(workspace_from_list_item(
         &mut client,
-        item,
-        unread_by_workspace.get(workspace_id).copied().unwrap_or(0),
+        &item,
+        unread_notifications,
+        conversation,
     ))
 }
 
@@ -3510,24 +4702,32 @@ fn workspace_from_list_item(
     client: &mut CmuxClient,
     item: &Value,
     unread_notifications: usize,
+    conversation: Option<&ConversationSnapshot>,
 ) -> Option<WorkspaceStatus> {
-    let id = string_field(item, "id").unwrap_or_default();
+    let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
         return None;
     }
     let description = string_field(item, "description");
-    let latest_message = client
-        .v2(
-            "surface.read_text",
-            json!({
-                "workspace_id": id,
-                "lines": 60,
-                "scrollback": true,
-            }),
-        )
-        .ok()
-        .and_then(|payload| string_field(&payload, "text"))
-        .and_then(|screen| latest_message_from_screen(&screen))
+    let conversation = conversation.cloned();
+    let latest_message = conversation
+        .as_ref()
+        .map(|snapshot| snapshot.preview.clone())
+        .filter(|preview| !preview.is_empty())
+        .or_else(|| {
+            client
+                .v2(
+                    "surface.read_text",
+                    json!({
+                        "workspace_id": id,
+                        "lines": 60,
+                        "scrollback": true,
+                    }),
+                )
+                .ok()
+                .and_then(|payload| string_field(&payload, "text"))
+                .and_then(|screen| latest_message_from_screen(&screen))
+        })
         .or_else(|| description.clone())
         .unwrap_or_else(|| "standing by for task".to_string());
     let mut workspace = WorkspaceStatus {
@@ -3541,12 +4741,399 @@ fn workspace_from_list_item(
         pinned: item.get("pinned").and_then(Value::as_bool).unwrap_or(false),
         statuses: HashMap::new(),
         unread_notifications,
+        conversation,
         updated_at: None,
     };
     if let Ok(sidebar) = client.v1(&format!("sidebar_state --tab={id}")) {
         workspace.statuses = parse_sidebar_statuses(&sidebar);
     }
     Some(workspace)
+}
+
+fn workspace_primary_id(item: &Value) -> Option<String> {
+    string_field(item, "id").or_else(|| string_field(item, "ref"))
+}
+
+fn workspace_item_keys(item: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in ["id", "ref"] {
+        if let Some(value) = string_field(item, key) {
+            if !keys.contains(&value) {
+                keys.push(value);
+            }
+        }
+    }
+    keys
+}
+
+fn workspace_item_ref(item: &Value) -> Option<String> {
+    string_field(item, "ref").or_else(|| string_field(item, "id"))
+}
+
+fn workspace_item_cwd(item: &Value) -> Option<String> {
+    string_field(item, "current_directory").or_else(|| string_field(item, "cwd"))
+}
+
+#[derive(Default)]
+struct TopConversationRefs {
+    codex_sessions_by_workspace: HashMap<String, HashSet<String>>,
+    claude_workspaces: HashSet<String>,
+}
+
+fn load_conversations_by_workspace(
+    client: &mut CmuxClient,
+    workspaces: &[Value],
+) -> HashMap<String, ConversationSnapshot> {
+    let top_command = if workspaces.len() == 1 {
+        workspace_item_ref(&workspaces[0])
+            .map(|workspace_ref| {
+                format!("top --workspace {workspace_ref} --processes --format tsv")
+            })
+            .unwrap_or_else(|| "top --all --processes --format tsv".to_string())
+    } else {
+        "top --all --processes --format tsv".to_string()
+    };
+    let top = client.v1(&top_command).unwrap_or_default();
+    let top_refs = parse_top_conversation_refs(&top);
+    let mut conversations = HashMap::new();
+
+    let codex_conversations = load_codex_conversations(&top_refs.codex_sessions_by_workspace);
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        let Some(session_ids) = top_refs.codex_sessions_by_workspace.get(&workspace_ref) else {
+            continue;
+        };
+        let best = session_ids
+            .iter()
+            .filter_map(|session_id| codex_conversations.get(session_id))
+            .max_by_key(|snapshot| snapshot.modified_at);
+        if let Some(snapshot) = best.cloned() {
+            insert_conversation_for_workspace(item, snapshot, &mut conversations);
+        }
+    }
+
+    let mut claude_cwd_counts: HashMap<String, usize> = HashMap::new();
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        if !top_refs.claude_workspaces.contains(&workspace_ref) {
+            continue;
+        }
+        if let Some(cwd) = workspace_item_cwd(item) {
+            *claude_cwd_counts.entry(cwd).or_insert(0) += 1;
+        }
+    }
+
+    for item in workspaces {
+        let Some(workspace_ref) = workspace_item_ref(item) else {
+            continue;
+        };
+        if !top_refs.claude_workspaces.contains(&workspace_ref) {
+            continue;
+        }
+        let Some(cwd) = workspace_item_cwd(item) else {
+            continue;
+        };
+        if claude_cwd_counts.get(&cwd).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        if let Some(snapshot) = load_latest_claude_conversation_for_cwd(&cwd) {
+            insert_conversation_for_workspace(item, snapshot, &mut conversations);
+        }
+    }
+
+    conversations
+}
+
+fn insert_conversation_for_workspace(
+    item: &Value,
+    snapshot: ConversationSnapshot,
+    conversations: &mut HashMap<String, ConversationSnapshot>,
+) {
+    for key in workspace_item_keys(item) {
+        conversations.insert(key, snapshot.clone());
+    }
+}
+
+fn parse_top_conversation_refs(text: &str) -> TopConversationRefs {
+    let mut refs = TopConversationRefs::default();
+    for line in text.lines() {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols.len() < 6 {
+            continue;
+        }
+        let kind = cols[3];
+        let id = cols[4];
+        let parent = cols[5];
+        if kind != "tag" || !parent.starts_with("workspace:") {
+            continue;
+        }
+        if let Some(session_id) = extract_codex_session_id(id) {
+            refs.codex_sessions_by_workspace
+                .entry(parent.to_string())
+                .or_default()
+                .insert(session_id);
+        }
+        if id.contains(":tag:claude") {
+            refs.claude_workspaces.insert(parent.to_string());
+        }
+    }
+    refs
+}
+
+fn extract_codex_session_id(value: &str) -> Option<String> {
+    let (_, rest) = value.split_once("codex.")?;
+    let session_id = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-')
+        .collect::<String>();
+    (session_id.len() >= 32).then_some(session_id)
+}
+
+fn load_codex_conversations(
+    sessions_by_workspace: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, ConversationSnapshot> {
+    let wanted = sessions_by_workspace
+        .values()
+        .flat_map(|ids| ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let mut paths_by_session = HashMap::new();
+    for root in codex_session_roots() {
+        collect_matching_session_files(&root, &wanted, &mut paths_by_session);
+    }
+    let mut conversations = HashMap::new();
+    for (session_id, path) in paths_by_session {
+        if let Some(snapshot) = parse_codex_conversation_file(&path) {
+            conversations.insert(session_id, snapshot);
+        }
+    }
+    conversations
+}
+
+fn codex_session_roots() -> Vec<PathBuf> {
+    let Some(codex_home) = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| user_home().map(|home| home.join(".codex")))
+    else {
+        return Vec::new();
+    };
+    vec![
+        codex_home.join("sessions"),
+        codex_home.join("archived_sessions"),
+    ]
+}
+
+fn collect_matching_session_files(
+    dir: &Path,
+    wanted: &HashSet<String>,
+    paths_by_session: &mut HashMap<String, PathBuf>,
+) {
+    if paths_by_session.len() == wanted.len() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_matching_session_files(&path, wanted, paths_by_session);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for session_id in wanted {
+            if paths_by_session.contains_key(session_id) {
+                continue;
+            }
+            if file_name.contains(session_id) {
+                paths_by_session.insert(session_id.clone(), path.clone());
+            }
+        }
+    }
+}
+
+fn load_latest_claude_conversation_for_cwd(cwd: &str) -> Option<ConversationSnapshot> {
+    let claude_home = std::env::var_os("CLAUDE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| user_home().map(|home| home.join(".claude")))?;
+    let project_dir = claude_home
+        .join("projects")
+        .join(claude_project_dir_name(cwd));
+    let latest = latest_jsonl_file(&project_dir)?;
+    parse_claude_conversation_file(&latest)
+}
+
+fn claude_project_dir_name(cwd: &str) -> String {
+    cwd.chars()
+        .map(|ch| {
+            if ch == '/' || ch.is_whitespace() {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+fn latest_jsonl_file(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let modified_at = fs::metadata(&path).ok()?.modified().ok()?;
+            Some((modified_at, path))
+        })
+        .max_by_key(|(modified_at, _)| *modified_at)
+        .map(|(_, path)| path)
+}
+
+fn parse_codex_conversation_file(path: &Path) -> Option<ConversationSnapshot> {
+    parse_conversation_file(path, |value| {
+        let event_type = value.get("type").and_then(Value::as_str);
+        let payload = value.get("payload")?;
+        let payload_type = payload.get("type").and_then(Value::as_str);
+        if event_type == Some("event_msg") && payload_type == Some("user_message") {
+            return Some((
+                ConversationActor::User,
+                payload
+                    .get("message")
+                    .and_then(value_preview)
+                    .or_else(|| payload.get("text_elements").and_then(value_preview))
+                    .unwrap_or_default(),
+            ));
+        }
+        if event_type == Some("response_item") && payload_type == Some("message") {
+            let role = payload.get("role").and_then(Value::as_str)?;
+            let actor = match role {
+                "user" => ConversationActor::User,
+                "assistant" => ConversationActor::Assistant,
+                _ => return None,
+            };
+            return Some((
+                actor,
+                payload
+                    .get("content")
+                    .and_then(value_preview)
+                    .unwrap_or_default(),
+            ));
+        }
+        None
+    })
+}
+
+fn parse_claude_conversation_file(path: &Path) -> Option<ConversationSnapshot> {
+    parse_conversation_file(path, |value| {
+        let role = value
+            .pointer("/message/role")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("type").and_then(Value::as_str))?;
+        let actor = match role {
+            "user" => ConversationActor::User,
+            "assistant" => ConversationActor::Assistant,
+            _ => return None,
+        };
+        let content = value
+            .pointer("/message/content")
+            .or_else(|| value.get("content"))?;
+        if actor == ConversationActor::User && claude_user_content_is_tool_result(content) {
+            return None;
+        }
+        let preview = value_preview(content).unwrap_or_default();
+        if actor == ConversationActor::Assistant && preview.is_empty() {
+            return None;
+        }
+        Some((actor, preview))
+    })
+}
+
+fn parse_conversation_file<F>(path: &Path, mut parse_line: F) -> Option<ConversationSnapshot>
+where
+    F: FnMut(&Value) -> Option<(ConversationActor, String)>,
+{
+    let modified_at = fs::metadata(path).ok()?.modified().ok()?;
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut last_actor = None;
+    let mut last_preview = String::new();
+    for line in reader.lines().map_while(std::result::Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some((actor, preview)) = parse_line(&value) else {
+            continue;
+        };
+        last_actor = Some(actor);
+        if !preview.is_empty() {
+            last_preview = preview;
+        }
+    }
+    Some(ConversationSnapshot {
+        actor: last_actor?,
+        preview: last_preview,
+        modified_at,
+    })
+}
+
+fn value_preview(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_value_text(value, &mut parts);
+    let preview = parts.join(" ");
+    (!preview.trim().is_empty()).then(|| one_line_preview(&preview, 240))
+}
+
+fn collect_value_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_value_text(item, parts);
+            }
+        }
+        Value::Object(object) => {
+            if object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "tool_result" | "tool_use" | "function_call"))
+            {
+                return;
+            }
+            for key in ["text", "content", "message"] {
+                if let Some(value) = object.get(key) {
+                    collect_value_text(value, parts);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn claude_user_content_is_tool_result(value: &Value) -> bool {
+    let Value::Array(items) = value else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|item| {
+            item.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "tool_result")
+        })
 }
 
 fn spawn_event_stream(socket_path: String, tx: Sender<UiEvent>) {
@@ -3595,104 +5182,6 @@ fn run_event_stream_once(socket_path: &str, tx: &Sender<UiEvent>) -> Result<()> 
             _ => {}
         }
     }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct EventFrame {
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    name: Option<String>,
-    workspace_id: Option<String>,
-    #[serde(default)]
-    payload: Value,
-}
-
-fn event_name(frame: &EventFrame) -> String {
-    frame.name.clone().unwrap_or_else(|| "event".to_string())
-}
-
-fn event_workspace_id(frame: &EventFrame) -> Option<&str> {
-    frame
-        .workspace_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-        .or_else(|| frame.payload.get("workspace_id").and_then(Value::as_str))
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/workspace_id")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/params/workspace_id")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            frame
-                .payload
-                .get("args")
-                .and_then(Value::as_str)
-                .and_then(workspace_id_from_args)
-        })
-}
-
-fn event_title(frame: &EventFrame) -> Option<String> {
-    frame
-        .payload
-        .get("custom_title")
-        .and_then(Value::as_str)
-        .or_else(|| frame.payload.get("title").and_then(Value::as_str))
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/title")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string)
-}
-
-fn event_description(frame: &EventFrame) -> Option<String> {
-    frame
-        .payload
-        .get("description")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            frame
-                .payload
-                .pointer("/result/description")
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string)
-}
-
-fn notification_is_unread(frame: &EventFrame) -> bool {
-    frame
-        .payload
-        .get("is_read")
-        .and_then(Value::as_bool)
-        .map(|is_read| !is_read)
-        .unwrap_or(true)
-}
-
-fn workspace_id_from_args(args: &str) -> Option<&str> {
-    let words = shell_words(args);
-    let id = words
-        .iter()
-        .find_map(|word| {
-            word.strip_prefix("--tab=")
-                .or_else(|| word.strip_prefix("--workspace="))
-        })
-        .or_else(|| {
-            words.windows(2).find_map(|pair| {
-                (pair[0] == "--tab" || pair[0] == "--workspace").then_some(pair[1].as_str())
-            })
-        });
-    id.map(|id| {
-        let offset = args.find(id).unwrap_or(0);
-        &args[offset..offset + id.len()]
-    })
 }
 
 fn unread_notifications_by_workspace(payload: Value) -> HashMap<String, usize> {
@@ -3787,65 +5276,668 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn one_line_preview(text: &str, max_chars: usize) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate(&collapsed, max_chars)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    if max_chars <= 1 {
-        return "…".to_string();
-    }
-    format!(
-        "{}…",
-        text.chars()
-            .take(max_chars.saturating_sub(1))
-            .collect::<String>()
-    )
-}
+    #[test]
+    fn parses_codex_session_ids_from_top_tags() {
+        let top = "\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:codex.019e266c-c7de-7052-b819-bcf5df17ada5\tworkspace:84\t\n\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:claude_code\tworkspace:40\tRunning\n";
+        let refs = parse_top_conversation_refs(top);
 
-fn time_ago(instant: Instant) -> String {
-    let elapsed = instant.elapsed();
-    let seconds = elapsed.as_secs();
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 60 * 60 {
-        format!("{}m", seconds / 60)
-    } else if seconds < 60 * 60 * 24 {
-        format!("{}h", seconds / 60 / 60)
-    } else {
-        format!("{}d", seconds / 60 / 60 / 24)
+        assert!(refs
+            .codex_sessions_by_workspace
+            .get("workspace:84")
+            .is_some_and(|sessions| sessions.contains("019e266c-c7de-7052-b819-bcf5df17ada5")));
+        assert!(refs.claude_workspaces.contains("workspace:40"));
     }
-}
 
-fn shell_quote(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
+    #[test]
+    fn ignores_claude_tool_result_user_messages() {
+        let content = json!([
+            {
+                "type": "tool_result",
+                "content": "command output"
+            }
+        ]);
 
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
-}
+        assert!(claude_user_content_is_tool_result(&content));
+        assert!(value_preview(&content).is_none());
+    }
 
-fn is_complete_single_line_response(data: &[u8]) -> bool {
-    if !data.contains(&b'\n') {
-        return false;
+    #[test]
+    fn extracts_text_preview_from_message_content() {
+        let content = json!([
+            {
+                "type": "text",
+                "text": "hello\nworld"
+            },
+            {
+                "type": "tool_use",
+                "input": "ignored"
+            }
+        ]);
+
+        assert_eq!(value_preview(&content).as_deref(), Some("hello world"));
     }
-    let Ok(response) = std::str::from_utf8(data) else {
-        return false;
-    };
-    let normalized = response.trim();
-    if normalized.is_empty() || normalized.contains('\n') {
-        return false;
+
+    #[test]
+    fn created_workspace_event_starts_in_working_group() {
+        let frame = EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("workspace:1".to_string()),
+            payload: json!({
+                "workspace_id": "workspace:1",
+                "title": "codex: fix submit flicker",
+                "selected": false
+            }),
+        };
+
+        let workspace = workspace_from_created_event(&frame, "workspace:1");
+
+        assert_eq!(workspace.latest_message, "fix submit flicker");
+        assert_eq!(display_group(workspace.agent_state()), AgentState::Working);
     }
-    normalized == "OK"
-        || normalized == "PONG"
-        || normalized.starts_with("OK ")
-        || normalized.starts_with("ERROR:")
-        || serde_json::from_str::<Value>(normalized).is_ok()
+
+    #[test]
+    fn plain_created_workspace_event_does_not_fake_agent_work() {
+        let frame = EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("workspace:1".to_string()),
+            payload: json!({
+                "workspace_id": "workspace:1",
+                "title": "shell",
+                "selected": false
+            }),
+        };
+
+        let workspace = workspace_from_created_event(&frame, "workspace:1");
+
+        assert_eq!(workspace.latest_message, "starting workspace");
+        assert!(workspace.conversation.is_none());
+        assert_eq!(display_group(workspace.agent_state()), AgentState::Idle);
+    }
+
+    #[test]
+    fn empty_refresh_preserves_recent_optimistic_submission() {
+        let existing = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix submit flicker".to_string(),
+            latest_message: "fix submit flicker".to_string(),
+            conversation: Some(ConversationSnapshot {
+                actor: ConversationActor::User,
+                preview: "fix submit flicker".to_string(),
+                modified_at: SystemTime::now(),
+            }),
+            ..WorkspaceStatus::default()
+        };
+        let mut refreshed = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix submit flicker".to_string(),
+            latest_message: "standing by for task".to_string(),
+            ..WorkspaceStatus::default()
+        };
+
+        preserve_optimistic_submission(&existing, &mut refreshed);
+
+        assert_eq!(refreshed.latest_message, "fix submit flicker");
+        assert_eq!(display_group(refreshed.agent_state()), AgentState::Working);
+    }
+
+    #[test]
+    fn opening_history_selects_first_prompt() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.history = vec![
+            draft_from_parts(
+                vec!["first".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+            draft_from_parts(
+                vec!["second".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+        ];
+        app.selected = 7;
+        app.list_scroll = 4;
+
+        app.open_history_view();
+
+        assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.list_scroll, 0);
+    }
+
+    #[test]
+    fn autocomplete_query_works_inside_non_empty_composer() {
+        let mut composer = composer_from_lines(vec!["please use $ver".to_string()]);
+        composer.move_cursor(CursorMove::End);
+
+        let query = autocomplete_query_at_cursor(&composer).expect("query");
+
+        assert_eq!(query.marker, AutocompleteMarker::Dollar);
+        assert_eq!(query.raw, "$ver");
+        assert_eq!(query.search, "ver");
+        assert_eq!(query.row, 0);
+        assert_eq!(query.start_col, 11);
+        assert_eq!(query.end_col, 15);
+    }
+
+    #[test]
+    fn skill_completion_replaces_current_token_only() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "verify".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/verify/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec!["please use $ver now".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        for _ in 0..4 {
+            app.composer.move_cursor(CursorMove::Back);
+        }
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(
+            app.composer.lines(),
+            &["please use $verify now".to_string()]
+        );
+    }
+
+    #[test]
+    fn slash_skill_completion_uses_slash_prefix_inline() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "review".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/review/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec!["run /rev".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(app.composer.lines(), &["run /review ".to_string()]);
+    }
+
+    #[test]
+    fn at_file_completion_replaces_current_token_only() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.file_references = vec![FileReference {
+            path: "src/main.rs".to_string(),
+        }];
+        app.composer = composer_from_lines(vec!["read @main".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(complete_autocomplete_selection(&mut app));
+
+        assert_eq!(app.composer.lines(), &["read @src/main.rs ".to_string()]);
+    }
+
+    #[test]
+    fn file_completion_biases_title_matches() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.file_references = vec![
+            FileReference {
+                path: "references/gstack/CLAUDE.md".to_string(),
+            },
+            FileReference {
+                path: "CLAUDE.md".to_string(),
+            },
+        ];
+        app.composer = composer_from_lines(vec!["@CLAUDE.md".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let items = app.autocomplete_items();
+
+        assert_eq!(
+            items.first().map(|item| item.label.as_str()),
+            Some("@CLAUDE.md")
+        );
+        assert_eq!(
+            items.first().map(|item| item.detail.as_str()),
+            Some("CLAUDE.md")
+        );
+        assert_eq!(
+            items.get(1).map(|item| item.detail.as_str()),
+            Some("references/gstack/CLAUDE.md")
+        );
+        assert!(!items
+            .first()
+            .map(|item| item.label_match_positions.is_empty())
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn middle_truncation_keeps_front_and_end() {
+        let (text, positions) =
+            truncate_middle_with_positions("references/qstack/CLAUDE.md.file", &[0, 19, 24], 18);
+
+        assert!(text.starts_with("referenc"));
+        assert!(text.ends_with(".md.file"));
+        assert!(text.contains('…'));
+        assert!(positions.contains(&0));
+    }
+
+    #[test]
+    fn composer_reference_ranges_classify_inline_refs() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills = vec![SkillEntry {
+            name: "verify".to_string(),
+            description: String::new(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/verify/SKILL.md"),
+        }];
+
+        let ranges = composer_reference_ranges(&app, "use $verify @src/main.rs /history /verify");
+
+        assert_eq!(
+            ranges.iter().map(|range| range.kind).collect::<Vec<_>>(),
+            vec![
+                ComposerReferenceKind::Skill,
+                ComposerReferenceKind::File,
+                ComposerReferenceKind::Command,
+                ComposerReferenceKind::Skill,
+            ]
+        );
+    }
+
+    #[test]
+    fn dollar_skill_prompt_is_not_treated_as_command() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec![
+            "$auto-issue https://github.com/manaflow-ai/cmux/issues/4228 reproduce and fix"
+                .to_string(),
+        ]);
+        app.composer.move_cursor(CursorMove::End);
+
+        assert!(!complete_autocomplete_selection(&mut app));
+        assert!(!handle_composer_command(&mut app));
+    }
+
+    #[test]
+    fn selected_text_from_range_handles_multiline_text() {
+        let lines = vec![
+            "first line".to_string(),
+            "middle".to_string(),
+            "last line".to_string(),
+        ];
+
+        let selected = selected_text_from_range(&lines, ((0, 6), (2, 4)));
+
+        assert_eq!(selected, "line\nmiddle\nlast");
+    }
+
+    #[test]
+    fn composer_mouse_position_accounts_for_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["abcdef".to_string()]);
+        let area = Rect::new(0, 0, 5, 3);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let position = composer_position_from_mouse(&app, area, &mouse);
+
+        assert_eq!(position, Some((0, 4)));
+    }
+
+    #[test]
+    fn composer_wraps_on_words_when_possible() {
+        let ranges = word_wrap_ranges("hello world test", 8);
+
+        assert_eq!(ranges, vec![(0, 5), (6, 11), (12, 16)]);
+    }
+
+    #[test]
+    fn composer_cursor_position_uses_word_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let position = composer_cursor_visual_position(&app, 10);
+
+        assert_eq!(position, (1, 5));
+    }
+
+    #[test]
+    fn composer_mouse_position_uses_word_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        let area = Rect::new(0, 0, 10, 2);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let position = composer_position_from_mouse(&app, area, &mouse);
+
+        assert_eq!(position, Some((0, 6)));
+    }
+
+    #[test]
+    fn composer_mouse_selection_sets_textarea_selection_range() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+
+        set_composer_selection(&mut app, (0, 6), (0, 11));
+
+        assert_eq!(app.composer.selection_range(), Some(((0, 6), (0, 11))));
+        assert_eq!(
+            selected_text_from_range(
+                app.composer.lines(),
+                app.composer.selection_range().unwrap()
+            ),
+            "world"
+        );
+    }
+
+    #[test]
+    fn refresh_snapshot_clears_loading_state() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.begin_loading("test");
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: Vec::new(),
+            loaded_at: Instant::now(),
+        });
+
+        assert!(app.loading_reason.is_none());
+        assert!(app.loading_started_at.is_none());
+    }
+
+    #[test]
+    fn scroll_indicator_visibility_tracks_hidden_rows() {
+        assert_eq!(scroll_indicator_visibility(0, 3, 3), (false, false));
+        assert_eq!(scroll_indicator_visibility(0, 8, 3), (false, true));
+        assert_eq!(scroll_indicator_visibility(2, 8, 3), (true, true));
+        assert_eq!(scroll_indicator_visibility(5, 8, 3), (true, false));
+        assert_eq!(scroll_indicator_visibility(0, 8, 0), (false, false));
+    }
+
+    #[test]
+    fn submitting_prompt_queues_background_work_and_preserves_history() {
+        let state_path = std::env::temp_dir().join(format!(
+            "cmux-home-submit-test-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let _ = fs::remove_file(&state_path);
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.state_path = state_path.clone();
+        app.history.clear();
+        app.stashes.clear();
+        app.composer = composer_from_lines(vec!["instant submit".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        let (tx, rx) = mpsc::channel();
+
+        app.submit_new_workspace(&tx).expect("queue submit");
+
+        let request = rx.try_recv().expect("background submit request");
+        assert_eq!(request.prompt, "instant submit");
+        assert!(!app.composer_has_input());
+        assert!(app
+            .workspaces
+            .first()
+            .is_some_and(|workspace| workspace.id.starts_with("pending:")));
+
+        let protected: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("protected state")).unwrap();
+        assert_eq!(
+            protected.draft.as_ref().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+        assert_eq!(
+            protected.history.first().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+
+        app.persist_state();
+        let cleared: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("cleared state")).unwrap();
+        assert!(cleared.draft.is_none());
+        assert_eq!(
+            cleared.history.first().map(|draft| draft.lines.clone()),
+            Some(vec!["instant submit".to_string()])
+        );
+        let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn refresh_preserves_pending_submission_rows() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.workspaces = vec![optimistic_workspace_status(
+            "pending:1",
+            "codex: instant submit".to_string(),
+            "instant submit".to_string(),
+        )];
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: Vec::new(),
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, "pending:1");
+        assert_eq!(
+            display_group(app.workspaces[0].agent_state()),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn submit_success_replaces_pending_row_without_duplicates() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.workspaces = vec![
+            optimistic_workspace_status(
+                "workspace:7",
+                "codex: instant submit".to_string(),
+                "instant submit".to_string(),
+            ),
+            optimistic_workspace_status(
+                "pending:1",
+                "codex: instant submit".to_string(),
+                "instant submit".to_string(),
+            ),
+        ];
+
+        app.apply_submit_success(SubmitSuccess {
+            pending_id: "pending:1".to_string(),
+            workspace_id: "workspace:7".to_string(),
+            title: "codex: instant submit".to_string(),
+            latest_message: "instant submit".to_string(),
+        });
+
+        let matches = app
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.id == "workspace:7")
+            .count();
+        assert_eq!(matches, 1);
+        assert!(app
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != "pending:1"));
+    }
+
+    #[test]
+    fn agent_terminal_command_keeps_workspace_alive_after_exit() {
+        let command = wrap_agent_terminal_command("codex --yolo 'hello'");
+
+        assert!(command.starts_with("/bin/zsh -lc "));
+        assert!(command.contains("codex --yolo"));
+        assert!(command.contains("stty sane 2>/dev/null || true"));
+        assert!(command.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn rendered_agent_command_preserves_prompt_detection_when_wrapped() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "printf agent {prompt}".to_string(),
+            codex_plan_command: "printf plan {prompt}".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.provider = AgentKind::Codex;
+
+        let (command, accepts_prompt) = app.render_agent_command(&[], "hello");
+
+        assert!(accepts_prompt);
+        assert!(command.starts_with("/bin/zsh -lc "));
+        assert!(command.contains("printf agent"));
+        assert!(command.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn command_suggestions_fuzzy_match_command_names() {
+        let suggestions = command_suggestions_for_query("/hs");
+
+        assert_eq!(
+            suggestions.first().map(|suggestion| suggestion.command),
+            Some("/history")
+        );
+    }
 }
