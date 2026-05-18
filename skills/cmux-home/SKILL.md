@@ -110,13 +110,22 @@ cargo test --release --manifest-path cmux-home/Cargo.toml
 cargo build --release --manifest-path cmux-home/Cargo.toml
 ```
 
-When working from `cmuxterm-hq`, dogfood in the caller workspace:
+When working from `cmuxterm-hq`, every change must reload `$cmux-workspace`
+before handoff, including docs and skill changes:
 
 ```bash
 CMUX_HOME_FOCUS=false ./scripts/dogfood-cmux-home.sh
 ```
 
-Verify the surface exists with `cmux read-screen` or `cmux surface-health` before reporting that the TUI is ready.
+Use the current caller workspace from `CMUX_WORKSPACE_ID` / `cmux identify`,
+reuse the right-side helper pane, preserve focus, and verify the surface with
+`cmux read-screen`, `cmux surface-health`, and `cmux top` before reporting that
+the TUI is ready.
+
+If the non-focus launch creates an unattached terminal surface, clean it up.
+For this cmux-home reload handoff only, briefly materialize the caller
+workspace to attach the TUI, verify it, then restore the workspace and surface
+that were focused before the reload.
 
 ## Change Guidance
 
