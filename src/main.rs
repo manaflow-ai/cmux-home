@@ -333,6 +333,7 @@ struct App {
     plan_mode: bool,
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
+    own_workspace_keys: HashSet<String>,
     selected: usize,
     list_scroll: usize,
     focus_target: FocusTarget,
@@ -435,6 +436,7 @@ impl App {
             plan_mode: false,
             show_shortcuts: false,
             workspaces: Vec::new(),
+            own_workspace_keys: current_workspace_keys(),
             selected: 0,
             list_scroll: 0,
             focus_target: FocusTarget::MainContent,
@@ -526,6 +528,7 @@ impl App {
         self.workspaces = snapshot
             .workspaces
             .into_iter()
+            .filter(|workspace| !self.should_hide_workspace(workspace))
             .map(|mut workspace| {
                 if let Some(existing) = previous.get(&workspace.id) {
                     preserve_optimistic_submission(existing, &mut workspace);
@@ -587,6 +590,10 @@ impl App {
 
     fn apply_workspace_refresh(&mut self, snapshot: WorkspaceRefresh) {
         match snapshot.workspace {
+            Some(refreshed) if self.should_hide_workspace(&refreshed) => {
+                self.workspaces
+                    .retain(|workspace| workspace.id != refreshed.id);
+            }
             Some(mut refreshed) => {
                 let previous = self
                     .workspaces
@@ -639,12 +646,27 @@ impl App {
         self.loading_started_at = None;
     }
 
+    fn workspace_key_is_self(&self, workspace_id: &str) -> bool {
+        self.own_workspace_keys.contains(workspace_id)
+    }
+
+    fn should_hide_workspace(&self, workspace: &WorkspaceStatus) -> bool {
+        self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title)
+    }
+
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
         match frame.name.as_deref() {
             Some("workspace.created") => {
                 let Some(workspace_id) = event_workspace_id(frame) else {
                     return Some(RefreshRequest::All(event_name(frame)));
                 };
+                if self.workspace_key_is_self(workspace_id)
+                    || event_title(frame)
+                        .as_deref()
+                        .is_some_and(cmux_home_launcher_label)
+                {
+                    return None;
+                }
                 if self
                     .workspaces
                     .iter()
@@ -696,6 +718,11 @@ impl App {
                 let (Some(workspace_id), Some(title)) = (workspace_id, title) else {
                     return Some(RefreshRequest::All(event_name(frame)));
                 };
+                if cmux_home_launcher_label(title) {
+                    self.workspaces
+                        .retain(|workspace| workspace.id != workspace_id);
+                    return None;
+                }
                 if let Some(workspace) = self
                     .workspaces
                     .iter_mut()
@@ -4864,10 +4891,21 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let top = client
+        .v1("top --all --processes --format tsv")
+        .unwrap_or_default();
+    let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
     let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
 
     let mut next = Vec::new();
     for item in workspaces {
+        if workspace_item_is_cmux_home_launcher(&item)
+            || workspace_item_keys(&item)
+                .iter()
+                .any(|key| cmux_home_workspace_refs.contains(key))
+        {
+            continue;
+        }
         let unread_notifications = workspace_item_keys(&item)
             .iter()
             .find_map(|key| unread_by_workspace.get(key))
@@ -4910,6 +4948,19 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
     let Some(item) = item else {
         return Ok(None);
     };
+    if workspace_item_is_cmux_home_launcher(&item)
+        || workspace_item_ref(&item)
+            .and_then(|workspace_ref| {
+                client
+                    .v1(&format!(
+                        "top --workspace {workspace_ref} --processes --format tsv"
+                    ))
+                    .ok()
+            })
+            .is_some_and(|top| top_has_cmux_home_launcher(&top))
+    {
+        return Ok(None);
+    }
     let conversations_by_workspace =
         load_conversations_by_workspace(&mut client, std::slice::from_ref(&item));
     let unread_notifications = workspace_item_keys(&item)
@@ -4936,6 +4987,9 @@ fn workspace_from_list_item(
 ) -> Option<WorkspaceStatus> {
     let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
+        return None;
+    }
+    if workspace_item_is_cmux_home_launcher(item) {
         return None;
     }
     let description = string_field(item, "description");
@@ -5002,6 +5056,69 @@ fn workspace_item_ref(item: &Value) -> Option<String> {
 
 fn workspace_item_cwd(item: &Value) -> Option<String> {
     string_field(item, "current_directory").or_else(|| string_field(item, "cwd"))
+}
+
+fn current_workspace_keys() -> HashSet<String> {
+    ["CMUX_WORKSPACE_ID", "CMUX_WORKSPACE_REF"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+}
+
+fn workspace_item_is_cmux_home_launcher(item: &Value) -> bool {
+    ["title", "description"]
+        .into_iter()
+        .filter_map(|key| string_field(item, key))
+        .any(|value| cmux_home_launcher_label(&value))
+}
+
+fn cmux_home_workspace_refs_from_top(text: &str) -> HashSet<String> {
+    text.lines()
+        .filter_map(|line| {
+            let cols = line.split('\t').collect::<Vec<_>>();
+            if cols.len() < 7 || cols[3] != "workspace" {
+                return None;
+            }
+            cmux_home_launcher_label(cols[6]).then(|| cols[4].to_string())
+        })
+        .collect()
+}
+
+fn top_has_cmux_home_launcher(text: &str) -> bool {
+    text.lines().any(|line| {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols.len() < 7 {
+            return false;
+        }
+        match cols[3] {
+            "workspace" | "surface" => cmux_home_launcher_label(cols[6]),
+            "process" => cmux_home_process_command(cols[6]),
+            _ => false,
+        }
+    })
+}
+
+fn cmux_home_launcher_label(label: &str) -> bool {
+    let label = label.trim();
+    if label.is_empty() {
+        return false;
+    }
+    matches!(label, "cmux-home" | "cmux home")
+        || label == "./scripts/cmux-home.sh"
+        || label == "scripts/cmux-home.sh"
+        || label.ends_with("/scripts/cmux-home.sh")
+}
+
+fn cmux_home_process_command(command: &str) -> bool {
+    let Some(program) = shell_words(command).into_iter().next() else {
+        return false;
+    };
+    let name = Path::new(&program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program.as_str());
+    name == "cmux-home"
 }
 
 #[derive(Default)]
@@ -6090,6 +6207,77 @@ mod tests {
 
         assert!(app.loading_reason.is_none());
         assert!(app.loading_started_at.is_none());
+    }
+
+    #[test]
+    fn refresh_filters_current_cmux_home_workspace() {
+        let mut app = test_app();
+        app.own_workspace_keys = HashSet::from(["self-workspace".to_string()]);
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: vec![
+                WorkspaceStatus {
+                    id: "self-workspace".to_string(),
+                    title: "home".to_string(),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "task-workspace".to_string(),
+                    title: "real task".to_string(),
+                    ..WorkspaceStatus::default()
+                },
+            ],
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, "task-workspace");
+    }
+
+    #[test]
+    fn workspace_refresh_removes_cmux_home_launcher() {
+        let mut app = test_app();
+        app.workspaces = vec![WorkspaceStatus {
+            id: "workspace:home".to_string(),
+            title: "old title".to_string(),
+            ..WorkspaceStatus::default()
+        }];
+
+        app.apply_workspace_refresh(WorkspaceRefresh {
+            reason: "test".to_string(),
+            workspace_id: "workspace:home".to_string(),
+            workspace: Some(WorkspaceStatus {
+                id: "workspace:home".to_string(),
+                title: "./scripts/cmux-home.sh".to_string(),
+                ..WorkspaceStatus::default()
+            }),
+            loaded_at: Instant::now(),
+        });
+
+        assert!(app.workspaces.is_empty());
+    }
+
+    #[test]
+    fn cmux_home_launcher_detection_uses_precise_signals() {
+        let item = json!({
+            "id": "ABC",
+            "ref": "workspace:7",
+            "title": "./scripts/cmux-home.sh"
+        });
+        assert!(workspace_item_is_cmux_home_launcher(&item));
+        assert!(top_has_cmux_home_launcher(
+            "0.0\t1\t1\tprocess\t123\tsurface:9\tcmux-home\n"
+        ));
+        assert_eq!(
+            cmux_home_workspace_refs_from_top(
+                "0.0\t1\t1\tworkspace\tworkspace:7\twindow:1\t./scripts/cmux-home.sh\n"
+            ),
+            HashSet::from(["workspace:7".to_string()])
+        );
+        assert!(!top_has_cmux_home_launcher(
+            "0.0\t1\t1\tprocess\t123\tsurface:9\tcodex prompt mentions cmux-home\n"
+        ));
     }
 
     #[test]
