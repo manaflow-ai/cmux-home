@@ -123,9 +123,9 @@ reuse the right-side helper pane, preserve focus, and verify the surface with
 the TUI is ready.
 
 If the non-focus launch creates an unattached terminal surface, clean it up.
-For this cmux-home reload handoff only, briefly materialize the caller
-workspace to attach the TUI, verify it, then restore the workspace and surface
-that were focused before the reload.
+Do not recover by running `select-workspace`, `focus-panel`, `focus-pane`, or
+other focus-changing cmux commands. Report the cmux CLI/runtime attachment bug
+instead, or use an already-attached cmux-home surface.
 
 ## Change Guidance
 
