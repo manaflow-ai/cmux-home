@@ -2792,27 +2792,20 @@ fn composer_position_from_mouse(
     let target_visual_row =
         visible_start.saturating_add(usize::from(mouse.row.saturating_sub(area.y)));
     let target_col = usize::from(mouse.column.saturating_sub(area.x));
-    let mut visual_row = 0usize;
-    let lines = app.composer.lines();
-    for (row, text) in lines.iter().enumerate() {
-        let text_width = composer_text_width(area.width, row);
-        let visual_count = visual_line_count_for_text(text, text_width);
-        if target_visual_row < visual_row.saturating_add(visual_count) {
-            let chunk_index = target_visual_row.saturating_sub(visual_row);
-            let prompt_width = composer_prompt_width(row);
-            let chunk_col = target_col.saturating_sub(prompt_width).min(text_width);
-            let col = chunk_index
-                .saturating_mul(text_width)
-                .saturating_add(chunk_col)
-                .min(text.chars().count());
-            return Some((row, col));
-        }
-        visual_row = visual_row.saturating_add(visual_count);
+    let layout = wrapped_composer_layout(app, area.width);
+    if let Some(line) = layout.get(target_visual_row) {
+        let prompt_width = composer_prompt_width(line.source_row);
+        let chunk_width = line.end_col.saturating_sub(line.start_col);
+        let chunk_col = target_col.saturating_sub(prompt_width).min(chunk_width);
+        return Some((line.source_row, line.start_col.saturating_add(chunk_col)));
     }
 
-    lines
-        .last()
-        .map(|line| (lines.len().saturating_sub(1), line.chars().count()))
+    app.composer.lines().last().map(|line| {
+        (
+            app.composer.lines().len().saturating_sub(1),
+            line.chars().count(),
+        )
+    })
 }
 
 fn composer_position_from_mouse_clamped(
@@ -3350,26 +3343,51 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn wrapped_composer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+    wrapped_composer_layout(app, width)
+        .into_iter()
+        .map(|line| Line::from(line.spans))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct ComposerVisualLine {
+    source_row: usize,
+    start_col: usize,
+    end_col: usize,
+    spans: Vec<Span<'static>>,
+}
+
+fn wrapped_composer_layout(app: &App, width: u16) -> Vec<ComposerVisualLine> {
+    let mut visual_lines = Vec::new();
     for (row, text) in app.composer.lines().iter().enumerate() {
         let text_width = composer_text_width(width, row);
         let content = render_composer_content_spans(app, row, text);
-        let chunks = wrap_spans(content, text_width);
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
+        let ranges = word_wrap_ranges(text, text_width);
+        for (chunk_index, (start_col, end_col)) in ranges.into_iter().enumerate() {
             let prompt = if row == 0 && chunk_index == 0 {
                 COMPOSER_PROMPT
             } else {
                 COMPOSER_CONTINUATION_PROMPT
             };
             let mut spans = vec![Span::styled(prompt, muted_style())];
-            spans.extend(chunk);
-            lines.push(Line::from(spans));
+            spans.extend(slice_spans(&content, start_col, end_col));
+            visual_lines.push(ComposerVisualLine {
+                source_row: row,
+                start_col,
+                end_col,
+                spans,
+            });
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::raw(""));
+    if visual_lines.is_empty() {
+        visual_lines.push(ComposerVisualLine {
+            source_row: 0,
+            start_col: 0,
+            end_col: 0,
+            spans: vec![Span::raw("")],
+        });
     }
-    lines
+    visual_lines
 }
 
 fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<'static>> {
@@ -3437,25 +3455,74 @@ fn render_composer_content_spans(app: &App, row: usize, text: &str) -> Vec<Span<
     spans
 }
 
-fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+fn word_wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
-    let mut rows = vec![Vec::new()];
-    let mut col = 0;
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        while start < chars.len() && !ranges.is_empty() && chars[start].is_whitespace() {
+            start += 1;
+        }
+        if start >= chars.len() {
+            break;
+        }
+        let max_end = start.saturating_add(width).min(chars.len());
+        if max_end == chars.len() {
+            ranges.push((start, chars.len()));
+            break;
+        }
+        if chars[max_end].is_whitespace() {
+            ranges.push((start, max_end));
+            start = max_end + 1;
+            continue;
+        }
+        let word_break = (start + 1..max_end)
+            .rev()
+            .find(|index| chars[*index].is_whitespace())
+            .filter(|index| *index > start);
+        let end = word_break.unwrap_or(max_end).max(start + 1);
+        ranges.push((start, end));
+        start = if word_break.is_some() { end + 1 } else { end };
+    }
+    if ranges.is_empty() {
+        ranges.push((0, 0));
+    }
+    ranges
+}
+
+fn slice_spans(spans: &[Span<'static>], start: usize, end: usize) -> Vec<Span<'static>> {
+    if start >= end {
+        return Vec::new();
+    }
+    let mut sliced = Vec::new();
+    let mut offset = 0usize;
     for span in spans {
         let style = span.style;
-        let content = span.content.to_string();
-        for ch in content.chars() {
-            if col >= width {
-                rows.push(Vec::new());
-                col = 0;
-            }
-            rows.last_mut()
-                .expect("wrapped composer rows are initialized")
-                .push(Span::styled(ch.to_string(), style));
-            col += 1;
+        let chars = span.content.chars().collect::<Vec<_>>();
+        let span_start = offset;
+        let span_end = offset + chars.len();
+        if span_end <= start {
+            offset = span_end;
+            continue;
         }
+        if span_start >= end {
+            break;
+        }
+        let local_start = start.saturating_sub(span_start);
+        let local_end = end.min(span_end).saturating_sub(span_start);
+        if local_start < local_end {
+            sliced.push(Span::styled(
+                chars[local_start..local_end].iter().collect::<String>(),
+                style,
+            ));
+        }
+        offset = span_end;
     }
-    rows
+    sliced
 }
 
 fn composer_selection_for_row(app: &App, row: usize, text: &str) -> Option<(usize, usize)> {
@@ -3564,42 +3631,35 @@ fn composer_text_width(width: u16, row: usize) -> usize {
         .max(1)
 }
 
-fn visual_line_count_for_text(text: &str, width: usize) -> usize {
-    let len = text.chars().count();
-    if len == 0 {
-        1
-    } else {
-        len.div_ceil(width.max(1))
-    }
-}
-
 fn composer_visual_line_count(app: &App, width: u16) -> usize {
-    app.composer
-        .lines()
-        .iter()
-        .enumerate()
-        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
-        .sum::<usize>()
-        .max(1)
+    wrapped_composer_layout(app, width).len().max(1)
 }
 
 fn composer_cursor_visual_position(app: &App, width: u16) -> (usize, usize) {
     let (cursor_row, cursor_col) = app.composer.cursor();
-    let visual_row_before_cursor = app
-        .composer
-        .lines()
-        .iter()
-        .enumerate()
-        .take(cursor_row)
-        .map(|(row, text)| visual_line_count_for_text(text, composer_text_width(width, row)))
-        .sum::<usize>();
-    let text_width = composer_text_width(width, cursor_row);
-    let (row_offset, col_offset) = if cursor_col > 0 && cursor_col % text_width == 0 {
-        ((cursor_col - 1) / text_width, text_width.saturating_sub(1))
-    } else {
-        (cursor_col / text_width, cursor_col % text_width)
-    };
-    (visual_row_before_cursor + row_offset, col_offset)
+    let layout = wrapped_composer_layout(app, width);
+    let mut fallback = (0usize, 0usize);
+    for (visual_row, line) in layout.iter().enumerate() {
+        fallback = (
+            visual_row,
+            line.end_col.saturating_sub(line.start_col).min(cursor_col),
+        );
+        if line.source_row < cursor_row {
+            continue;
+        }
+        if line.source_row > cursor_row {
+            break;
+        }
+        if cursor_col <= line.end_col {
+            return (
+                visual_row,
+                cursor_col
+                    .saturating_sub(line.start_col)
+                    .min(line.end_col.saturating_sub(line.start_col)),
+            );
+        }
+    }
+    fallback
 }
 
 fn composer_visible_start(app: &App, height: usize, width: u16) -> usize {
@@ -5544,6 +5604,57 @@ mod tests {
         let position = composer_position_from_mouse(&app, area, &mouse);
 
         assert_eq!(position, Some((0, 4)));
+    }
+
+    #[test]
+    fn composer_wraps_on_words_when_possible() {
+        let ranges = word_wrap_ranges("hello world test", 8);
+
+        assert_eq!(ranges, vec![(0, 5), (6, 11), (12, 16)]);
+    }
+
+    #[test]
+    fn composer_cursor_position_uses_word_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let position = composer_cursor_visual_position(&app, 10);
+
+        assert_eq!(position, (1, 5));
+    }
+
+    #[test]
+    fn composer_mouse_position_uses_word_wrapping() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        let area = Rect::new(0, 0, 10, 2);
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let position = composer_position_from_mouse(&app, area, &mouse);
+
+        assert_eq!(position, Some((0, 6)));
     }
 
     #[test]
