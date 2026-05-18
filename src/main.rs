@@ -1673,7 +1673,7 @@ impl App {
                 ("claude_env", &self.claude_env_args),
             ],
         );
-        (command, accepts_prompt)
+        (wrap_agent_terminal_command(&command), accepts_prompt)
     }
 
     fn submit_template(&self) -> Option<&str> {
@@ -1953,6 +1953,12 @@ fn optimistic_workspace_status(
         }),
         updated_at: Some(Instant::now()),
     }
+}
+
+fn wrap_agent_terminal_command(command: &str) -> String {
+    let script =
+        format!("{command}\nstty sane 2>/dev/null || true\nexec \"${{SHELL:-/bin/zsh}}\" -l");
+    format!("/bin/zsh -lc {}", shell_quote(&script))
 }
 
 fn main() -> Result<()> {
@@ -5716,6 +5722,37 @@ mod tests {
             .workspaces
             .iter()
             .all(|workspace| workspace.id != "pending:1"));
+    }
+
+    #[test]
+    fn agent_terminal_command_keeps_workspace_alive_after_exit() {
+        let command = wrap_agent_terminal_command("codex --yolo 'hello'");
+
+        assert!(command.starts_with("/bin/zsh -lc "));
+        assert!(command.contains("codex --yolo"));
+        assert!(command.contains("stty sane 2>/dev/null || true"));
+        assert!(command.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn rendered_agent_command_preserves_prompt_detection_when_wrapped() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "printf agent {prompt}".to_string(),
+            codex_plan_command: "printf plan {prompt}".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.provider = AgentKind::Codex;
+
+        let (command, accepts_prompt) = app.render_agent_command(&[], "hello");
+
+        assert!(accepts_prompt);
+        assert!(command.starts_with("/bin/zsh -lc "));
+        assert!(command.contains("printf agent"));
+        assert!(command.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
     }
 
     #[test]
