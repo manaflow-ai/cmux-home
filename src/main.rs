@@ -3945,39 +3945,54 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn draw_empty_workspace_state(frame: &mut Frame<'_>, area: Rect) {
-    let logo = welcome_icon_lines();
+    let logo = welcome_logo_lines();
     let logo_height = logo.len() as u16;
     if area.width == 0 || area.height < logo_height {
         return;
     }
+    let logo_width = logo.iter().map(line_width).max().unwrap_or(0) as u16;
+    let x = area.x + area.width.saturating_sub(logo_width) / 2;
     let y = area.y + area.height.saturating_sub(logo_height) / 2;
     for (index, line) in logo.into_iter().enumerate() {
-        let width = line_width(&line) as u16;
-        let x = area.x + area.width.saturating_sub(width) / 2;
         frame.render_widget(
             Paragraph::new(line),
-            Rect::new(x, y + index as u16, width.min(area.width), 1),
+            Rect::new(x, y + index as u16, logo_width.min(area.width), 1),
         );
     }
 }
 
-fn welcome_icon_lines() -> Vec<Line<'static>> {
+fn welcome_logo_lines() -> Vec<Line<'static>> {
     vec![
-        welcome_icon_line(0, "  ::"),
-        welcome_icon_line(1, "    ::::"),
-        welcome_icon_line(2, "      ::::::"),
-        welcome_icon_line(3, "        ::::::"),
-        welcome_icon_line(4, "      ::::::"),
-        welcome_icon_line(5, "    ::::"),
-        welcome_icon_line(6, "  ::"),
+        welcome_logo_mark_line(0, "  ::"),
+        Line::from(vec![
+            Span::styled("    ::::", welcome_logo_style(1)),
+            Span::raw("              "),
+            Span::styled("c", welcome_logo_style(0)),
+            Span::styled("m", welcome_logo_style(1)),
+            Span::styled("u", welcome_logo_style(2)),
+            Span::styled("x", welcome_logo_style(6)),
+        ]),
+        welcome_logo_mark_line(2, "      ::::::"),
+        Line::from(vec![
+            Span::styled("        ::::::", welcome_logo_style(3)),
+            Span::raw("        "),
+            Span::styled("the open source terminal", welcome_tagline_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("      ::::::", welcome_logo_style(4)),
+            Span::raw("          "),
+            Span::styled("built for coding agents", welcome_tagline_style()),
+        ]),
+        welcome_logo_mark_line(5, "    ::::"),
+        welcome_logo_mark_line(6, "  ::"),
     ]
 }
 
-fn welcome_icon_line(index: usize, text: &'static str) -> Line<'static> {
-    Line::from(Span::styled(text, welcome_icon_style(index)))
+fn welcome_logo_mark_line(index: usize, text: &'static str) -> Line<'static> {
+    Line::from(Span::styled(text, welcome_logo_style(index)))
 }
 
-fn welcome_icon_style(index: usize) -> Style {
+fn welcome_logo_style(index: usize) -> Style {
     let colors = [
         Color::Rgb(0, 212, 255),
         Color::Rgb(24, 181, 250),
@@ -3988,6 +4003,10 @@ fn welcome_icon_style(index: usize) -> Style {
         Color::Rgb(124, 58, 237),
     ];
     Style::default().fg(colors[index.min(colors.len() - 1)])
+}
+
+fn welcome_tagline_style() -> Style {
+    Style::default().fg(Color::Rgb(130, 130, 140))
 }
 
 fn line_width(line: &Line<'_>) -> usize {
@@ -6290,15 +6309,35 @@ mod tests {
     }
 
     #[test]
-    fn welcome_icon_lines_match_cmux_welcome_mark() {
-        let lines = welcome_icon_lines();
+    fn welcome_logo_lines_match_cmux_welcome_logo() {
+        let lines = welcome_logo_lines();
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 7);
         assert_eq!(
-            lines.iter().map(line_width).collect::<Vec<_>>(),
-            vec![4, 8, 12, 14, 12, 8, 4]
+            text,
+            vec![
+                "  ::",
+                "    ::::              cmux",
+                "      ::::::",
+                "        ::::::        the open source terminal",
+                "      ::::::          built for coding agents",
+                "    ::::",
+                "  ::",
+            ]
         );
         assert_eq!(lines[0].spans[0].style.fg, Some(Color::Rgb(0, 212, 255)));
+        assert_eq!(lines[1].spans[2].style.fg, Some(Color::Rgb(0, 212, 255)));
+        assert_eq!(lines[1].spans[5].style.fg, Some(Color::Rgb(124, 58, 237)));
+        assert_eq!(lines[3].spans[2].style.fg, Some(Color::Rgb(130, 130, 140)));
         assert_eq!(lines[6].spans[0].style.fg, Some(Color::Rgb(124, 58, 237)));
     }
 
