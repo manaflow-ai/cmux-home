@@ -341,6 +341,7 @@ struct App {
     image_paths: Vec<String>,
     selected_image: Option<ImageSelection>,
     composer_drag_anchor: Option<(usize, usize)>,
+    composer_goal_visual_col: Option<usize>,
     stashes: Vec<PersistedDraft>,
     history: Vec<PersistedDraft>,
     state_path: PathBuf,
@@ -442,6 +443,7 @@ impl App {
             image_paths: Vec::new(),
             selected_image: None,
             composer_drag_anchor: None,
+            composer_goal_visual_col: None,
             stashes: persisted.stashes,
             history: persisted.history,
             state_path,
@@ -925,6 +927,7 @@ impl App {
         self.image_paths.clear();
         self.selected_image = None;
         self.composer_drag_anchor = None;
+        self.composer_goal_visual_col = None;
         self.composer_mode = ComposerMode::NewWorkspace;
         self.status_line = format!("starting {} workspace", self.agent_label());
         if let Err(err) = submit_tx.send(request) {
@@ -1058,6 +1061,7 @@ impl App {
         self.composer = composer_from_lines(vec![workspace.title]);
         self.composer.select_all();
         self.composer_drag_anchor = None;
+        self.composer_goal_visual_col = None;
         self.composer_mode = ComposerMode::RenameWorkspace(workspace.id);
         self.status_line = "renaming workspace".to_string();
         true
@@ -1086,6 +1090,7 @@ impl App {
         self.image_paths.clear();
         self.selected_image = None;
         self.composer_drag_anchor = None;
+        self.composer_goal_visual_col = None;
         self.composer_mode = ComposerMode::NewWorkspace;
         self.sync_focus_after_composer_change();
     }
@@ -1155,6 +1160,7 @@ impl App {
         self.image_paths = draft.image_paths;
         self.selected_image = None;
         self.composer_drag_anchor = None;
+        self.composer_goal_visual_col = None;
         self.provider = AgentKind::from_label(&draft.provider).unwrap_or(AgentKind::Codex);
         self.plan_mode = draft.plan_mode;
         self.composer_mode = ComposerMode::NewWorkspace;
@@ -1463,6 +1469,7 @@ impl App {
     }
 
     fn sync_focus_after_composer_change(&mut self) {
+        self.composer_goal_visual_col = None;
         if self.autocomplete_is_active() {
             self.focus_target = FocusTarget::Autocomplete;
             self.clamp_autocomplete_selection();
@@ -1619,11 +1626,15 @@ impl App {
 
     fn toggle_provider(&mut self) {
         self.provider = self.provider.toggle();
+        self.selected_image = None;
+        self.composer_goal_visual_col = None;
         self.status_line = format!("agent {}", self.agent_label());
     }
 
     fn toggle_plan_mode(&mut self) {
         self.plan_mode = !self.plan_mode;
+        self.selected_image = None;
+        self.composer_goal_visual_col = None;
         self.status_line = format!("mode {}", self.agent_label());
     }
 
@@ -2246,6 +2257,7 @@ fn handle_key(
             modifiers: KeyModifiers::NONE,
             ..
         } => {
+            app.composer_goal_visual_col = None;
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
                 app.sync_focus_after_composer_change();
@@ -2256,6 +2268,7 @@ fn handle_key(
             modifiers: KeyModifiers::NONE,
             ..
         } => {
+            app.composer_goal_visual_col = None;
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
                 app.sync_focus_after_composer_change();
@@ -2445,6 +2458,7 @@ fn handle_composer_key(
             modifiers: KeyModifiers::NONE,
             ..
         } => {
+            app.composer_goal_visual_col = None;
             if !navigate_image_token(app, CursorMove::Back) {
                 app.composer.input(key);
                 app.sync_focus_after_composer_change();
@@ -2455,13 +2469,38 @@ fn handle_composer_key(
             modifiers: KeyModifiers::NONE,
             ..
         } => {
+            app.composer_goal_visual_col = None;
             if !navigate_image_token(app, CursorMove::Forward) {
                 app.composer.input(key);
                 app.sync_focus_after_composer_change();
             }
         }
         KeyEvent {
-            code: KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down,
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Up,
+                true,
+            );
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Down,
+                true,
+            );
+        }
+        KeyEvent {
+            code: KeyCode::Left | KeyCode::Right,
             modifiers: KeyModifiers::SHIFT,
             ..
         } => {
@@ -2508,11 +2547,46 @@ fn handle_composer_key(
             app.select_next_autocomplete();
         }
         KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Up,
+                false,
+            );
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Down,
+                false,
+            );
+        }
+        KeyEvent {
             code: KeyCode::Char('a'),
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
             app.selected_image = None;
+            app.composer_goal_visual_col = None;
             move_to_visual_line_start_or_previous_line(app, composer_area(app, screen_area).width);
         }
         KeyEvent {
@@ -2521,6 +2595,7 @@ fn handle_composer_key(
             ..
         } => {
             app.selected_image = None;
+            app.composer_goal_visual_col = None;
             move_to_visual_line_end_or_next_line(app, composer_area(app, screen_area).width);
         }
         _ => {
@@ -3205,6 +3280,62 @@ fn move_to_visual_line_end_or_next_line(app: &mut App, width: u16) {
         (line.source_row, line.end_col)
     };
     move_composer_cursor_to(&mut app.composer, target);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualLineDirection {
+    Up,
+    Down,
+}
+
+fn move_visual_line(app: &mut App, width: u16, direction: VisualLineDirection, selecting: bool) {
+    let layout = wrapped_composer_layout(app, width);
+    let Some((index, line)) = current_composer_visual_line_from_layout(app, &layout) else {
+        return;
+    };
+    let (_, cursor_col) = app.composer.cursor();
+    let current_visual_col = cursor_col
+        .saturating_sub(line.start_col)
+        .min(line.end_col.saturating_sub(line.start_col));
+    let goal_col = app.composer_goal_visual_col.unwrap_or(current_visual_col);
+
+    if !selecting {
+        app.composer.cancel_selection();
+    }
+
+    let target_index = match direction {
+        VisualLineDirection::Up => index.checked_sub(1),
+        VisualLineDirection::Down => (index + 1 < layout.len()).then_some(index + 1),
+    };
+    let Some(target_index) = target_index else {
+        app.selected_image = None;
+        app.composer_goal_visual_col = Some(goal_col);
+        return;
+    };
+
+    let target = &layout[target_index];
+    let target_len = target.end_col.saturating_sub(target.start_col);
+    let target_position = (
+        target.source_row,
+        target.start_col.saturating_add(goal_col.min(target_len)),
+    );
+    if selecting {
+        move_composer_cursor_with_selection(app, target_position);
+    } else {
+        move_composer_cursor_to(&mut app.composer, target_position);
+    }
+    app.selected_image = None;
+    app.composer_goal_visual_col = Some(goal_col);
+}
+
+fn move_composer_cursor_with_selection(app: &mut App, position: (usize, usize)) {
+    let cursor = app.composer.cursor();
+    let anchor = app
+        .composer
+        .selection_range()
+        .map(|(start, end)| if cursor == start { end } else { start })
+        .unwrap_or(cursor);
+    set_composer_selection(app, anchor, position);
 }
 
 fn current_composer_visual_line(app: &App, width: u16) -> Option<(usize, ComposerVisualLine)> {
@@ -5322,6 +5453,18 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_app() -> App {
+        App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        })
+    }
+
     #[test]
     fn parses_codex_session_ids_from_top_tags() {
         let top = "\
@@ -5732,15 +5875,7 @@ mod tests {
 
     #[test]
     fn ctrl_a_e_use_visual_wrapped_lines() {
-        let mut app = App::new(Args {
-            socket: Some("/tmp/cmux-home-test.sock".to_string()),
-            workspace_cwd: Some(".".to_string()),
-            config: None,
-            codex_command: "codex".to_string(),
-            codex_plan_command: "codex".to_string(),
-            claude_command: "claude".to_string(),
-            claude_plan_command: "claude --permission-mode plan".to_string(),
-        });
+        let mut app = test_app();
         app.composer = composer_from_lines(vec!["hello world".to_string()]);
         app.composer.move_cursor(CursorMove::End);
 
@@ -5755,6 +5890,76 @@ mod tests {
 
         move_to_visual_line_end_or_next_line(&mut app, 10);
         assert_eq!(app.composer.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn ctrl_n_p_use_visual_wrapped_lines() {
+        let mut app = test_app();
+        app.composer = composer_from_lines(vec!["hello world test".to_string()]);
+
+        move_composer_cursor_to(&mut app.composer, (0, 5));
+        move_visual_line(&mut app, 10, VisualLineDirection::Down, false);
+        assert_eq!(app.composer.cursor(), (0, 11));
+
+        move_visual_line(&mut app, 10, VisualLineDirection::Up, false);
+        assert_eq!(app.composer.cursor(), (0, 5));
+
+        move_composer_cursor_to(&mut app.composer, (0, 16));
+        app.composer_goal_visual_col = None;
+        move_visual_line(&mut app, 10, VisualLineDirection::Up, false);
+        assert_eq!(app.composer.cursor(), (0, 10));
+    }
+
+    #[test]
+    fn ctrl_n_p_key_events_move_visual_lines_when_typing() {
+        let mut app = test_app();
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 10, 20);
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+            area,
+        )
+        .expect("ctrl+p");
+        assert_eq!(app.composer.cursor(), (0, 5));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &tx,
+            area,
+        )
+        .expect("ctrl+n");
+        assert_eq!(app.composer.cursor(), (0, 11));
+    }
+
+    #[test]
+    fn visual_vertical_navigation_preserves_goal_column() {
+        let mut app = test_app();
+        app.composer = composer_from_lines(vec!["abcdefgh ij klmnopqrst".to_string()]);
+
+        move_composer_cursor_to(&mut app.composer, (0, 8));
+        move_visual_line(&mut app, 10, VisualLineDirection::Down, false);
+        assert_eq!(app.composer.cursor(), (0, 11));
+
+        move_visual_line(&mut app, 10, VisualLineDirection::Down, false);
+        assert_eq!(app.composer.cursor(), (0, 20));
+    }
+
+    #[test]
+    fn shift_up_down_select_visual_wrapped_lines() {
+        let mut app = test_app();
+        app.composer = composer_from_lines(vec!["hello world".to_string()]);
+
+        move_composer_cursor_to(&mut app.composer, (0, 0));
+        move_visual_line(&mut app, 10, VisualLineDirection::Down, true);
+
+        assert_eq!(app.composer.cursor(), (0, 6));
+        assert_eq!(app.composer.selection_range(), Some(((0, 0), (0, 6))));
     }
 
     #[test]
