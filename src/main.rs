@@ -229,12 +229,16 @@ struct Args {
     )]
     codex_plan_command: String,
 
-    #[arg(long, default_value = "claude", env = "CMUX_AGENT_TUI_CLAUDE_COMMAND")]
+    #[arg(
+        long,
+        default_value = "claude {prompt}",
+        env = "CMUX_AGENT_TUI_CLAUDE_COMMAND"
+    )]
     claude_command: String,
 
     #[arg(
         long,
-        default_value = "claude --permission-mode plan",
+        default_value = "claude --permission-mode plan {prompt}",
         env = "CMUX_AGENT_TUI_CLAUDE_PLAN_COMMAND"
     )]
     claude_plan_command: String,
@@ -302,6 +306,7 @@ struct SubmitSuccess {
 #[derive(Debug)]
 struct SubmitFailure {
     pending_id: String,
+    draft: PersistedDraft,
     error: String,
 }
 
@@ -474,6 +479,14 @@ impl App {
             app.status_line = "restored draft".to_string();
         }
         app
+    }
+
+    fn has_active_animation(&self) -> bool {
+        self.loading_reason.is_some()
+            || self
+                .workspaces
+                .iter()
+                .any(|workspace| display_group(workspace.agent_state()) == AgentState::Working)
     }
 
     fn selected_workspace(&self) -> Option<&WorkspaceStatus> {
@@ -1015,8 +1028,9 @@ impl App {
 
     fn apply_submit_failure(&mut self, failure: SubmitFailure) {
         self.remove_pending_workspace(&failure.pending_id);
+        self.restore_draft(failure.draft);
         self.status_line = format!(
-            "start failed, saved to history: {}",
+            "start failed, draft restored: {}",
             truncate(&failure.error, 80)
         );
     }
@@ -2034,10 +2048,18 @@ fn run_tui(
     let result = (|| -> Result<()> {
         let mut pending_refresh: Option<RefreshRequest> = None;
         let mut last_refresh_request = Instant::now();
+        let mut needs_draw = true;
+        let mut last_periodic_draw = Instant::now();
         loop {
-            terminal.draw(|frame| draw(frame, app))?;
+            if needs_draw {
+                terminal.draw(|frame| draw(frame, app))?;
+                needs_draw = false;
+                last_periodic_draw = Instant::now();
+            }
 
+            let mut processed_ui_event = false;
             while let Ok(ui_event) = rx.try_recv() {
+                processed_ui_event = true;
                 match ui_event {
                     UiEvent::CmuxEvent(frame) => {
                         pending_refresh =
@@ -2060,36 +2082,61 @@ fn run_tui(
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
                 }
             }
+            if processed_ui_event {
+                needs_draw = true;
+            }
 
-            if event::poll(Duration::from_millis(16))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-                        let size = terminal.size()?;
-                        let screen_area = Rect::new(0, 0, size.width, size.height);
-                        match handle_key(app, key, &submit_tx, screen_area)? {
-                            KeyAction::Continue => {}
-                            KeyAction::Quit => break,
-                            KeyAction::Refresh(reason) => {
-                                pending_refresh = merge_refresh_request(
-                                    pending_refresh,
-                                    Some(RefreshRequest::All(reason)),
-                                );
+            if !needs_draw {
+                let periodic_draw_interval = if app.has_active_animation() {
+                    Duration::from_millis(140)
+                } else {
+                    Duration::from_secs(1)
+                };
+                if last_periodic_draw.elapsed() >= periodic_draw_interval {
+                    needs_draw = true;
+                } else {
+                    let poll_timeout = periodic_draw_interval
+                        .saturating_sub(last_periodic_draw.elapsed())
+                        .min(Duration::from_millis(50));
+                    if event::poll(poll_timeout)? {
+                        match event::read()? {
+                            Event::Key(key) => {
+                                if key.kind != KeyEventKind::Press {
+                                    continue;
+                                }
+                                let size = terminal.size()?;
+                                let screen_area = Rect::new(0, 0, size.width, size.height);
+                                match handle_key(app, key, &submit_tx, screen_area)? {
+                                    KeyAction::Continue => {}
+                                    KeyAction::Quit => break,
+                                    KeyAction::Refresh(reason) => {
+                                        pending_refresh = merge_refresh_request(
+                                            pending_refresh,
+                                            Some(RefreshRequest::All(reason)),
+                                        );
+                                    }
+                                }
+                                app.persist_state();
+                                needs_draw = true;
+                            }
+                            Event::Mouse(mouse) => {
+                                let size = terminal.size()?;
+                                handle_mouse(app, mouse, Rect::new(0, 0, size.width, size.height));
+                                needs_draw = true;
+                            }
+                            Event::Paste(text) => {
+                                handle_paste(app, &text);
+                                app.persist_state();
+                                needs_draw = true;
+                            }
+                            Event::Resize(_, _) => {
+                                needs_draw = true;
+                            }
+                            _ => {
+                                needs_draw = true;
                             }
                         }
-                        app.persist_state();
                     }
-                    Event::Mouse(mouse) => {
-                        let size = terminal.size()?;
-                        handle_mouse(app, mouse, Rect::new(0, 0, size.width, size.height));
-                    }
-                    Event::Paste(text) => {
-                        handle_paste(app, &text);
-                        app.persist_state();
-                    }
-                    _ => {}
                 }
             }
 
@@ -2100,6 +2147,7 @@ fn run_tui(
                     app.begin_loading(refresh_request_reason(&reason));
                     let _ = refresh_tx.send(reason);
                     last_refresh_request = Instant::now();
+                    needs_draw = true;
                 }
             }
         }
@@ -4470,9 +4518,9 @@ fn render_workspace_row(
         .unwrap_or_else(|| "-".to_string());
     let group = display_group(state);
     let unread = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention {
-        "  ∙"
+        "   ∙"
     } else {
-        "   "
+        "    "
     };
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let marker = match group {
@@ -4750,7 +4798,8 @@ fn run_submit_request(request: SubmitRequest) -> std::result::Result<SubmitSucce
             latest_message: request.latest_message,
         }),
         Err(err) => Err(SubmitFailure {
-            pending_id: request.pending_id,
+            pending_id: request.pending_id.clone(),
+            draft: draft_from_submit_request(&request),
             error: err.to_string(),
         }),
     }
@@ -6309,6 +6358,26 @@ mod tests {
     }
 
     #[test]
+    fn workspace_row_places_unread_indicator_one_cell_right() {
+        let workspace = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix layout".to_string(),
+            latest_message: "needs input".to_string(),
+            unread_notifications: 1,
+            ..WorkspaceStatus::default()
+        };
+
+        let line = render_workspace_row(Some(&workspace), false, 80, 0);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("   ∙"));
+    }
+
+    #[test]
     fn welcome_logo_lines_match_cmux_welcome_logo() {
         let lines = welcome_logo_lines();
         let text = lines
@@ -6395,6 +6464,39 @@ mod tests {
             Some(vec!["instant submit".to_string()])
         );
         let _ = fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn submit_failure_restores_failed_draft() {
+        let mut app = test_app();
+        app.workspaces = vec![optimistic_workspace_status(
+            "pending:1",
+            "codex: retry me".to_string(),
+            "retry me".to_string(),
+        )];
+        app.composer = new_composer();
+        app.image_paths.clear();
+        app.provider = AgentKind::Codex;
+        app.plan_mode = false;
+
+        app.apply_submit_failure(SubmitFailure {
+            pending_id: "pending:1".to_string(),
+            draft: PersistedDraft {
+                lines: vec!["retry me".to_string()],
+                image_paths: vec!["/tmp/screenshot.png".to_string()],
+                provider: "claude".to_string(),
+                plan_mode: true,
+                saved_at_ms: 123,
+            },
+            error: "connect /tmp/cmux-home-test.sock: Connection refused".to_string(),
+        });
+
+        assert!(app.workspaces.is_empty());
+        assert_eq!(app.composer.lines().join("\n"), "retry me");
+        assert_eq!(app.image_paths, vec!["/tmp/screenshot.png".to_string()]);
+        assert_eq!(app.provider, AgentKind::Claude);
+        assert!(app.plan_mode);
+        assert!(app.status_line.contains("draft restored"));
     }
 
     #[test]
@@ -6501,6 +6603,27 @@ mod tests {
         assert!(command.starts_with("/bin/zsh -lc "));
         assert!(command.contains("printf agent"));
         assert!(command.contains("exec \"${SHELL:-/bin/zsh}\" -l"));
+    }
+
+    #[test]
+    fn rendered_claude_command_passes_prompt_positionally() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex {prompt}".to_string(),
+            codex_plan_command: "codex {prompt}".to_string(),
+            claude_command: "claude --dangerously-skip-permissions {prompt}".to_string(),
+            claude_plan_command: "claude --permission-mode plan {prompt}".to_string(),
+        });
+        app.provider = AgentKind::Claude;
+
+        let (command, accepts_prompt) = app.render_agent_command(&[], "hello claude");
+
+        assert!(accepts_prompt);
+        assert!(command.contains("claude --dangerously-skip-permissions"));
+        assert!(command.contains("hello claude"));
+        assert!(command.starts_with("/bin/zsh -lc "));
     }
 
     #[test]
