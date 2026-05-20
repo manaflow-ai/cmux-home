@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,6 +87,55 @@ pub(crate) fn load_skill_entries(workspace_cwd: &str) -> Vec<SkillEntry> {
             .then_with(|| a.name.cmp(&b.name))
     });
     skills
+}
+
+pub(crate) fn skill_watch_roots(workspace_cwd: &str) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let workspace = PathBuf::from(workspace_cwd);
+
+    push_watch_root(&mut roots, &mut seen, workspace.join(".codex/skills"));
+    push_watch_root(&mut roots, &mut seen, workspace.join(".claude/skills"));
+    push_watch_root(&mut roots, &mut seen, workspace.join(".agents/skills"));
+    push_watch_root(&mut roots, &mut seen, workspace.join("skills"));
+
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".codex")));
+    if let Some(codex_home) = codex_home {
+        push_watch_root(&mut roots, &mut seen, codex_home.join("skills"));
+        push_watch_root(&mut roots, &mut seen, codex_home.join("plugins/cache"));
+    }
+
+    if let Some(home) = home.as_ref() {
+        push_watch_root(&mut roots, &mut seen, home.join(".agents/skills"));
+    }
+
+    let claude_home = std::env::var_os("CLAUDE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")));
+    if let Some(claude_home) = claude_home {
+        push_watch_root(&mut roots, &mut seen, claude_home.join("skills"));
+        push_watch_root(&mut roots, &mut seen, claude_home.join("plugins/cache"));
+        push_watch_root(
+            &mut roots,
+            &mut seen,
+            claude_home.join("plugins/marketplaces"),
+        );
+    }
+
+    roots
+}
+
+fn push_watch_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if !path.is_dir() {
+        return;
+    }
+    let key = fs::canonicalize(&path).unwrap_or(path);
+    if seen.insert(key.clone()) {
+        roots.push(key);
+    }
 }
 
 fn scan_plugin_skill_roots(

@@ -20,6 +20,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ignore::WalkBuilder;
+use notify::{
+    event::EventKind as NotifyEventKind, Config as NotifyConfig, RecommendedWatcher, RecursiveMode,
+    Watcher,
+};
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
 use ratatui::backend::CrosstermBackend;
@@ -52,7 +56,7 @@ use events::{
 use model::{
     display_group, AgentKind, AgentState, ConversationActor, ConversationSnapshot, WorkspaceStatus,
 };
-use skills::{load_skill_entries, SkillEntry};
+use skills::{load_skill_entries, skill_watch_roots, SkillEntry};
 use util::{
     contains_any, now_millis, one_line_preview, shell_quote, shell_words, time_ago, truncate,
     user_home,
@@ -250,6 +254,7 @@ enum UiEvent {
     Snapshot(Result<RefreshSnapshot, String>),
     WorkspaceSnapshot(Result<WorkspaceRefresh, String>),
     SubmitResult(std::result::Result<SubmitSuccess, SubmitFailure>),
+    SkillsChanged(Vec<SkillEntry>),
     StreamError(String),
 }
 
@@ -647,6 +652,18 @@ impl App {
         self.last_refresh = Some(snapshot.loaded_at);
         self.finish_loading();
         self.status_line = snapshot.reason;
+    }
+
+    fn apply_skills_changed(&mut self, skills: Vec<SkillEntry>) {
+        let previous_count = self.skills.len();
+        self.skills = skills;
+        self.clamp_autocomplete_selection();
+        let count = self.skills.len();
+        self.status_line = if count == previous_count {
+            format!("reloaded {count} skills")
+        } else {
+            format!("reloaded {count} skills ({previous_count} before)")
+        };
     }
 
     fn begin_loading(&mut self, reason: impl Into<String>) {
@@ -2021,6 +2038,7 @@ fn main() -> Result<()> {
     let (submit_tx, submit_rx) = mpsc::channel();
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
     spawn_submit_worker(submit_rx, ui_tx.clone());
+    spawn_skill_watcher(app.workspace_cwd.clone(), ui_tx.clone());
     spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
@@ -2079,6 +2097,7 @@ fn run_tui(
                     }
                     UiEvent::SubmitResult(Ok(success)) => app.apply_submit_success(success),
                     UiEvent::SubmitResult(Err(failure)) => app.apply_submit_failure(failure),
+                    UiEvent::SkillsChanged(skills) => app.apply_skills_changed(skills),
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
                 }
             }
@@ -4946,6 +4965,56 @@ fn spawn_refresh_worker(
     });
 }
 
+fn spawn_skill_watcher(workspace_cwd: String, tx: Sender<UiEvent>) {
+    thread::spawn(move || {
+        let roots = skill_watch_roots(&workspace_cwd);
+        if roots.is_empty() {
+            return;
+        }
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut watcher = match RecommendedWatcher::new(
+            move |event| {
+                let _ = event_tx.send(event);
+            },
+            NotifyConfig::default(),
+        ) {
+            Ok(watcher) => watcher,
+            Err(_) => return,
+        };
+        for root in roots {
+            let _ = watcher.watch(&root, RecursiveMode::Recursive);
+        }
+        let mut previous = load_skill_entries(&workspace_cwd);
+        while let Ok(event) = event_rx.recv() {
+            let Ok(event) = event else {
+                continue;
+            };
+            if !skill_fs_event_affects_catalog(&event.kind) {
+                continue;
+            }
+            let current = load_skill_entries(&workspace_cwd);
+            if current == previous {
+                continue;
+            }
+            previous = current.clone();
+            if tx.send(UiEvent::SkillsChanged(current)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn skill_fs_event_affects_catalog(kind: &NotifyEventKind) -> bool {
+    matches!(
+        kind,
+        NotifyEventKind::Any
+            | NotifyEventKind::Create(_)
+            | NotifyEventKind::Modify(_)
+            | NotifyEventKind::Remove(_)
+            | NotifyEventKind::Other
+    )
+}
+
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
@@ -5921,6 +5990,38 @@ mod tests {
         assert!(complete_autocomplete_selection(&mut app));
 
         assert_eq!(app.composer.lines(), &["run /review ".to_string()]);
+    }
+
+    #[test]
+    fn skill_reload_updates_autocomplete_results() {
+        let mut app = App::new(Args {
+            socket: Some("/tmp/cmux-home-test.sock".to_string()),
+            workspace_cwd: Some(".".to_string()),
+            config: None,
+            codex_command: "codex".to_string(),
+            codex_plan_command: "codex".to_string(),
+            claude_command: "claude".to_string(),
+            claude_plan_command: "claude --permission-mode plan".to_string(),
+        });
+        app.skills.clear();
+        app.composer = composer_from_lines(vec!["use $auto".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        assert!(app.autocomplete_items().is_empty());
+
+        app.apply_skills_changed(vec![SkillEntry {
+            name: "auto-reload".to_string(),
+            description: "refresh skill metadata".to_string(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/auto-reload/SKILL.md"),
+        }]);
+
+        let items = app.autocomplete_items();
+        assert_eq!(
+            items.first().map(|item| item.label.as_str()),
+            Some("$auto-reload")
+        );
+        assert_eq!(app.status_line, "reloaded 1 skills (0 before)");
     }
 
     #[test]
