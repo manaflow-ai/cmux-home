@@ -2459,9 +2459,7 @@ fn handle_composer_key(
             ..
         } => match app.composer_mode.clone() {
             ComposerMode::NewWorkspace if app.composer_has_text() => {
-                if complete_autocomplete_selection(app) {
-                    return Ok(KeyAction::Continue);
-                }
+                let _ = complete_autocomplete_selection(app);
                 if handle_composer_command(app) {
                     return Ok(KeyAction::Continue);
                 }
@@ -4714,7 +4712,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if app.autocomplete_is_active() {
                     let mut help_spans = current_agent_mode_spans(app);
                     help_spans.push(Span::styled(
-                        " · enter/tab complete · ctrl+n/p select · esc clear",
+                        " · enter create · tab complete · ctrl+n/p select · esc clear",
                         muted_style(),
                     ));
                     frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
@@ -6022,6 +6020,41 @@ mod tests {
             Some("$auto-reload")
         );
         assert_eq!(app.status_line, "reloaded 1 skills (0 before)");
+    }
+
+    #[test]
+    fn enter_with_skill_autocomplete_completes_and_submits() {
+        let mut app = test_app();
+        app.skills = vec![SkillEntry {
+            name: "cmux-workspace".to_string(),
+            description: "workspace helper".to_string(),
+            sources: vec!["codex".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/cmux-workspace/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec![
+            "fix and set up $cmux-worksp".to_string(),
+        ]);
+        app.composer.move_cursor(CursorMove::End);
+        assert!(app.autocomplete_is_active());
+        let (tx, rx) = mpsc::channel();
+
+        let action = handle_composer_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            Rect::new(0, 0, 120, 40),
+        )
+        .expect("enter");
+
+        assert!(matches!(action, KeyAction::Continue));
+        let request = rx.try_recv().expect("background submit request");
+        assert_eq!(request.prompt, "fix and set up $cmux-workspace");
+        assert!(!app.composer_has_input());
+        assert!(app
+            .workspaces
+            .first()
+            .is_some_and(|workspace| workspace.id.starts_with("pending:")));
     }
 
     #[test]
