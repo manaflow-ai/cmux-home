@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -97,35 +97,8 @@ pub(crate) struct SkillWatchRoot {
 
 pub(crate) fn skill_watch_roots(workspace_cwd: &str) -> Vec<SkillWatchRoot> {
     let mut roots = HashMap::new();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let workspace = PathBuf::from(workspace_cwd);
-
-    push_watch_target(&mut roots, workspace.join(".codex/skills"), &workspace);
-    push_watch_target(&mut roots, workspace.join(".claude/skills"), &workspace);
-    push_watch_target(&mut roots, workspace.join(".agents/skills"), &workspace);
-    push_watch_target(&mut roots, workspace.join("skills"), &workspace);
-
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".codex")));
-    if let Some(codex_home) = codex_home {
-        let floor = watch_floor(&codex_home);
-        push_watch_target(&mut roots, codex_home.join("skills"), &floor);
-        push_watch_target(&mut roots, codex_home.join("plugins/cache"), &floor);
-    }
-
-    if let Some(home) = home.as_ref() {
-        push_watch_target(&mut roots, home.join(".agents/skills"), home);
-    }
-
-    let claude_home = std::env::var_os("CLAUDE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".claude")));
-    if let Some(claude_home) = claude_home {
-        let floor = watch_floor(&claude_home);
-        push_watch_target(&mut roots, claude_home.join("skills"), &floor);
-        push_watch_target(&mut roots, claude_home.join("plugins/cache"), &floor);
-        push_watch_target(&mut roots, claude_home.join("plugins/marketplaces"), &floor);
+    for target in skill_watch_targets(workspace_cwd) {
+        push_watch_target(&mut roots, target.path, &target.floor);
     }
 
     let mut roots = roots
@@ -138,6 +111,68 @@ pub(crate) fn skill_watch_roots(workspace_cwd: &str) -> Vec<SkillWatchRoot> {
             .then_with(|| a.recursive.cmp(&b.recursive))
     });
     roots
+}
+
+pub(crate) fn skill_watch_interest_paths(workspace_cwd: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for target in skill_watch_targets(workspace_cwd) {
+        push_watch_interest_paths(&mut paths, &mut seen, target.path, &target.floor);
+    }
+    paths
+}
+
+#[derive(Debug)]
+struct SkillWatchTarget {
+    path: PathBuf,
+    floor: PathBuf,
+}
+
+fn skill_watch_targets(workspace_cwd: &str) -> Vec<SkillWatchTarget> {
+    let mut targets = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let workspace = PathBuf::from(workspace_cwd);
+
+    push_watch_target_spec(&mut targets, workspace.join(".codex/skills"), &workspace);
+    push_watch_target_spec(&mut targets, workspace.join(".claude/skills"), &workspace);
+    push_watch_target_spec(&mut targets, workspace.join(".agents/skills"), &workspace);
+    push_watch_target_spec(&mut targets, workspace.join("skills"), &workspace);
+
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".codex")));
+    if let Some(codex_home) = codex_home {
+        let floor = watch_floor(&codex_home);
+        push_watch_target_spec(&mut targets, codex_home.join("skills"), &floor);
+        push_watch_target_spec(&mut targets, codex_home.join("plugins/cache"), &floor);
+    }
+
+    if let Some(home) = home.as_ref() {
+        push_watch_target_spec(&mut targets, home.join(".agents/skills"), home);
+    }
+
+    let claude_home = std::env::var_os("CLAUDE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".claude")));
+    if let Some(claude_home) = claude_home {
+        let floor = watch_floor(&claude_home);
+        push_watch_target_spec(&mut targets, claude_home.join("skills"), &floor);
+        push_watch_target_spec(&mut targets, claude_home.join("plugins/cache"), &floor);
+        push_watch_target_spec(
+            &mut targets,
+            claude_home.join("plugins/marketplaces"),
+            &floor,
+        );
+    }
+
+    targets
+}
+
+fn push_watch_target_spec(targets: &mut Vec<SkillWatchTarget>, path: PathBuf, floor: &Path) {
+    targets.push(SkillWatchTarget {
+        path,
+        floor: floor.to_path_buf(),
+    });
 }
 
 fn watch_floor(root: &Path) -> PathBuf {
@@ -177,6 +212,31 @@ fn nearest_existing_watch_parent(target: &Path, floor: &Path) -> Option<PathBuf>
         if !path.pop() {
             return None;
         }
+    }
+}
+
+fn push_watch_interest_paths(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    target: PathBuf,
+    floor: &Path,
+) {
+    let mut path = target;
+    loop {
+        if path == floor {
+            break;
+        }
+        push_watch_interest_path(paths, seen, path.clone());
+        if !path.pop() {
+            break;
+        }
+    }
+}
+
+fn push_watch_interest_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    let key = fs::canonicalize(&path).unwrap_or(path);
+    if seen.insert(key.clone()) {
+        paths.push(key);
     }
 }
 

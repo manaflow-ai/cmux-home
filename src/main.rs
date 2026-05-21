@@ -56,7 +56,9 @@ use events::{
 use model::{
     display_group, AgentKind, AgentState, ConversationActor, ConversationSnapshot, WorkspaceStatus,
 };
-use skills::{load_skill_entries, skill_watch_roots, SkillEntry, SkillWatchRoot};
+use skills::{
+    load_skill_entries, skill_watch_interest_paths, skill_watch_roots, SkillEntry, SkillWatchRoot,
+};
 use util::{
     contains_any, now_millis, one_line_preview, shell_quote, shell_words, time_ago, truncate,
     user_home,
@@ -4990,7 +4992,7 @@ fn spawn_skill_watcher(workspace_cwd: String, tx: Sender<UiEvent>) {
             let Ok(event) = event else {
                 continue;
             };
-            if !skill_fs_event_affects_catalog(&event) {
+            if !skill_fs_event_affects_catalog(&event, &workspace_cwd) {
                 continue;
             }
             if reconcile_skill_watches(&mut watcher, &mut watched_roots, &workspace_cwd, &tx) == 0 {
@@ -5049,7 +5051,7 @@ fn reconcile_skill_watches(
     watched_roots.len()
 }
 
-fn skill_fs_event_affects_catalog(event: &NotifyEvent) -> bool {
+fn skill_fs_event_affects_catalog(event: &NotifyEvent, workspace_cwd: &str) -> bool {
     let relevant_kind = matches!(
         event.kind,
         NotifyEventKind::Any
@@ -5063,10 +5065,10 @@ fn skill_fs_event_affects_catalog(event: &NotifyEvent) -> bool {
             || event
                 .paths
                 .iter()
-                .any(|path| skill_fs_path_affects_catalog(path)))
+                .any(|path| skill_fs_path_affects_catalog(path, workspace_cwd)))
 }
 
-fn skill_fs_path_affects_catalog(path: &Path) -> bool {
+fn skill_fs_path_affects_catalog(path: &Path, workspace_cwd: &str) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
         || path.components().any(|component| {
             matches!(
@@ -5082,6 +5084,9 @@ fn skill_fs_path_affects_catalog(path: &Path) -> bool {
                 )
             )
         })
+        || skill_watch_interest_paths(workspace_cwd)
+            .iter()
+            .any(|interest_path| interest_path == path)
 }
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
@@ -6111,9 +6116,42 @@ mod tests {
             attrs: Default::default(),
         };
 
-        assert!(skill_fs_event_affects_catalog(&skill_event));
-        assert!(skill_fs_event_affects_catalog(&missing_root_event));
-        assert!(!skill_fs_event_affects_catalog(&unrelated_event));
+        assert!(skill_fs_event_affects_catalog(&skill_event, "/workspace"));
+        assert!(skill_fs_event_affects_catalog(
+            &missing_root_event,
+            "/workspace"
+        ));
+        assert!(!skill_fs_event_affects_catalog(
+            &unrelated_event,
+            "/workspace"
+        ));
+    }
+
+    #[test]
+    fn skill_watcher_reconciles_custom_home_creation_events() {
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let custom_home = std::env::temp_dir().join(format!(
+            "cmux-home-custom-codex-{}-{nonce}",
+            std::process::id()
+        ));
+        let previous_codex_home = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", &custom_home);
+
+        let event = NotifyEvent {
+            kind: NotifyEventKind::Any,
+            paths: vec![custom_home],
+            attrs: Default::default(),
+        };
+        let matches_custom_home = skill_fs_event_affects_catalog(&event, "/workspace");
+
+        match previous_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        assert!(matches_custom_home);
     }
 
     #[test]
