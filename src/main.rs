@@ -21,8 +21,8 @@ use crossterm::terminal::{
 };
 use ignore::WalkBuilder;
 use notify::{
-    event::EventKind as NotifyEventKind, Config as NotifyConfig, RecommendedWatcher, RecursiveMode,
-    Watcher,
+    event::EventKind as NotifyEventKind, Config as NotifyConfig, Event as NotifyEvent,
+    RecommendedWatcher, RecursiveMode, Watcher,
 };
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as FuzzyConfig, Matcher as FuzzyMatcher, Utf32Str};
@@ -56,7 +56,7 @@ use events::{
 use model::{
     display_group, AgentKind, AgentState, ConversationActor, ConversationSnapshot, WorkspaceStatus,
 };
-use skills::{load_skill_entries, skill_watch_roots, SkillEntry};
+use skills::{load_skill_entries, skill_watch_roots, SkillEntry, SkillWatchRoot};
 use util::{
     contains_any, now_millis, one_line_preview, shell_quote, shell_words, time_ago, truncate,
     user_home,
@@ -255,6 +255,7 @@ enum UiEvent {
     WorkspaceSnapshot(Result<WorkspaceRefresh, String>),
     SubmitResult(std::result::Result<SubmitSuccess, SubmitFailure>),
     SkillsChanged(Vec<SkillEntry>),
+    Status(String),
     StreamError(String),
 }
 
@@ -2098,6 +2099,7 @@ fn run_tui(
                     UiEvent::SubmitResult(Ok(success)) => app.apply_submit_success(success),
                     UiEvent::SubmitResult(Err(failure)) => app.apply_submit_failure(failure),
                     UiEvent::SkillsChanged(skills) => app.apply_skills_changed(skills),
+                    UiEvent::Status(status) => app.status_line = status,
                     UiEvent::StreamError(err) => app.status_line = format!("event stream: {err}"),
                 }
             }
@@ -4965,10 +4967,6 @@ fn spawn_refresh_worker(
 
 fn spawn_skill_watcher(workspace_cwd: String, tx: Sender<UiEvent>) {
     thread::spawn(move || {
-        let roots = skill_watch_roots(&workspace_cwd);
-        if roots.is_empty() {
-            return;
-        }
         let (event_tx, event_rx) = mpsc::channel();
         let mut watcher = match RecommendedWatcher::new(
             move |event| {
@@ -4977,18 +4975,27 @@ fn spawn_skill_watcher(workspace_cwd: String, tx: Sender<UiEvent>) {
             NotifyConfig::default(),
         ) {
             Ok(watcher) => watcher,
-            Err(_) => return,
+            Err(err) => {
+                let _ = tx.send(UiEvent::Status(format!("skill watcher failed: {err}")));
+                return;
+            }
         };
-        for root in roots {
-            let _ = watcher.watch(&root, RecursiveMode::Recursive);
+        let mut watched_roots = Vec::new();
+        if reconcile_skill_watches(&mut watcher, &mut watched_roots, &workspace_cwd, &tx) == 0 {
+            let _ = tx.send(UiEvent::Status("skill watcher disabled".to_string()));
+            return;
         }
         let mut previous = load_skill_entries(&workspace_cwd);
         while let Ok(event) = event_rx.recv() {
             let Ok(event) = event else {
                 continue;
             };
-            if !skill_fs_event_affects_catalog(&event.kind) {
+            if !skill_fs_event_affects_catalog(&event) {
                 continue;
+            }
+            if reconcile_skill_watches(&mut watcher, &mut watched_roots, &workspace_cwd, &tx) == 0 {
+                let _ = tx.send(UiEvent::Status("skill watcher disabled".to_string()));
+                break;
             }
             let current = load_skill_entries(&workspace_cwd);
             if current == previous {
@@ -5002,15 +5009,79 @@ fn spawn_skill_watcher(workspace_cwd: String, tx: Sender<UiEvent>) {
     });
 }
 
-fn skill_fs_event_affects_catalog(kind: &NotifyEventKind) -> bool {
-    matches!(
-        kind,
+fn reconcile_skill_watches(
+    watcher: &mut RecommendedWatcher,
+    watched_roots: &mut Vec<SkillWatchRoot>,
+    workspace_cwd: &str,
+    tx: &Sender<UiEvent>,
+) -> usize {
+    let desired_roots = skill_watch_roots(workspace_cwd);
+    for root in watched_roots
+        .iter()
+        .filter(|root| !desired_roots.contains(root))
+    {
+        let _ = watcher.unwatch(&root.path);
+    }
+
+    let mut next_roots = Vec::new();
+    for root in desired_roots {
+        if watched_roots.contains(&root) {
+            next_roots.push(root);
+            continue;
+        }
+
+        let mode = if root.recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        match watcher.watch(&root.path, mode) {
+            Ok(()) => next_roots.push(root),
+            Err(err) => {
+                let _ = tx.send(UiEvent::Status(format!(
+                    "skill watcher skipped {}: {err}",
+                    root.path.display()
+                )));
+            }
+        }
+    }
+    *watched_roots = next_roots;
+    watched_roots.len()
+}
+
+fn skill_fs_event_affects_catalog(event: &NotifyEvent) -> bool {
+    let relevant_kind = matches!(
+        event.kind,
         NotifyEventKind::Any
             | NotifyEventKind::Create(_)
             | NotifyEventKind::Modify(_)
             | NotifyEventKind::Remove(_)
             | NotifyEventKind::Other
-    )
+    );
+    relevant_kind
+        && (event.paths.is_empty()
+            || event
+                .paths
+                .iter()
+                .any(|path| skill_fs_path_affects_catalog(path)))
+}
+
+fn skill_fs_path_affects_catalog(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        || path.components().any(|component| {
+            matches!(
+                component.as_os_str().to_str(),
+                Some(
+                    "skills"
+                        | "plugins"
+                        | "cache"
+                        | "marketplaces"
+                        | ".codex"
+                        | ".claude"
+                        | ".agents"
+                )
+            )
+        })
 }
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
@@ -6023,6 +6094,29 @@ mod tests {
     }
 
     #[test]
+    fn skill_watcher_ignores_unrelated_file_events() {
+        let skill_event = NotifyEvent {
+            kind: NotifyEventKind::Any,
+            paths: vec![PathBuf::from("/workspace/skills/review/SKILL.md")],
+            attrs: Default::default(),
+        };
+        let unrelated_event = NotifyEvent {
+            kind: NotifyEventKind::Any,
+            paths: vec![PathBuf::from("/workspace/src/main.rs")],
+            attrs: Default::default(),
+        };
+        let missing_root_event = NotifyEvent {
+            kind: NotifyEventKind::Any,
+            paths: vec![PathBuf::from("/workspace/.codex")],
+            attrs: Default::default(),
+        };
+
+        assert!(skill_fs_event_affects_catalog(&skill_event));
+        assert!(skill_fs_event_affects_catalog(&missing_root_event));
+        assert!(!skill_fs_event_affects_catalog(&unrelated_event));
+    }
+
+    #[test]
     fn enter_with_skill_autocomplete_completes_and_submits() {
         let mut app = test_app();
         app.skills = vec![SkillEntry {
@@ -6032,9 +6126,7 @@ mod tests {
             priority: 0,
             path: PathBuf::from("/tmp/cmux-workspace/SKILL.md"),
         }];
-        app.composer = composer_from_lines(vec![
-            "fix and set up $cmux-worksp".to_string(),
-        ]);
+        app.composer = composer_from_lines(vec!["fix and set up $cmux-worksp".to_string()]);
         app.composer.move_cursor(CursorMove::End);
         assert!(app.autocomplete_is_active());
         let (tx, rx) = mpsc::channel();

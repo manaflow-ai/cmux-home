@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -89,52 +89,94 @@ pub(crate) fn load_skill_entries(workspace_cwd: &str) -> Vec<SkillEntry> {
     skills
 }
 
-pub(crate) fn skill_watch_roots(workspace_cwd: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SkillWatchRoot {
+    pub(crate) path: PathBuf,
+    pub(crate) recursive: bool,
+}
+
+pub(crate) fn skill_watch_roots(workspace_cwd: &str) -> Vec<SkillWatchRoot> {
+    let mut roots = HashMap::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let workspace = PathBuf::from(workspace_cwd);
 
-    push_watch_root(&mut roots, &mut seen, workspace.join(".codex/skills"));
-    push_watch_root(&mut roots, &mut seen, workspace.join(".claude/skills"));
-    push_watch_root(&mut roots, &mut seen, workspace.join(".agents/skills"));
-    push_watch_root(&mut roots, &mut seen, workspace.join("skills"));
+    push_watch_target(&mut roots, workspace.join(".codex/skills"), &workspace);
+    push_watch_target(&mut roots, workspace.join(".claude/skills"), &workspace);
+    push_watch_target(&mut roots, workspace.join(".agents/skills"), &workspace);
+    push_watch_target(&mut roots, workspace.join("skills"), &workspace);
 
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".codex")));
     if let Some(codex_home) = codex_home {
-        push_watch_root(&mut roots, &mut seen, codex_home.join("skills"));
-        push_watch_root(&mut roots, &mut seen, codex_home.join("plugins/cache"));
+        let floor = watch_floor(&codex_home);
+        push_watch_target(&mut roots, codex_home.join("skills"), &floor);
+        push_watch_target(&mut roots, codex_home.join("plugins/cache"), &floor);
     }
 
     if let Some(home) = home.as_ref() {
-        push_watch_root(&mut roots, &mut seen, home.join(".agents/skills"));
+        push_watch_target(&mut roots, home.join(".agents/skills"), home);
     }
 
     let claude_home = std::env::var_os("CLAUDE_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".claude")));
     if let Some(claude_home) = claude_home {
-        push_watch_root(&mut roots, &mut seen, claude_home.join("skills"));
-        push_watch_root(&mut roots, &mut seen, claude_home.join("plugins/cache"));
-        push_watch_root(
-            &mut roots,
-            &mut seen,
-            claude_home.join("plugins/marketplaces"),
-        );
+        let floor = watch_floor(&claude_home);
+        push_watch_target(&mut roots, claude_home.join("skills"), &floor);
+        push_watch_target(&mut roots, claude_home.join("plugins/cache"), &floor);
+        push_watch_target(&mut roots, claude_home.join("plugins/marketplaces"), &floor);
     }
 
+    let mut roots = roots
+        .into_iter()
+        .map(|(path, recursive)| SkillWatchRoot { path, recursive })
+        .collect::<Vec<_>>();
+    roots.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.recursive.cmp(&b.recursive))
+    });
     roots
 }
 
-fn push_watch_root(roots: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
-    if !path.is_dir() {
+fn watch_floor(root: &Path) -> PathBuf {
+    root.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+fn push_watch_target(roots: &mut HashMap<PathBuf, bool>, target: PathBuf, floor: &Path) {
+    if target.is_dir() {
+        push_watch_root(roots, target, true);
         return;
     }
+
+    if let Some(parent) = nearest_existing_watch_parent(&target, floor) {
+        push_watch_root(roots, parent, false);
+    }
+}
+
+fn push_watch_root(roots: &mut HashMap<PathBuf, bool>, path: PathBuf, recursive: bool) {
     let key = fs::canonicalize(&path).unwrap_or(path);
-    if seen.insert(key.clone()) {
-        roots.push(key);
+    roots
+        .entry(key)
+        .and_modify(|existing_recursive| *existing_recursive |= recursive)
+        .or_insert(recursive);
+}
+
+fn nearest_existing_watch_parent(target: &Path, floor: &Path) -> Option<PathBuf> {
+    let mut path = target.parent()?.to_path_buf();
+    loop {
+        if path.is_dir() {
+            return Some(path);
+        }
+        if path == floor {
+            return None;
+        }
+        if !path.pop() {
+            return None;
+        }
     }
 }
 
@@ -269,4 +311,53 @@ fn unquote_yaml_scalar(value: &str) -> String {
         }
     }
     value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{skill_watch_roots, SkillWatchRoot};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cmux-home-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn skill_watch_roots_use_nonrecursive_parent_for_missing_roots() {
+        let root = temp_path("missing-skill-roots");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        let roots = skill_watch_roots(workspace.to_str().expect("utf8 workspace"));
+        let workspace = fs::canonicalize(&workspace).expect("canonical workspace");
+
+        assert!(roots.contains(&SkillWatchRoot {
+            path: workspace,
+            recursive: false,
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_watch_roots_prefer_existing_skill_directory() {
+        let root = temp_path("existing-skill-root");
+        let workspace = root.join("workspace");
+        let skills = workspace.join("skills");
+        fs::create_dir_all(&skills).expect("skills");
+
+        let roots = skill_watch_roots(workspace.to_str().expect("utf8 workspace"));
+        let skills = fs::canonicalize(&skills).expect("canonical skills");
+
+        assert!(roots.contains(&SkillWatchRoot {
+            path: skills,
+            recursive: true,
+        }));
+        let _ = fs::remove_dir_all(root);
+    }
 }
