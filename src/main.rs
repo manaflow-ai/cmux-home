@@ -74,14 +74,12 @@ const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
     CommandSuggestion {
         command: "/history",
         detail: "previous prompts",
+        shortcut: Some("ctrl+h"),
     },
     CommandSuggestion {
         command: "/stash",
         detail: "saved drafts",
-    },
-    CommandSuggestion {
-        command: "/stash save",
-        detail: "save text as stash",
+        shortcut: Some("ctrl+s"),
     },
 ];
 
@@ -89,12 +87,14 @@ const COMMAND_SUGGESTIONS: &[CommandSuggestion] = &[
 struct CommandSuggestion {
     command: &'static str,
     detail: &'static str,
+    shortcut: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CommandSuggestionMatch {
     command: &'static str,
     detail: &'static str,
+    shortcut: Option<&'static str>,
     positions: Vec<usize>,
 }
 
@@ -117,6 +117,13 @@ struct AutocompleteItem {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FuzzyMatch {
+    score: u32,
+    positions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HistorySearchMatch {
+    history_index: usize,
     score: u32,
     positions: Vec<usize>,
 }
@@ -374,6 +381,78 @@ struct App {
 enum ComposerMode {
     NewWorkspace,
     RenameWorkspace(String),
+    HistorySearch,
+}
+
+impl ComposerMode {
+    fn placeholder(&self) -> &'static str {
+        match self {
+            ComposerMode::NewWorkspace => COMPOSER_PLACEHOLDER,
+            ComposerMode::RenameWorkspace(_) => "",
+            ComposerMode::HistorySearch => "search history",
+        }
+    }
+
+    fn keeps_draft(&self) -> bool {
+        matches!(self, ComposerMode::NewWorkspace)
+    }
+
+    fn is_empty_textbox_active(&self) -> bool {
+        matches!(
+            self,
+            ComposerMode::RenameWorkspace(_) | ComposerMode::HistorySearch
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextboxVerticalKeys {
+    VisualLines,
+    Ignore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextboxKeyOptions {
+    allow_image_tokens: bool,
+    allow_newlines: bool,
+    allow_tabs: bool,
+    normalize_image_paths: bool,
+    vertical_keys: TextboxVerticalKeys,
+}
+
+impl TextboxKeyOptions {
+    fn composer() -> Self {
+        Self {
+            allow_image_tokens: true,
+            allow_newlines: true,
+            allow_tabs: true,
+            normalize_image_paths: true,
+            vertical_keys: TextboxVerticalKeys::VisualLines,
+        }
+    }
+
+    fn history_search() -> Self {
+        Self {
+            allow_image_tokens: false,
+            allow_newlines: false,
+            allow_tabs: false,
+            normalize_image_paths: false,
+            vertical_keys: TextboxVerticalKeys::Ignore,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextboxSnapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+    selection: Option<((usize, usize), (usize, usize))>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextboxKeyOutcome {
+    handled: bool,
+    text_changed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1119,11 +1198,11 @@ impl App {
             self.status_line = "select a workspace to rename".to_string();
             return false;
         };
-        self.composer = composer_from_lines(vec![workspace.title]);
+        self.replace_composer(
+            ComposerMode::RenameWorkspace(workspace.id),
+            vec![workspace.title],
+        );
         self.composer.select_all();
-        self.composer_drag_anchor = None;
-        self.composer_goal_visual_col = None;
-        self.composer_mode = ComposerMode::RenameWorkspace(workspace.id);
         self.status_line = "renaming workspace".to_string();
         true
     }
@@ -1147,12 +1226,16 @@ impl App {
     }
 
     fn reset_composer(&mut self) {
-        self.composer = new_composer();
+        self.replace_composer(ComposerMode::NewWorkspace, vec![String::new()]);
+    }
+
+    fn replace_composer(&mut self, mode: ComposerMode, lines: Vec<String>) {
+        self.composer = composer_from_lines(non_empty_lines(lines));
         self.image_paths.clear();
         self.selected_image = None;
         self.composer_drag_anchor = None;
         self.composer_goal_visual_col = None;
-        self.composer_mode = ComposerMode::NewWorkspace;
+        self.composer_mode = mode;
         self.sync_focus_after_composer_change();
     }
 
@@ -1161,9 +1244,39 @@ impl App {
             self.status_line = "nothing to stash".to_string();
             return;
         };
+        self.record_draft_history(&draft);
         self.stashes.push(draft);
         self.reset_composer();
         self.status_line = format!("stashed draft {}", self.stashes.len());
+    }
+
+    fn handle_stash_shortcut(&mut self) {
+        if self.view_mode == ViewMode::Stashes {
+            self.restore_selected_stash();
+            return;
+        }
+        if self.current_draft().is_some() {
+            self.stash_current_draft();
+            return;
+        }
+        if self.composer_has_input() {
+            self.status_line = "nothing to stash".to_string();
+            return;
+        }
+        self.pop_latest_stash();
+    }
+
+    fn pop_latest_stash(&mut self) {
+        let Some(draft) = self.stashes.pop() else {
+            self.status_line = "no stashes".to_string();
+            return;
+        };
+        let count = self.stashes.len() + 1;
+        self.restore_draft(draft);
+        self.view_mode = ViewMode::Workspaces;
+        self.selected = 0;
+        self.list_scroll = 0;
+        self.status_line = format!("popped stash {count}");
     }
 
     fn restore_selected_stash(&mut self) {
@@ -1180,11 +1293,15 @@ impl App {
     }
 
     fn restore_selected_history(&mut self) {
-        let Some(draft) = self.history.get(self.selected).cloned() else {
+        let Some(history_index) = self.selected_history_index() else {
             self.status_line = "select a prompt".to_string();
             return;
         };
-        let count = self.selected + 1;
+        let Some(draft) = self.history.get(history_index).cloned() else {
+            self.status_line = "select a prompt".to_string();
+            return;
+        };
+        let count = history_index + 1;
         self.restore_draft(draft);
         self.view_mode = ViewMode::Workspaces;
         self.selected = 0;
@@ -1202,6 +1319,7 @@ impl App {
 
     fn open_history_view(&mut self) {
         self.view_mode = ViewMode::History;
+        self.replace_composer(ComposerMode::HistorySearch, vec![String::new()]);
         self.selected = 0;
         self.list_scroll = 0;
         self.focus_target = FocusTarget::MainContent;
@@ -1209,6 +1327,9 @@ impl App {
     }
 
     fn open_workspace_view(&mut self) {
+        if self.composer_mode == ComposerMode::HistorySearch {
+            self.reset_composer();
+        }
         self.view_mode = ViewMode::Workspaces;
         self.selected = 0;
         self.list_scroll = 0;
@@ -1237,13 +1358,22 @@ impl App {
         } else {
             prompt.lines().map(str::to_string).collect()
         };
-        self.history.insert(
-            0,
-            draft_from_parts(lines, images.to_vec(), self.provider, self.plan_mode),
-        );
+        let draft = draft_from_parts(lines, images.to_vec(), self.provider, self.plan_mode);
+        self.record_draft_history(&draft);
+    }
+
+    fn record_draft_history(&mut self, draft: &PersistedDraft) {
+        let has_text = draft.lines.iter().any(|line| !line.trim().is_empty());
+        if !has_text && draft.image_paths.is_empty() {
+            return;
+        }
+        self.history.insert(0, draft.clone());
     }
 
     fn current_draft(&self) -> Option<PersistedDraft> {
+        if !self.composer_mode.keeps_draft() {
+            return None;
+        }
         if !self.composer_has_input() && self.image_paths.is_empty() {
             return None;
         }
@@ -1331,7 +1461,22 @@ impl App {
     }
 
     fn composer_is_active(&self) -> bool {
-        self.composer_has_input() || matches!(self.composer_mode, ComposerMode::RenameWorkspace(_))
+        self.composer_has_input() || self.composer_mode.is_empty_textbox_active()
+    }
+
+    fn composer_text(&self) -> String {
+        self.composer.lines().join("\n")
+    }
+
+    fn history_search_query(&self) -> String {
+        if self.composer_mode != ComposerMode::HistorySearch {
+            return String::new();
+        }
+        self.composer_text().replace('\n', " ").trim().to_string()
+    }
+
+    fn history_search_has_input(&self) -> bool {
+        self.composer_mode == ComposerMode::HistorySearch && self.composer_has_input()
     }
 
     fn autocomplete_query(&self) -> Option<AutocompleteQuery> {
@@ -1350,17 +1495,13 @@ impl App {
             AutocompleteMarker::Slash => {
                 items.extend(command_suggestions_for_query(&query.raw).into_iter().map(
                     |suggestion| {
-                        let insert_text = if suggestion.command == "/stash save" {
-                            "/stash save ".to_string()
-                        } else {
-                            suggestion.command.to_string()
-                        };
+                        let detail = command_suggestion_detail(&suggestion);
                         AutocompleteItem {
                             kind: AutocompleteKind::Command,
                             label: suggestion.command.to_string(),
                             label_match_positions: suggestion.positions,
-                            insert_text,
-                            detail: suggestion.detail.to_string(),
+                            insert_text: suggestion.command.to_string(),
+                            detail,
                             detail_match_positions: Vec::new(),
                         }
                     },
@@ -1555,6 +1696,67 @@ impl App {
         self.autocomplete.select_next(len);
     }
 
+    fn history_search_matches(&self) -> Vec<HistorySearchMatch> {
+        let query = self.history_search_query();
+        let query = query.trim();
+        if query.is_empty() {
+            return self
+                .history
+                .iter()
+                .enumerate()
+                .map(|(history_index, _)| HistorySearchMatch {
+                    history_index,
+                    score: 0,
+                    positions: Vec::new(),
+                })
+                .collect();
+        }
+
+        let pattern = fuzzy_pattern(query);
+        let mut matcher = fuzzy_matcher(false);
+        let mut buf = Vec::new();
+        let mut positions = Vec::new();
+        let mut matches = self
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(history_index, draft)| {
+                let candidate = draft_search_text(draft);
+                let match_item = fuzzy_match_candidate(
+                    &pattern,
+                    &mut matcher,
+                    &candidate,
+                    &mut buf,
+                    &mut positions,
+                )?;
+                Some(HistorySearchMatch {
+                    history_index,
+                    score: match_item.score,
+                    positions: match_item.positions,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.history_index.cmp(&b.history_index))
+        });
+        matches
+    }
+
+    fn selected_history_index(&self) -> Option<usize> {
+        self.history_search_matches()
+            .get(self.selected)
+            .map(|match_item| match_item.history_index)
+    }
+
+    fn reset_history_search_selection(&mut self) {
+        self.selected = 0;
+        self.list_scroll = 0;
+        self.focus_target = FocusTarget::MainContent;
+    }
+
     fn move_focused_selection(&mut self, direction: SelectionDirection) -> bool {
         if self.focus_target == FocusTarget::Autocomplete && self.autocomplete_is_active() {
             match direction {
@@ -1659,7 +1861,7 @@ impl App {
         match self.view_mode {
             ViewMode::Workspaces => 0,
             ViewMode::Stashes => self.stashes.len(),
-            ViewMode::History => self.history.len(),
+            ViewMode::History => self.history_search_matches().len(),
         }
     }
 
@@ -1884,6 +2086,15 @@ fn shift_positions(positions: &[usize], offset: usize) -> Vec<usize> {
         .iter()
         .map(|position| position.saturating_add(offset))
         .collect()
+}
+
+fn draft_search_text(draft: &PersistedDraft) -> String {
+    draft
+        .lines
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn file_reference_title(path: &str) -> &str {
@@ -2217,11 +2428,7 @@ fn handle_key(
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            if app.view_mode == ViewMode::Stashes {
-                app.restore_selected_stash();
-            } else {
-                app.stash_current_draft();
-            }
+            app.handle_stash_shortcut();
         }
         KeyEvent {
             code: KeyCode::Char('y'),
@@ -2240,11 +2447,28 @@ fn handle_key(
         }
         KeyEvent {
             code: KeyCode::Esc, ..
+        } if app.view_mode == ViewMode::History && app.history_search_has_input() => {
+            app.replace_composer(ComposerMode::HistorySearch, vec![String::new()]);
+            app.reset_history_search_selection();
+        }
+        KeyEvent {
+            code: KeyCode::Esc, ..
         } if matches!(app.view_mode, ViewMode::Stashes | ViewMode::History) => {
             app.open_workspace_view();
         }
+        _ if app.view_mode == ViewMode::History => {
+            handle_history_key(app, key, screen_area);
+            return Ok(KeyAction::Continue);
+        }
         _ if app.composer_is_active() => {
             return handle_composer_key(app, key, submit_tx, screen_area);
+        }
+        KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.open_history_view();
         }
         KeyEvent {
             code: KeyCode::Char('r'),
@@ -2450,6 +2674,327 @@ fn handle_key(
     Ok(KeyAction::Continue)
 }
 
+fn handle_history_key(app: &mut App, key: KeyEvent, screen_area: Rect) {
+    match key {
+        KeyEvent {
+            code: KeyCode::Char('?'),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } if !app.history_search_has_input() => {
+            app.show_shortcuts = !app.show_shortcuts;
+        }
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.select_previous();
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.select_next();
+        }
+        KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            app.restore_selected_history();
+        }
+        KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Home,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::End,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char(_),
+            modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
+            ..
+        } => update_history_search_text(app, key, screen_area),
+        KeyEvent {
+            code: KeyCode::Char('u'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.replace_composer(ComposerMode::HistorySearch, vec![String::new()]);
+            app.reset_history_search_selection();
+        }
+        _ => update_history_search_text(app, key, screen_area),
+    }
+}
+
+fn update_history_search_text(app: &mut App, key: KeyEvent, screen_area: Rect) {
+    let outcome = handle_textbox_key(app, key, screen_area, TextboxKeyOptions::history_search());
+    if outcome.text_changed {
+        app.reset_history_search_selection();
+    }
+}
+
+fn handle_textbox_key(
+    app: &mut App,
+    key: KeyEvent,
+    screen_area: Rect,
+    options: TextboxKeyOptions,
+) -> TextboxKeyOutcome {
+    let before = textbox_snapshot(app);
+    let handled = match key {
+        KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } if options.allow_newlines => {
+            app.composer.insert_newline();
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Enter,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('j'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => false,
+        KeyEvent {
+            code: KeyCode::BackTab | KeyCode::Tab,
+            ..
+        } if !options.allow_tabs => false,
+        KeyEvent {
+            code: KeyCode::Backspace,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            if options.allow_image_tokens && delete_image_token_before_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
+                app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Delete,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            if options.allow_image_tokens && delete_image_token_after_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
+                app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            app.composer_goal_visual_col = None;
+            if !(options.allow_image_tokens && navigate_image_token(app, CursorMove::Back)) {
+                app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Right,
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            app.composer_goal_visual_col = None;
+            if !(options.allow_image_tokens && navigate_image_token(app, CursorMove::Forward)) {
+                app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Up | KeyCode::Down,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p' | 'n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if options.vertical_keys == TextboxVerticalKeys::Ignore => false,
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Up,
+                true,
+            );
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Down,
+                true,
+            );
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Left | KeyCode::Right,
+            modifiers: KeyModifiers::SHIFT,
+            ..
+        } => {
+            app.selected_image = None;
+            app.composer.input(key);
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Char(' '),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } => {
+            if !(options.allow_image_tokens && open_image_token_at_cursor(app)) {
+                app.selected_image = None;
+                app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('p'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Up,
+                false,
+            );
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            ..
+        }
+        | KeyEvent {
+            code: KeyCode::Char('n'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            move_visual_line(
+                app,
+                composer_area(app, screen_area).width,
+                VisualLineDirection::Down,
+                false,
+            );
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.selected_image = None;
+            app.composer_goal_visual_col = None;
+            move_to_visual_line_start_or_previous_line(app, composer_area(app, screen_area).width);
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Char('e'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            app.selected_image = None;
+            app.composer_goal_visual_col = None;
+            move_to_visual_line_end_or_next_line(app, composer_area(app, screen_area).width);
+            true
+        }
+        _ => {
+            app.selected_image = None;
+            let modified = app.composer.input(key);
+            let after = textbox_snapshot(app);
+            modified || before != after
+        }
+    };
+
+    if !handled {
+        return TextboxKeyOutcome {
+            handled: false,
+            text_changed: false,
+        };
+    }
+
+    if options.normalize_image_paths {
+        normalize_composer_image_paths(app);
+    }
+    app.sync_focus_after_composer_change();
+    let after = textbox_snapshot(app);
+    TextboxKeyOutcome {
+        handled: true,
+        text_changed: before.lines != after.lines,
+    }
+}
+
+fn textbox_snapshot(app: &App) -> TextboxSnapshot {
+    TextboxSnapshot {
+        lines: app.composer.lines().to_vec(),
+        cursor: app.composer.cursor(),
+        selection: app.composer.selection_range(),
+    }
+}
+
 fn handle_composer_key(
     app: &mut App,
     key: KeyEvent,
@@ -2474,6 +3019,7 @@ fn handle_composer_key(
                 app.submit_rename_workspace(workspace_id)?;
                 return Ok(KeyAction::Refresh("workspace renamed".to_string()));
             }
+            ComposerMode::HistorySearch => {}
             ComposerMode::NewWorkspace => {}
         },
         KeyEvent {
@@ -2522,101 +3068,6 @@ fn handle_composer_key(
             app.reset_composer();
         }
         KeyEvent {
-            code: KeyCode::Backspace,
-            modifiers: KeyModifiers::NONE,
-            ..
-        } => {
-            if delete_image_token_before_cursor(&mut app.composer) {
-                app.selected_image = None;
-                app.sync_focus_after_composer_change();
-            } else {
-                app.selected_image = None;
-                app.composer.input(key);
-                app.sync_focus_after_composer_change();
-            }
-        }
-        KeyEvent {
-            code: KeyCode::Delete,
-            modifiers: KeyModifiers::NONE,
-            ..
-        } => {
-            if delete_image_token_after_cursor(&mut app.composer) {
-                app.selected_image = None;
-                app.sync_focus_after_composer_change();
-            } else {
-                app.selected_image = None;
-                app.composer.input(key);
-                app.sync_focus_after_composer_change();
-            }
-        }
-        KeyEvent {
-            code: KeyCode::Left,
-            modifiers: KeyModifiers::NONE,
-            ..
-        } => {
-            app.composer_goal_visual_col = None;
-            if !navigate_image_token(app, CursorMove::Back) {
-                app.composer.input(key);
-                app.sync_focus_after_composer_change();
-            }
-        }
-        KeyEvent {
-            code: KeyCode::Right,
-            modifiers: KeyModifiers::NONE,
-            ..
-        } => {
-            app.composer_goal_visual_col = None;
-            if !navigate_image_token(app, CursorMove::Forward) {
-                app.composer.input(key);
-                app.sync_focus_after_composer_change();
-            }
-        }
-        KeyEvent {
-            code: KeyCode::Up,
-            modifiers: KeyModifiers::SHIFT,
-            ..
-        } => {
-            move_visual_line(
-                app,
-                composer_area(app, screen_area).width,
-                VisualLineDirection::Up,
-                true,
-            );
-        }
-        KeyEvent {
-            code: KeyCode::Down,
-            modifiers: KeyModifiers::SHIFT,
-            ..
-        } => {
-            move_visual_line(
-                app,
-                composer_area(app, screen_area).width,
-                VisualLineDirection::Down,
-                true,
-            );
-        }
-        KeyEvent {
-            code: KeyCode::Left | KeyCode::Right,
-            modifiers: KeyModifiers::SHIFT,
-            ..
-        } => {
-            app.selected_image = None;
-            app.composer.input(key);
-            app.sync_focus_after_composer_change();
-        }
-        KeyEvent {
-            code: KeyCode::Char(' '),
-            modifiers: KeyModifiers::NONE,
-            ..
-        } => {
-            if !open_image_token_at_cursor(app) {
-                app.selected_image = None;
-                app.composer.input(key);
-                normalize_composer_image_paths(app);
-                app.sync_focus_after_composer_change();
-            }
-        }
-        KeyEvent {
             code: KeyCode::Up,
             modifiers: KeyModifiers::NONE,
             ..
@@ -2642,63 +3093,8 @@ fn handle_composer_key(
             app.focus_target = FocusTarget::Autocomplete;
             app.select_next_autocomplete();
         }
-        KeyEvent {
-            code: KeyCode::Up,
-            modifiers: KeyModifiers::NONE,
-            ..
-        }
-        | KeyEvent {
-            code: KeyCode::Char('p'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => {
-            move_visual_line(
-                app,
-                composer_area(app, screen_area).width,
-                VisualLineDirection::Up,
-                false,
-            );
-        }
-        KeyEvent {
-            code: KeyCode::Down,
-            modifiers: KeyModifiers::NONE,
-            ..
-        }
-        | KeyEvent {
-            code: KeyCode::Char('n'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => {
-            move_visual_line(
-                app,
-                composer_area(app, screen_area).width,
-                VisualLineDirection::Down,
-                false,
-            );
-        }
-        KeyEvent {
-            code: KeyCode::Char('a'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => {
-            app.selected_image = None;
-            app.composer_goal_visual_col = None;
-            move_to_visual_line_start_or_previous_line(app, composer_area(app, screen_area).width);
-        }
-        KeyEvent {
-            code: KeyCode::Char('e'),
-            modifiers: KeyModifiers::CONTROL,
-            ..
-        } => {
-            app.selected_image = None;
-            app.composer_goal_visual_col = None;
-            move_to_visual_line_end_or_next_line(app, composer_area(app, screen_area).width);
-        }
         _ => {
-            app.selected_image = None;
-            app.composer.input(key);
-            normalize_composer_image_paths(app);
-            app.sync_focus_after_composer_change();
+            handle_textbox_key(app, key, screen_area, TextboxKeyOptions::composer());
         }
     }
     Ok(KeyAction::Continue)
@@ -2719,28 +3115,6 @@ fn handle_composer_command(app: &mut App) -> bool {
     if text == "/stash" {
         app.reset_composer();
         app.open_stash_view();
-        return true;
-    }
-
-    if text == "/stash save" {
-        app.status_line = "nothing to stash".to_string();
-        return true;
-    }
-
-    if let Some(rest) = text.strip_prefix("/stash save ") {
-        let draft_text = rest.trim();
-        if draft_text.is_empty() {
-            app.status_line = "nothing to stash".to_string();
-        } else {
-            app.stashes.push(draft_from_parts(
-                draft_text.lines().map(str::to_string).collect(),
-                Vec::new(),
-                app.provider,
-                app.plan_mode,
-            ));
-            app.reset_composer();
-            app.status_line = format!("stashed draft {}", app.stashes.len());
-        }
         return true;
     }
 
@@ -2826,9 +3200,17 @@ fn command_suggestions_for_query(query: &str) -> Vec<CommandSuggestionMatch> {
         .map(|(_, positions, suggestion)| CommandSuggestionMatch {
             command: suggestion.command,
             detail: suggestion.detail,
+            shortcut: suggestion.shortcut,
             positions: shift_positions(&positions, 1),
         })
         .collect()
+}
+
+fn command_suggestion_detail(suggestion: &CommandSuggestionMatch) -> String {
+    match suggestion.shortcut {
+        Some(shortcut) => format!("{} · {shortcut}", suggestion.detail),
+        None => suggestion.detail.to_string(),
+    }
 }
 
 fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
@@ -3591,11 +3973,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if !app.composer_is_active() {
+    let placeholder = app.composer_mode.placeholder();
+    if !app.composer_is_active() || (!app.composer_has_input() && !placeholder.is_empty()) {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(COMPOSER_PROMPT, muted_style()),
-                Span::styled(COMPOSER_PLACEHOLDER, muted_style()),
+                Span::styled(placeholder, muted_style()),
             ])),
             area,
         );
@@ -3949,14 +4332,7 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
     if app.view_mode == ViewMode::History {
-        draw_draft_list(
-            frame,
-            area,
-            app,
-            "History",
-            "no previous prompts",
-            app.history.clone(),
-        );
+        draw_history_list(frame, area, app);
         return;
     }
     if app.autocomplete_is_active() {
@@ -4375,6 +4751,61 @@ fn draw_draft_list(
     draw_scroll_indicators(frame, area, app.list_scroll, drafts.len(), viewport);
 }
 
+fn draw_history_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    if area.height == 0 {
+        return;
+    }
+    let matches = app.history_search_matches();
+    let viewport = area.height.saturating_sub(1).max(1);
+    let viewport_rows = usize::from(viewport);
+    if app.selected < app.list_scroll {
+        app.list_scroll = app.selected;
+    } else if app.selected >= app.list_scroll.saturating_add(viewport_rows) {
+        app.list_scroll = app.selected.saturating_add(1).saturating_sub(viewport_rows);
+    }
+    app.list_scroll = app
+        .list_scroll
+        .min(matches.len().saturating_sub(viewport_rows));
+
+    let query = app.history_search_query();
+    let title = if query.is_empty() {
+        format!("History ({})", app.history.len())
+    } else {
+        format!("History ({}/{})", matches.len(), app.history.len())
+    };
+    let mut lines = vec![Line::from(Span::styled(title, muted_style()))];
+
+    if app.history.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no previous prompts",
+            muted_style(),
+        )));
+    } else if matches.is_empty() {
+        lines.push(Line::from(Span::styled("  no matches", muted_style())));
+    } else {
+        lines.extend(
+            matches
+                .iter()
+                .enumerate()
+                .skip(app.list_scroll)
+                .take(viewport as usize)
+                .filter_map(|(index, match_item)| {
+                    app.history.get(match_item.history_index).map(|draft| {
+                        render_history_row(
+                            match_item.history_index,
+                            draft,
+                            index == app.selected,
+                            area.width as usize,
+                            &match_item.positions,
+                        )
+                    })
+                }),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+    draw_scroll_indicators(frame, area, app.list_scroll, matches.len(), viewport);
+}
+
 fn draw_scroll_indicators(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4451,6 +4882,46 @@ fn render_stash_row(
         format!("{content}{}", " ".repeat(trailing)),
         style,
     ))
+}
+
+fn render_history_row(
+    history_index: usize,
+    draft: &PersistedDraft,
+    selected: bool,
+    width: usize,
+    match_positions: &[usize],
+) -> Line<'static> {
+    let images = if draft.image_paths.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} images", draft.image_paths.len())
+    };
+    let prefix = format!("{:>3}  ", history_index + 1);
+    let preview_width = width
+        .saturating_sub(prefix.chars().count())
+        .saturating_sub(images.chars().count())
+        .max(8);
+    let (preview, preview_positions) =
+        truncate_end_with_positions(&draft_search_text(draft), match_positions, preview_width);
+    let content_width = prefix.chars().count() + preview.chars().count() + images.chars().count();
+    let trailing = width.saturating_sub(content_width);
+    let base_style = if selected {
+        selected_title_style()
+    } else {
+        muted_style()
+    };
+    let mut spans = vec![Span::styled(prefix, base_style)];
+    spans.extend(highlighted_text_spans(
+        &preview,
+        &preview_positions,
+        base_style,
+        autocomplete_match_style(selected),
+    ));
+    if !images.is_empty() {
+        spans.push(Span::styled(images, base_style));
+    }
+    spans.push(Span::styled(" ".repeat(trailing), base_style));
+    Line::from(spans)
 }
 
 #[derive(Clone)]
@@ -4670,7 +5141,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 muted_style(),
             )),
             Line::from(Span::styled(
-                "  ctrl+s to stash           alt+1-6 to open         esc/? to main",
+                "  ctrl+s stash/pop          ctrl+h history         alt+1-6 to open",
                 muted_style(),
             )),
         ];
@@ -4688,10 +5159,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     if app.view_mode == ViewMode::History {
-        frame.render_widget(
-            Paragraph::new("  enter restore · esc main · ? shortcuts").style(muted_style()),
-            area,
-        );
+        let label = if app.history_search_has_input() {
+            "  enter restore · backspace edit · ctrl+u clear · esc clear".to_string()
+        } else {
+            "  enter restore · type search · esc main · ? shortcuts".to_string()
+        };
+        frame.render_widget(Paragraph::new(label).style(muted_style()), area);
         return;
     }
 
@@ -4733,6 +5206,12 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ]);
                 frame.render_widget(Paragraph::new(Line::from(help_spans)), area);
             }
+            ComposerMode::HistorySearch => {
+                frame.render_widget(
+                    Paragraph::new("  enter restore · type search · esc main").style(muted_style()),
+                    area,
+                );
+            }
         }
         return;
     }
@@ -4745,6 +5224,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let mut help_spans = current_agent_mode_spans(app);
     help_spans.extend([
         Span::styled(format!(" · {}", prefix.trim()), muted_style()),
+        Span::styled(" · ctrl+s pop stash", muted_style()),
         Span::styled(" · tab switch agent", muted_style()),
         Span::styled(" · shift+tab switch mode", muted_style()),
         Span::styled(" · ? for shortcuts", muted_style()),
@@ -5850,6 +6330,52 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Copy)]
+    enum TextboxModeUnderTest {
+        NewWorkspace,
+        RenameWorkspace,
+        HistorySearch,
+    }
+
+    fn app_with_textbox_mode(mode: TextboxModeUnderTest, text: &str) -> App {
+        let mut app = test_app();
+        match mode {
+            TextboxModeUnderTest::NewWorkspace => {}
+            TextboxModeUnderTest::RenameWorkspace => {
+                app.composer_mode = ComposerMode::RenameWorkspace("workspace:1".to_string());
+            }
+            TextboxModeUnderTest::HistorySearch => {
+                app.open_history_view();
+            }
+        }
+        app.composer = composer_from_lines(vec![text.to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        app
+    }
+
+    fn press_key(app: &mut App, key: KeyEvent) {
+        let (tx, _rx) = mpsc::channel();
+        handle_key(app, key, &tx, Rect::new(0, 0, 80, 24)).expect("key");
+    }
+
+    fn assert_all_textbox_modes(mut check: impl FnMut(TextboxModeUnderTest)) {
+        for mode in [
+            TextboxModeUnderTest::NewWorkspace,
+            TextboxModeUnderTest::RenameWorkspace,
+            TextboxModeUnderTest::HistorySearch,
+        ] {
+            check(mode);
+        }
+    }
+
+    fn temp_state_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cmux-home-{label}-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ))
+    }
+
     #[test]
     fn parses_codex_session_ids_from_top_tags() {
         let top = "\
@@ -5989,8 +6515,462 @@ mod tests {
         app.open_history_view();
 
         assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.composer_mode, ComposerMode::HistorySearch);
+        assert_eq!(app.composer_mode.placeholder(), "search history");
         assert_eq!(app.selected, 0);
         assert_eq!(app.list_scroll, 0);
+    }
+
+    #[test]
+    fn typing_in_history_filters_and_enter_restores_match() {
+        let mut app = test_app();
+        app.history = vec![
+            draft_from_parts(
+                vec!["vim keybindings markdown".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+            draft_from_parts(
+                vec!["cloud vm billing".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+        ];
+        app.open_history_view();
+        let (tx, rx) = mpsc::channel();
+
+        for ch in ['v', 'i', 'm'] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                &tx,
+                Rect::new(0, 0, 120, 40),
+            )
+            .expect("history search key");
+        }
+
+        assert_eq!(app.history_search_query(), "vim");
+        assert_eq!(app.composer.lines(), &["vim".to_string()]);
+        assert_eq!(app.active_draft_list_len(), 1);
+        assert_eq!(app.selected_history_index(), Some(0));
+        assert!(!app.history_search_matches()[0].positions.is_empty());
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            Rect::new(0, 0, 120, 40),
+        )
+        .expect("history restore");
+
+        assert_eq!(app.view_mode, ViewMode::Workspaces);
+        assert_eq!(
+            app.composer.lines(),
+            &["vim keybindings markdown".to_string()]
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn history_search_backspace_updates_matches() {
+        let mut app = test_app();
+        app.history = vec![
+            draft_from_parts(
+                vec!["vim keybindings markdown".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+            draft_from_parts(
+                vec!["visual diff codeview".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+        ];
+        app.open_history_view();
+        for ch in ['v', 'i', 'm'] {
+            handle_history_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                Rect::new(0, 0, 120, 40),
+            );
+        }
+        assert_eq!(app.active_draft_list_len(), 1);
+
+        handle_history_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert_eq!(app.history_search_query(), "vi");
+        assert_eq!(app.composer.lines(), &["vi".to_string()]);
+        assert_eq!(app.active_draft_list_len(), 2);
+    }
+
+    #[test]
+    fn history_search_is_not_persisted_as_new_workspace_draft() {
+        let mut app = test_app();
+        app.open_history_view();
+        for ch in ['v', 'i', 'm'] {
+            handle_history_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                Rect::new(0, 0, 120, 40),
+            );
+        }
+
+        assert_eq!(app.history_search_query(), "vim");
+        assert!(app.current_draft().is_none());
+    }
+
+    #[test]
+    fn textbox_navigation_shortcuts_work_in_all_modes() {
+        assert_all_textbox_modes(|mode| {
+            let mut app = app_with_textbox_mode(mode, "hello world");
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.cursor(), (0, 0));
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.cursor(), (0, 11));
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.cursor(), (0, 10));
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.cursor(), (0, 11));
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.composer.cursor(), (0, 6));
+
+            move_composer_cursor_to(&mut app.composer, (0, 0));
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            );
+            assert_eq!(app.composer.cursor(), (0, 6));
+
+            press_key(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            assert_eq!(app.composer.cursor(), (0, 0));
+
+            press_key(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            assert_eq!(app.composer.cursor(), (0, 11));
+        });
+    }
+
+    #[test]
+    fn textbox_edit_shortcuts_work_in_all_modes() {
+        assert_all_textbox_modes(|mode| {
+            let mut app = app_with_textbox_mode(mode, "hello world");
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.lines(), &["hello worl".to_string()]);
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.lines(), &["hello ".to_string()]);
+
+            press_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.composer.lines(), &["hello ".to_string()]);
+        });
+    }
+
+    #[test]
+    fn ctrl_h_opens_history_only_when_textbox_is_inactive() {
+        let mut app = test_app();
+        app.history = vec![draft_from_parts(
+            vec!["previous prompt".to_string()],
+            Vec::new(),
+            AgentKind::Codex,
+            false,
+        )];
+        app.reset_composer();
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.composer_mode, ComposerMode::HistorySearch);
+
+        app.composer = composer_from_lines(vec!["abc".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.composer.lines(), &["ab".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_s_with_text_stashes_current_draft() {
+        let mut app = test_app();
+        app.stashes.clear();
+        app.history.clear();
+        app.composer = composer_from_lines(vec!["save this".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert!(!app.composer_has_input());
+        assert_eq!(app.stashes.len(), 1);
+        assert_eq!(app.stashes[0].lines, vec!["save this".to_string()]);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history[0].lines, vec!["save this".to_string()]);
+        assert_eq!(app.status_line, "stashed draft 1");
+    }
+
+    #[test]
+    fn ctrl_s_with_empty_textbox_pops_latest_stash() {
+        let mut app = test_app();
+        app.stashes = vec![
+            draft_from_parts(
+                vec!["older stash".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+            draft_from_parts(
+                vec!["latest stash".to_string()],
+                Vec::new(),
+                AgentKind::Claude,
+                true,
+            ),
+        ];
+        app.reset_composer();
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.composer.lines(), &["latest stash".to_string()]);
+        assert_eq!(app.provider, AgentKind::Claude);
+        assert!(app.plan_mode);
+        assert_eq!(app.stashes.len(), 1);
+        assert_eq!(app.stashes[0].lines, vec!["older stash".to_string()]);
+        assert_eq!(app.status_line, "popped stash 2");
+    }
+
+    #[test]
+    fn ctrl_s_with_empty_textbox_reports_no_stashes() {
+        let mut app = test_app();
+        app.stashes.clear();
+        app.reset_composer();
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.status_line, "no stashes");
+        assert!(!app.composer_has_input());
+    }
+
+    #[test]
+    fn ctrl_s_with_history_search_text_does_not_pop_stash() {
+        let mut app = test_app();
+        app.stashes = vec![draft_from_parts(
+            vec!["stashed draft".to_string()],
+            Vec::new(),
+            AgentKind::Codex,
+            false,
+        )];
+        app.open_history_view();
+        app.composer = composer_from_lines(vec!["vim".to_string()]);
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(app.view_mode, ViewMode::History);
+        assert_eq!(app.composer.lines(), &["vim".to_string()]);
+        assert_eq!(app.stashes.len(), 1);
+        assert_eq!(app.status_line, "nothing to stash");
+    }
+
+    #[test]
+    fn ctrl_s_stash_records_prompt_history() {
+        let state_path = temp_state_path("stash-history");
+        let _ = fs::remove_file(&state_path);
+        let mut app = test_app();
+        app.state_path = state_path.clone();
+        app.stashes.clear();
+        app.history = vec![draft_from_parts(
+            vec!["previous prompt".to_string()],
+            Vec::new(),
+            AgentKind::Codex,
+            false,
+        )];
+        app.composer = composer_from_lines(vec!["stash me".to_string()]);
+        app.provider = AgentKind::Claude;
+        app.plan_mode = true;
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        app.persist_state();
+
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].lines, vec!["stash me".to_string()]);
+        assert_eq!(app.history[0].provider, "claude");
+        assert!(app.history[0].plan_mode);
+        assert_eq!(app.history[1].lines, vec!["previous prompt".to_string()]);
+        let persisted: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("state")).unwrap();
+        assert_eq!(persisted.history.len(), 2);
+        assert_eq!(persisted.history[0].lines, vec!["stash me".to_string()]);
+        assert_eq!(
+            persisted.history[1].lines,
+            vec!["previous prompt".to_string()]
+        );
+        let _ = fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn ctrl_s_pop_preserves_prompt_history() {
+        let state_path = temp_state_path("pop-history");
+        let _ = fs::remove_file(&state_path);
+        let mut app = test_app();
+        app.state_path = state_path.clone();
+        app.history = vec![
+            draft_from_parts(
+                vec!["stashed draft".to_string()],
+                Vec::new(),
+                AgentKind::Claude,
+                true,
+            ),
+            draft_from_parts(
+                vec!["previous prompt".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+        ];
+        app.stashes = vec![draft_from_parts(
+            vec!["stashed draft".to_string()],
+            Vec::new(),
+            AgentKind::Claude,
+            true,
+        )];
+        app.reset_composer();
+
+        press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        );
+        app.persist_state();
+
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].lines, vec!["stashed draft".to_string()]);
+        assert_eq!(app.history[1].lines, vec!["previous prompt".to_string()]);
+        let persisted: PersistedState =
+            serde_json::from_slice(&fs::read(&state_path).expect("state")).unwrap();
+        assert_eq!(persisted.history.len(), 2);
+        assert_eq!(
+            persisted.history[0].lines,
+            vec!["stashed draft".to_string()]
+        );
+        assert_eq!(
+            persisted.history[1].lines,
+            vec!["previous prompt".to_string()]
+        );
+        assert_eq!(
+            persisted.draft.map(|draft| draft.lines),
+            Some(vec!["stashed draft".to_string()])
+        );
+        let _ = fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn restoring_stash_preserves_prompt_history() {
+        let mut app = test_app();
+        app.history = vec![
+            draft_from_parts(
+                vec!["stashed draft".to_string()],
+                Vec::new(),
+                AgentKind::Claude,
+                true,
+            ),
+            draft_from_parts(
+                vec!["previous prompt".to_string()],
+                Vec::new(),
+                AgentKind::Codex,
+                false,
+            ),
+        ];
+        app.stashes = vec![draft_from_parts(
+            vec!["stashed draft".to_string()],
+            Vec::new(),
+            AgentKind::Claude,
+            true,
+        )];
+        app.reset_composer();
+        app.open_stash_view();
+
+        press_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.composer.lines(), &["stashed draft".to_string()]);
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[0].lines, vec!["stashed draft".to_string()]);
+        assert_eq!(app.history[1].lines, vec!["previous prompt".to_string()]);
+    }
+
+    #[test]
+    fn command_suggestion_details_render_shortcuts() {
+        let mut app = test_app();
+        app.composer = composer_from_lines(vec!["/h".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let item = app.autocomplete_items().into_iter().next().expect("item");
+
+        assert_eq!(item.label, "/history");
+        assert_eq!(item.detail, "previous prompts · ctrl+h");
+
+        app.composer = composer_from_lines(vec!["/st".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let items = app.autocomplete_items();
+        let item = items.first().expect("item");
+
+        assert_eq!(item.label, "/stash");
+        assert_eq!(item.detail, "saved drafts · ctrl+s");
+        assert!(items.iter().all(|item| item.label != "/stash save"));
     }
 
     #[test]
