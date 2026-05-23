@@ -9,8 +9,7 @@ On startup, `cmux-home` reads the current world once:
 - `workspace.list` for workspace identity, title, cwd, selected state, and pins
 - `notification.list` for unread counts
 - `surface.read_text` for a fallback latest-message preview
-- `sidebar_state --tab=<workspace>` for agent status metadata
-- `top --all --processes --format tsv` for Codex/Claude tags that identify active sessions
+- `top --all --no-resources --format tsv` for Codex/Claude tags that identify active sessions and agent status metadata, with a fallback to `top --all --format tsv` for older cmux builds
 - `~/.codex/sessions`, `~/.codex/archived_sessions`, and `~/.claude/projects` for JSONL trajectory previews
 
 The snapshot is slower than an event, but it gives the TUI a complete baseline and repairs drift after unknown events.
@@ -51,22 +50,27 @@ The TUI patches these event families without a full refresh:
 - `sidebar.metadata.updated`: patch sidebar status values
 - `sidebar.metadata.cleared` and `sidebar.reset`: clear sidebar status values
 
-The TUI asks for a targeted workspace refresh for surface and pane events:
+The TUI ignores focus-only and layout-only surface or pane events because they
+do not change workspace status rows:
+
+- `surface.selected`
+- `surface.focused`
+- `surface.moved`
+- `surface.reordered`
+- `pane.focused`
+- `pane.resized`
+- `pane.swapped`
+
+The TUI asks for a targeted workspace refresh for surface and pane events that
+can change a workspace row, terminal preview, or launcher filtering:
 
 - `surface.input_sent`
 - `surface.key_sent`
 - `surface.created`
 - `surface.closed`
-- `surface.selected`
-- `surface.focused`
 - `surface.action`
-- `surface.moved`
-- `surface.reordered`
 - `pane.created`
 - `pane.closed`
-- `pane.focused`
-- `pane.resized`
-- `pane.swapped`
 - `pane.broken`
 - `pane.joined`
 
