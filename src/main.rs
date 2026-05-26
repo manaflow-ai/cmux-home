@@ -5540,33 +5540,31 @@ fn skill_fs_event_affects_catalog(event: &NotifyEvent, workspace_cwd: &str) -> b
             | NotifyEventKind::Remove(_)
             | NotifyEventKind::Other
     );
-    relevant_kind
-        && (event.paths.is_empty()
-            || event
-                .paths
-                .iter()
-                .any(|path| skill_fs_path_affects_catalog(path, workspace_cwd)))
+    if !relevant_kind {
+        return false;
+    }
+    if event.paths.is_empty() {
+        return true;
+    }
+
+    let interest_paths = skill_watch_interest_paths(workspace_cwd);
+    event
+        .paths
+        .iter()
+        .any(|path| skill_fs_path_affects_catalog(path, &interest_paths))
 }
 
-fn skill_fs_path_affects_catalog(path: &Path, workspace_cwd: &str) -> bool {
+fn skill_fs_path_affects_catalog(path: &Path, interest_paths: &[PathBuf]) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
-        || path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some(
-                    "skills"
-                        | "plugins"
-                        | "cache"
-                        | "marketplaces"
-                        | ".codex"
-                        | ".claude"
-                        | ".agents"
-                )
-            )
-        })
-        || skill_watch_interest_paths(workspace_cwd)
-            .iter()
-            .any(|interest_path| interest_path == path)
+        || path
+            .components()
+            .any(|component| component.as_os_str().to_str() == Some("skills"))
+        || {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            interest_paths
+                .iter()
+                .any(|interest_path| interest_path == &key)
+        }
 }
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
@@ -7132,7 +7130,8 @@ mod tests {
         };
 
         let ignores_git_event = !skill_fs_event_affects_catalog(&unrelated_git_event, "/workspace");
-        let matches_skill_event = skill_fs_event_affects_catalog(&skill_manifest_event, "/workspace");
+        let matches_skill_event =
+            skill_fs_event_affects_catalog(&skill_manifest_event, "/workspace");
 
         match previous_claude_home {
             Some(value) => std::env::set_var("CLAUDE_HOME", value),
