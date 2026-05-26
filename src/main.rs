@@ -7108,6 +7108,41 @@ mod tests {
     }
 
     #[test]
+    fn skill_watcher_ignores_unrelated_plugin_cache_churn() {
+        let previous_claude_home = std::env::var_os("CLAUDE_HOME");
+        std::env::set_var("CLAUDE_HOME", "/tmp/cmux-home-test-claude");
+
+        let unrelated_git_event = NotifyEvent {
+            kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from(
+                "/tmp/cmux-home-test-claude/plugins/cache/temp_git/.git/objects/pack/pack.idx",
+            )],
+            attrs: Default::default(),
+        };
+        let skill_manifest_event = NotifyEvent {
+            kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![PathBuf::from(
+                "/tmp/cmux-home-test-claude/plugins/cache/openai-codex/codex/1.0.0/skills/codex/SKILL.md",
+            )],
+            attrs: Default::default(),
+        };
+
+        let ignores_git_event = !skill_fs_event_affects_catalog(&unrelated_git_event, "/workspace");
+        let matches_skill_event = skill_fs_event_affects_catalog(&skill_manifest_event, "/workspace");
+
+        match previous_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_HOME", value),
+            None => std::env::remove_var("CLAUDE_HOME"),
+        }
+        assert!(ignores_git_event);
+        assert!(matches_skill_event);
+    }
+
+    #[test]
     fn skill_watcher_reconciles_custom_home_creation_events() {
         let nonce = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
