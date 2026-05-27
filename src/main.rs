@@ -6315,6 +6315,16 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test env lock")
+    }
 
     fn test_app() -> App {
         App::new(Args {
@@ -7107,6 +7117,7 @@ mod tests {
 
     #[test]
     fn skill_watcher_ignores_unrelated_plugin_cache_churn() {
+        let _env_guard = test_env_lock();
         let previous_claude_home = std::env::var_os("CLAUDE_HOME");
         std::env::set_var("CLAUDE_HOME", "/tmp/cmux-home-test-claude");
 
@@ -7143,6 +7154,7 @@ mod tests {
 
     #[test]
     fn skill_watcher_reconciles_custom_home_creation_events() {
+        let _env_guard = test_env_lock();
         let nonce = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
