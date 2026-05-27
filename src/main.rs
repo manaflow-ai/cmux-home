@@ -3160,14 +3160,28 @@ fn handle_composer_command(app: &mut App) -> bool {
     }
 
     if text.starts_with('/') {
+        if slash_skill_prompt(app, &text) {
+            return false;
+        }
         if complete_autocomplete_selection(app) {
-            return true;
+            let completed_text = app.composer.lines().join("\n").trim().to_string();
+            return !slash_skill_prompt(app, &completed_text);
         }
         app.status_line = "unknown command".to_string();
         return true;
     }
 
     false
+}
+
+fn slash_skill_prompt(app: &App, text: &str) -> bool {
+    let Some(body) = text.strip_prefix('/') else {
+        return false;
+    };
+    let Some(name) = body.split_whitespace().next() else {
+        return false;
+    };
+    !name.is_empty() && skill_name_exists(&app.skills, name)
 }
 
 fn complete_autocomplete_selection(app: &mut App) -> bool {
