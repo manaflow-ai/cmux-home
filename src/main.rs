@@ -7497,6 +7497,43 @@ mod tests {
     }
 
     #[test]
+    fn enter_with_slash_skill_autocomplete_completes_and_submits_for_both_agents() {
+        for provider in [AgentKind::Codex, AgentKind::Claude] {
+            let mut app = test_app();
+            app.provider = provider;
+            app.skills = vec![SkillEntry {
+                name: "cmux-workspace".to_string(),
+                description: "workspace helper".to_string(),
+                sources: vec!["codex".to_string(), "claude".to_string()],
+                priority: 0,
+                path: PathBuf::from("/tmp/cmux-workspace/SKILL.md"),
+            }];
+            app.composer = composer_from_lines(vec!["/cmux-worksp".to_string()]);
+            app.composer.move_cursor(CursorMove::End);
+            assert!(app.autocomplete_is_active());
+            let (tx, rx) = mpsc::channel();
+
+            let action = handle_composer_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+                Rect::new(0, 0, 120, 40),
+            )
+            .expect("enter");
+
+            assert!(matches!(action, KeyAction::Continue));
+            let request = rx.try_recv().expect("background submit request");
+            assert_eq!(request.provider, provider);
+            assert_eq!(request.prompt, "/cmux-workspace");
+            assert!(!app.composer_has_input());
+            assert!(app
+                .workspaces
+                .first()
+                .is_some_and(|workspace| workspace.id.starts_with("pending:")));
+        }
+    }
+
+    #[test]
     fn at_file_completion_replaces_current_token_only() {
         let mut app = App::new(Args {
             socket: Some("/tmp/cmux-home-test.sock".to_string()),
@@ -7622,6 +7659,39 @@ mod tests {
 
         assert!(!complete_autocomplete_selection(&mut app));
         assert!(!handle_composer_command(&mut app));
+    }
+
+    #[test]
+    fn slash_skill_prompt_submits_for_both_agents() {
+        for provider in [AgentKind::Codex, AgentKind::Claude] {
+            let mut app = test_app();
+            app.provider = provider;
+            app.skills = vec![SkillEntry {
+                name: "auto-issue".to_string(),
+                description: "bug helper".to_string(),
+                sources: vec!["codex".to_string(), "claude".to_string()],
+                priority: 0,
+                path: PathBuf::from("/tmp/auto-issue/SKILL.md"),
+            }];
+            app.composer = composer_from_lines(vec!["/auto-issue reproduce and fix".to_string()]);
+            app.composer.move_cursor(CursorMove::End);
+            let (tx, rx) = mpsc::channel();
+
+            let action = handle_composer_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+                Rect::new(0, 0, 120, 40),
+            )
+            .expect("enter");
+
+            assert!(matches!(action, KeyAction::Continue));
+            let request = rx.try_recv().expect("background submit request");
+            assert_eq!(request.provider, provider);
+            assert_eq!(request.prompt, "/auto-issue reproduce and fix");
+            assert!(!app.composer_has_input());
+            assert_ne!(app.status_line, "unknown command");
+        }
     }
 
     #[test]
