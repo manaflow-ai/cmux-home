@@ -916,20 +916,20 @@ impl App {
                     })
                 }
             }
+            Some("surface.selected")
+            | Some("surface.focused")
+            | Some("surface.moved")
+            | Some("surface.reordered")
+            | Some("pane.focused")
+            | Some("pane.resized")
+            | Some("pane.swapped") => None,
             Some("surface.input_sent")
             | Some("surface.key_sent")
             | Some("surface.created")
             | Some("surface.closed")
-            | Some("surface.selected")
-            | Some("surface.focused")
             | Some("surface.action")
-            | Some("surface.moved")
-            | Some("surface.reordered")
             | Some("pane.created")
             | Some("pane.closed")
-            | Some("pane.focused")
-            | Some("pane.resized")
-            | Some("pane.swapped")
             | Some("pane.broken")
             | Some("pane.joined") => {
                 event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
@@ -1831,10 +1831,51 @@ impl App {
                 .saturating_add(delta as usize)
                 .min(max_scroll)
         };
+        self.move_selection_into_scroll_view(delta, viewport_height);
     }
 
     fn clamp_list_scroll(&mut self, viewport_height: u16) {
         self.list_scroll = self.list_scroll.min(self.max_list_scroll(viewport_height));
+    }
+
+    fn move_selection_into_scroll_view(&mut self, delta: isize, viewport_height: u16) {
+        if matches!(self.view_mode, ViewMode::Stashes | ViewMode::History) {
+            let len = self.active_draft_list_len();
+            if len == 0 {
+                self.selected = 0;
+                return;
+            }
+            let rows = usize::from(viewport_height.saturating_sub(1).max(1));
+            let first = self.list_scroll.min(len.saturating_sub(1));
+            let last = first.saturating_add(rows.saturating_sub(1)).min(len - 1);
+            self.selected = self.selected.clamp(first, last);
+            return;
+        }
+
+        let rows = visible_rows(&self.workspaces, &self.collapsed_groups);
+        if rows.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let viewport_rows = usize::from(viewport_height.max(1));
+        let first = self.list_scroll.min(rows.len().saturating_sub(1));
+        let last = first
+            .saturating_add(viewport_rows.saturating_sub(1))
+            .min(rows.len() - 1);
+        if self.selected >= first && self.selected <= last {
+            return;
+        }
+
+        let candidate = if delta.is_negative() {
+            (first..=last)
+                .rev()
+                .find(|index| is_selectable_row(rows.get(*index)))
+        } else {
+            (first..=last).find(|index| is_selectable_row(rows.get(*index)))
+        };
+        if let Some(index) = candidate {
+            self.selected = index;
+        }
     }
 
     fn ensure_selected_visible(&mut self, viewport_height: u16) {
@@ -5010,9 +5051,9 @@ fn render_workspace_row(
         .unwrap_or_else(|| "-".to_string());
     let group = display_group(state);
     let unread = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention {
-        "   ∙"
+        "    ∙"
     } else {
-        "    "
+        "     "
     };
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let marker = match group {
@@ -5638,11 +5679,10 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let top = client
-        .v1("top --all --processes --format tsv")
-        .unwrap_or_default();
+    let top = load_top_metadata_tsv(&mut client, "--all");
     let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
-    let conversations_by_workspace = load_conversations_by_workspace(&mut client, &workspaces);
+    let top_agent_statuses = parse_top_agent_statuses(&top);
+    let conversations_by_workspace = load_conversations_by_workspace_from_top(&top, &workspaces);
 
     let mut next = Vec::new();
     for item in workspaces {
@@ -5661,9 +5701,14 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         let conversation = workspace_item_keys(&item)
             .iter()
             .find_map(|key| conversations_by_workspace.get(key));
-        if let Some(workspace) =
-            workspace_from_list_item(&mut client, &item, unread_notifications, conversation)
-        {
+        let statuses = statuses_for_workspace_item(&item, &top_agent_statuses);
+        if let Some(workspace) = workspace_from_list_item_with_statuses(
+            &mut client,
+            &item,
+            unread_notifications,
+            conversation,
+            Some(statuses),
+        ) {
             next.push(workspace);
         }
     }
@@ -5732,6 +5777,16 @@ fn workspace_from_list_item(
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
 ) -> Option<WorkspaceStatus> {
+    workspace_from_list_item_with_statuses(client, item, unread_notifications, conversation, None)
+}
+
+fn workspace_from_list_item_with_statuses(
+    client: &mut CmuxClient,
+    item: &Value,
+    unread_notifications: usize,
+    conversation: Option<&ConversationSnapshot>,
+    statuses: Option<HashMap<String, String>>,
+) -> Option<WorkspaceStatus> {
     let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
         return None;
@@ -5775,7 +5830,9 @@ fn workspace_from_list_item(
         conversation,
         updated_at: None,
     };
-    if let Ok(sidebar) = client.v1(&format!("sidebar_state --tab={id}")) {
+    if let Some(statuses) = statuses {
+        workspace.statuses = statuses;
+    } else if let Ok(sidebar) = client.v1(&format!("sidebar_state --tab={id}")) {
         workspace.statuses = parse_sidebar_statuses(&sidebar);
     }
     Some(workspace)
@@ -5868,6 +5925,17 @@ fn cmux_home_process_command(command: &str) -> bool {
     name == "cmux-home"
 }
 
+fn statuses_for_workspace_item(
+    item: &Value,
+    statuses_by_workspace: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, String> {
+    workspace_item_keys(item)
+        .iter()
+        .find_map(|key| statuses_by_workspace.get(key))
+        .cloned()
+        .unwrap_or_default()
+}
+
 #[derive(Default)]
 struct TopConversationRefs {
     codex_sessions_by_workspace: HashMap<String, HashSet<String>>,
@@ -5878,16 +5946,43 @@ fn load_conversations_by_workspace(
     client: &mut CmuxClient,
     workspaces: &[Value],
 ) -> HashMap<String, ConversationSnapshot> {
-    let top_command = if workspaces.len() == 1 {
+    let top_scope = if workspaces.len() == 1 {
         workspace_item_ref(&workspaces[0])
-            .map(|workspace_ref| {
-                format!("top --workspace {workspace_ref} --processes --format tsv")
-            })
-            .unwrap_or_else(|| "top --all --processes --format tsv".to_string())
+            .map(|workspace_ref| format!("--workspace {workspace_ref}"))
+            .unwrap_or_else(|| "--all".to_string())
     } else {
-        "top --all --processes --format tsv".to_string()
+        "--all".to_string()
     };
-    let top = client.v1(&top_command).unwrap_or_default();
+    let top = load_top_metadata_tsv(client, &top_scope);
+    load_conversations_by_workspace_from_top(&top, workspaces)
+}
+
+fn load_top_metadata_tsv(client: &mut CmuxClient, scope_args: &str) -> String {
+    match client.v1(&top_metadata_tsv_command(scope_args, true)) {
+        Ok(top) => top,
+        Err(_) => client
+            .v1(&top_metadata_tsv_command(scope_args, false))
+            .unwrap_or_default(),
+    }
+}
+
+fn top_metadata_tsv_command(scope_args: &str, no_resources: bool) -> String {
+    let scope_args = scope_args.trim();
+    let mut parts = vec!["top".to_string()];
+    if !scope_args.is_empty() {
+        parts.push(scope_args.to_string());
+    }
+    if no_resources {
+        parts.push("--no-resources".to_string());
+    }
+    parts.push("--format tsv".to_string());
+    parts.join(" ")
+}
+
+fn load_conversations_by_workspace_from_top(
+    top: &str,
+    workspaces: &[Value],
+) -> HashMap<String, ConversationSnapshot> {
     let top_refs = parse_top_conversation_refs(&top);
     let mut conversations = HashMap::new();
 
@@ -5976,6 +6071,38 @@ fn parse_top_conversation_refs(text: &str) -> TopConversationRefs {
         }
     }
     refs
+}
+
+fn parse_top_agent_statuses(text: &str) -> HashMap<String, HashMap<String, String>> {
+    let mut statuses = HashMap::new();
+    for line in text.lines() {
+        let cols = line.split('\t').collect::<Vec<_>>();
+        if cols.len() < 7 || cols[3] != "tag" || !cols[5].starts_with("workspace:") {
+            continue;
+        }
+        let Some(agent_key) = agent_status_key_from_top_tag(cols[4]) else {
+            continue;
+        };
+        let value = cols[6].trim();
+        if value.is_empty() {
+            continue;
+        }
+        statuses
+            .entry(cols[5].to_string())
+            .or_insert_with(HashMap::new)
+            .insert(agent_key.to_string(), value.to_string());
+    }
+    statuses
+}
+
+fn agent_status_key_from_top_tag(tag_id: &str) -> Option<&'static str> {
+    let (_, tag) = tag_id.split_once(":tag:")?;
+    match tag {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "claude_code" => Some("claude_code"),
+        _ => None,
+    }
 }
 
 fn extract_codex_session_id(value: &str) -> Option<String> {
@@ -6454,6 +6581,48 @@ mod tests {
             .get("workspace:84")
             .is_some_and(|sessions| sessions.contains("019e266c-c7de-7052-b819-bcf5df17ada5")));
         assert!(refs.claude_workspaces.contains("workspace:40"));
+    }
+
+    #[test]
+    fn top_metadata_tsv_command_prefers_no_resources() {
+        assert_eq!(
+            top_metadata_tsv_command("--all", true),
+            "top --all --no-resources --format tsv"
+        );
+        assert_eq!(
+            top_metadata_tsv_command("--workspace workspace:7", true),
+            "top --workspace workspace:7 --no-resources --format tsv"
+        );
+        assert_eq!(
+            top_metadata_tsv_command("--all", false),
+            "top --all --format tsv"
+        );
+    }
+
+    #[test]
+    fn parses_agent_statuses_from_top_base_tags() {
+        let top = "\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:codex\tworkspace:84\tRunning\n\
+0.0\t0\t0\ttag\tworkspace:ABC:tag:codex.019e266c-c7de-7052-b819-bcf5df17ada5\tworkspace:84\t\n\
+0.0\t0\t0\ttag\tworkspace:DEF:tag:claude_code\tworkspace:40\tIdle\n";
+
+        let statuses = parse_top_agent_statuses(top);
+
+        assert_eq!(
+            statuses
+                .get("workspace:84")
+                .and_then(|items| items.get("codex"))
+                .map(String::as_str),
+            Some("Running")
+        );
+        assert_eq!(
+            statuses
+                .get("workspace:40")
+                .and_then(|items| items.get("claude_code"))
+                .map(String::as_str),
+            Some("Idle")
+        );
+        assert_eq!(statuses.get("workspace:84").map(HashMap::len), Some(1));
     }
 
     #[test]
@@ -7682,6 +7851,38 @@ mod tests {
     }
 
     #[test]
+    fn focus_and_layout_events_do_not_request_refresh() {
+        let mut app = test_app();
+        app.workspaces = vec![WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "task".to_string(),
+            ..WorkspaceStatus::default()
+        }];
+
+        for name in [
+            "surface.selected",
+            "surface.focused",
+            "surface.moved",
+            "surface.reordered",
+            "pane.focused",
+            "pane.resized",
+            "pane.swapped",
+        ] {
+            let frame = EventFrame {
+                kind: Some("event".to_string()),
+                name: Some(name.to_string()),
+                workspace_id: Some("workspace:1".to_string()),
+                payload: json!({ "workspace_id": "workspace:1" }),
+            };
+
+            assert!(
+                app.apply_cmux_event(&frame).is_none(),
+                "{name} should not trigger a snapshot refresh"
+            );
+        }
+    }
+
+    #[test]
     fn refresh_filters_current_cmux_home_workspace() {
         let mut app = test_app();
         app.own_workspace_keys = HashSet::from(["self-workspace".to_string()]);
@@ -7762,7 +7963,75 @@ mod tests {
     }
 
     #[test]
-    fn workspace_row_places_unread_indicator_one_cell_right() {
+    fn mouse_scroll_up_keeps_workspace_view_at_new_top() {
+        let mut app = test_app();
+        app.workspaces = (0..12)
+            .map(|index| WorkspaceStatus {
+                id: format!("workspace:{index}"),
+                title: format!("task {index}"),
+                ..WorkspaceStatus::default()
+            })
+            .collect();
+        app.selected = 12;
+        app.list_scroll = 7;
+        let area = Rect::new(0, 0, 80, 10);
+        let viewport = area
+            .height
+            .saturating_sub(app.bottom_reserved_height(10, 80));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.list_scroll, 4);
+        assert_eq!(app.selected, 9);
+        app.ensure_selected_visible(viewport);
+        assert_eq!(app.list_scroll, 4);
+    }
+
+    #[test]
+    fn mouse_scroll_down_keeps_workspace_view_at_new_offset() {
+        let mut app = test_app();
+        app.workspaces = (0..12)
+            .map(|index| WorkspaceStatus {
+                id: format!("workspace:{index}"),
+                title: format!("task {index}"),
+                ..WorkspaceStatus::default()
+            })
+            .collect();
+        app.selected = 0;
+        app.list_scroll = 0;
+        let area = Rect::new(0, 0, 80, 10);
+        let viewport = area
+            .height
+            .saturating_sub(app.bottom_reserved_height(10, 80));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        );
+
+        assert_eq!(app.list_scroll, 3);
+        assert_eq!(app.selected, 3);
+        app.ensure_selected_visible(viewport);
+        assert_eq!(app.list_scroll, 3);
+    }
+
+    #[test]
+    fn workspace_row_places_unread_indicator_after_four_cell_indent() {
         let workspace = WorkspaceStatus {
             id: "workspace:1".to_string(),
             title: "codex: fix layout".to_string(),
@@ -7778,7 +8047,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.starts_with("   ∙"));
+        assert!(text.starts_with("    ∙"));
     }
 
     #[test]
