@@ -5581,33 +5581,89 @@ fn skill_fs_event_affects_catalog(event: &NotifyEvent, workspace_cwd: &str) -> b
             | NotifyEventKind::Remove(_)
             | NotifyEventKind::Other
     );
-    relevant_kind
-        && (event.paths.is_empty()
-            || event
-                .paths
-                .iter()
-                .any(|path| skill_fs_path_affects_catalog(path, workspace_cwd)))
+    if !relevant_kind {
+        return false;
+    }
+    if event.paths.is_empty() {
+        return true;
+    }
+
+    let interest_paths = skill_watch_interest_paths(workspace_cwd);
+    let plugin_entry_event = matches!(
+        event.kind,
+        NotifyEventKind::Any
+            | NotifyEventKind::Create(_)
+            | NotifyEventKind::Remove(_)
+            | NotifyEventKind::Modify(notify::event::ModifyKind::Name(_))
+            | NotifyEventKind::Other
+    );
+    event
+        .paths
+        .iter()
+        .any(|path| skill_fs_path_affects_catalog(path, &interest_paths, plugin_entry_event))
 }
 
-fn skill_fs_path_affects_catalog(path: &Path, workspace_cwd: &str) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
-        || path.components().any(|component| {
-            matches!(
-                component.as_os_str().to_str(),
-                Some(
-                    "skills"
-                        | "plugins"
-                        | "cache"
-                        | "marketplaces"
-                        | ".codex"
-                        | ".claude"
-                        | ".agents"
-                )
-            )
-        })
-        || skill_watch_interest_paths(workspace_cwd)
-            .iter()
-            .any(|interest_path| interest_path == path)
+fn skill_fs_path_affects_catalog(
+    path: &Path,
+    interest_paths: &[PathBuf],
+    plugin_entry_event: bool,
+) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+        || path
+            .components()
+            .any(|component| component.as_os_str().to_str() == Some("skills"))
+    {
+        return true;
+    }
+
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    interest_paths
+        .iter()
+        .any(|interest_path| interest_path == &key)
+        || (plugin_entry_event && path_is_plugin_catalog_entry(&key, interest_paths))
+}
+
+fn path_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    if path_file_name_is_hidden(path) {
+        return false;
+    }
+    path_parent_is_plugin_catalog_root(path, interest_paths)
+        || path_parent_is_plugin_catalog_entry(path, interest_paths)
+}
+
+fn path_parent_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path_parent_is_plugin_catalog_root(parent, interest_paths)
+}
+
+fn path_file_name_is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn path_parent_is_plugin_catalog_root(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let parent_key = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    interest_paths.iter().any(|interest_path| {
+        interest_path == &parent_key && path_is_plugin_catalog_root(interest_path)
+    })
+}
+
+fn path_is_plugin_catalog_root(path: &Path) -> bool {
+    let mut components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str());
+    let last = components.next_back();
+    let previous = components.next_back();
+    matches!(
+        (previous, last),
+        (Some("plugins"), Some("cache")) | (Some("plugins"), Some("marketplaces"))
+    )
 }
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
@@ -6444,6 +6500,16 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("test env lock")
+    }
 
     fn test_app() -> App {
         App::new(Args {
@@ -7277,7 +7343,101 @@ mod tests {
     }
 
     #[test]
+    fn skill_watcher_ignores_unrelated_plugin_cache_churn() {
+        let _env_guard = test_env_lock();
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let claude_home = std::env::temp_dir().join(format!(
+            "cmux-home-test-claude-{}-{nonce}",
+            std::process::id()
+        ));
+        let plugin_cache = claude_home.join("plugins/cache");
+        fs::create_dir_all(&plugin_cache).expect("plugin cache");
+        let previous_claude_home = std::env::var_os("CLAUDE_HOME");
+        std::env::set_var("CLAUDE_HOME", &claude_home);
+
+        let unrelated_git_event = NotifyEvent {
+            kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![plugin_cache.join("temp_git/.git/objects/pack/pack.idx")],
+            attrs: Default::default(),
+        };
+        let skill_manifest_event = NotifyEvent {
+            kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![plugin_cache.join("openai-codex/codex/1.0.0/skills/codex/SKILL.md")],
+            attrs: Default::default(),
+        };
+
+        let ignores_git_event = !skill_fs_event_affects_catalog(&unrelated_git_event, "/workspace");
+        let matches_skill_event =
+            skill_fs_event_affects_catalog(&skill_manifest_event, "/workspace");
+
+        match previous_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_HOME", value),
+            None => std::env::remove_var("CLAUDE_HOME"),
+        }
+        let _ = fs::remove_dir_all(&claude_home);
+        assert!(ignores_git_event);
+        assert!(matches_skill_event);
+    }
+
+    #[test]
+    fn skill_watcher_detects_plugin_catalog_entry_changes() {
+        let _env_guard = test_env_lock();
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let claude_home = std::env::temp_dir().join(format!(
+            "cmux-home-test-claude-{}-{nonce}",
+            std::process::id()
+        ));
+        let plugin_cache = claude_home.join("plugins/cache");
+        fs::create_dir_all(&plugin_cache).expect("plugin cache");
+        let previous_claude_home = std::env::var_os("CLAUDE_HOME");
+        std::env::set_var("CLAUDE_HOME", &claude_home);
+
+        let plugin_install_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![plugin_cache.join("new-plugin")],
+            attrs: Default::default(),
+        };
+        let direct_skill_install_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![plugin_cache.join("direct-plugin/my-skill")],
+            attrs: Default::default(),
+        };
+        let hidden_cache_dir_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![plugin_cache.join("direct-plugin/.git")],
+            attrs: Default::default(),
+        };
+
+        let matches_plugin_install =
+            skill_fs_event_affects_catalog(&plugin_install_event, "/workspace");
+        let matches_direct_skill_install =
+            skill_fs_event_affects_catalog(&direct_skill_install_event, "/workspace");
+        let ignores_hidden_cache_dir =
+            !skill_fs_event_affects_catalog(&hidden_cache_dir_event, "/workspace");
+
+        match previous_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_HOME", value),
+            None => std::env::remove_var("CLAUDE_HOME"),
+        }
+        let _ = fs::remove_dir_all(&claude_home);
+        assert!(matches_plugin_install);
+        assert!(matches_direct_skill_install);
+        assert!(ignores_hidden_cache_dir);
+    }
+
+    #[test]
     fn skill_watcher_reconciles_custom_home_creation_events() {
+        let _env_guard = test_env_lock();
         let nonce = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
