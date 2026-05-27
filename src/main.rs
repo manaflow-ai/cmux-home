@@ -5583,6 +5583,27 @@ fn skill_fs_path_affects_catalog(
 }
 
 fn path_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    if path_file_name_is_hidden(path) {
+        return false;
+    }
+    path_parent_is_plugin_catalog_root(path, interest_paths)
+        || path_parent_is_plugin_catalog_entry(path, interest_paths)
+}
+
+fn path_parent_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    path_parent_is_plugin_catalog_root(parent, interest_paths)
+}
+
+fn path_file_name_is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
+fn path_parent_is_plugin_catalog_root(path: &Path, interest_paths: &[PathBuf]) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
@@ -7217,9 +7238,23 @@ mod tests {
             paths: vec![plugin_cache.join("new-plugin")],
             attrs: Default::default(),
         };
+        let direct_skill_install_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![plugin_cache.join("direct-plugin/my-skill")],
+            attrs: Default::default(),
+        };
+        let hidden_cache_dir_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![plugin_cache.join("direct-plugin/.git")],
+            attrs: Default::default(),
+        };
 
         let matches_plugin_install =
             skill_fs_event_affects_catalog(&plugin_install_event, "/workspace");
+        let matches_direct_skill_install =
+            skill_fs_event_affects_catalog(&direct_skill_install_event, "/workspace");
+        let ignores_hidden_cache_dir =
+            !skill_fs_event_affects_catalog(&hidden_cache_dir_event, "/workspace");
 
         match previous_claude_home {
             Some(value) => std::env::set_var("CLAUDE_HOME", value),
@@ -7227,6 +7262,8 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&claude_home);
         assert!(matches_plugin_install);
+        assert!(matches_direct_skill_install);
+        assert!(ignores_hidden_cache_dir);
     }
 
     #[test]
