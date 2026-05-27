@@ -5586,9 +5586,10 @@ fn path_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool
     let Some(parent) = path.parent() else {
         return false;
     };
-    interest_paths
-        .iter()
-        .any(|interest_path| interest_path == parent && path_is_plugin_catalog_root(interest_path))
+    let parent_key = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    interest_paths.iter().any(|interest_path| {
+        interest_path == &parent_key && path_is_plugin_catalog_root(interest_path)
+    })
 }
 
 fn path_is_plugin_catalog_root(path: &Path) -> bool {
@@ -7154,25 +7155,31 @@ mod tests {
     #[test]
     fn skill_watcher_ignores_unrelated_plugin_cache_churn() {
         let _env_guard = test_env_lock();
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let claude_home = std::env::temp_dir().join(format!(
+            "cmux-home-test-claude-{}-{nonce}",
+            std::process::id()
+        ));
+        let plugin_cache = claude_home.join("plugins/cache");
+        fs::create_dir_all(&plugin_cache).expect("plugin cache");
         let previous_claude_home = std::env::var_os("CLAUDE_HOME");
-        std::env::set_var("CLAUDE_HOME", "/tmp/cmux-home-test-claude");
+        std::env::set_var("CLAUDE_HOME", &claude_home);
 
         let unrelated_git_event = NotifyEvent {
             kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from(
-                "/tmp/cmux-home-test-claude/plugins/cache/temp_git/.git/objects/pack/pack.idx",
-            )],
+            paths: vec![plugin_cache.join("temp_git/.git/objects/pack/pack.idx")],
             attrs: Default::default(),
         };
         let skill_manifest_event = NotifyEvent {
             kind: NotifyEventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![PathBuf::from(
-                "/tmp/cmux-home-test-claude/plugins/cache/openai-codex/codex/1.0.0/skills/codex/SKILL.md",
-            )],
+            paths: vec![plugin_cache.join("openai-codex/codex/1.0.0/skills/codex/SKILL.md")],
             attrs: Default::default(),
         };
 
@@ -7184,6 +7191,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_HOME", value),
             None => std::env::remove_var("CLAUDE_HOME"),
         }
+        let _ = fs::remove_dir_all(&claude_home);
         assert!(ignores_git_event);
         assert!(matches_skill_event);
     }
@@ -7191,14 +7199,22 @@ mod tests {
     #[test]
     fn skill_watcher_detects_plugin_catalog_entry_changes() {
         let _env_guard = test_env_lock();
+        let nonce = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let claude_home = std::env::temp_dir().join(format!(
+            "cmux-home-test-claude-{}-{nonce}",
+            std::process::id()
+        ));
+        let plugin_cache = claude_home.join("plugins/cache");
+        fs::create_dir_all(&plugin_cache).expect("plugin cache");
         let previous_claude_home = std::env::var_os("CLAUDE_HOME");
-        std::env::set_var("CLAUDE_HOME", "/tmp/cmux-home-test-claude");
+        std::env::set_var("CLAUDE_HOME", &claude_home);
 
         let plugin_install_event = NotifyEvent {
             kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
-            paths: vec![PathBuf::from(
-                "/tmp/cmux-home-test-claude/plugins/cache/new-plugin",
-            )],
+            paths: vec![plugin_cache.join("new-plugin")],
             attrs: Default::default(),
         };
 
@@ -7209,6 +7225,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAUDE_HOME", value),
             None => std::env::remove_var("CLAUDE_HOME"),
         }
+        let _ = fs::remove_dir_all(&claude_home);
         assert!(matches_plugin_install);
     }
 
