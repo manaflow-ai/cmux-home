@@ -5548,23 +5548,59 @@ fn skill_fs_event_affects_catalog(event: &NotifyEvent, workspace_cwd: &str) -> b
     }
 
     let interest_paths = skill_watch_interest_paths(workspace_cwd);
+    let plugin_entry_event = matches!(
+        event.kind,
+        NotifyEventKind::Any
+            | NotifyEventKind::Create(_)
+            | NotifyEventKind::Remove(_)
+            | NotifyEventKind::Modify(notify::event::ModifyKind::Name(_))
+            | NotifyEventKind::Other
+    );
     event
         .paths
         .iter()
-        .any(|path| skill_fs_path_affects_catalog(path, &interest_paths))
+        .any(|path| skill_fs_path_affects_catalog(path, &interest_paths, plugin_entry_event))
 }
 
-fn skill_fs_path_affects_catalog(path: &Path, interest_paths: &[PathBuf]) -> bool {
-    path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
+fn skill_fs_path_affects_catalog(
+    path: &Path,
+    interest_paths: &[PathBuf],
+    plugin_entry_event: bool,
+) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md")
         || path
             .components()
             .any(|component| component.as_os_str().to_str() == Some("skills"))
-        || {
-            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            interest_paths
-                .iter()
-                .any(|interest_path| interest_path == &key)
-        }
+    {
+        return true;
+    }
+
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    interest_paths
+        .iter()
+        .any(|interest_path| interest_path == &key)
+        || (plugin_entry_event && path_is_plugin_catalog_entry(&key, interest_paths))
+}
+
+fn path_is_plugin_catalog_entry(path: &Path, interest_paths: &[PathBuf]) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    interest_paths
+        .iter()
+        .any(|interest_path| interest_path == parent && path_is_plugin_catalog_root(interest_path))
+}
+
+fn path_is_plugin_catalog_root(path: &Path) -> bool {
+    let mut components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str());
+    let last = components.next_back();
+    let previous = components.next_back();
+    matches!(
+        (previous, last),
+        (Some("plugins"), Some("cache")) | (Some("plugins"), Some("marketplaces"))
+    )
 }
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
@@ -7150,6 +7186,30 @@ mod tests {
         }
         assert!(ignores_git_event);
         assert!(matches_skill_event);
+    }
+
+    #[test]
+    fn skill_watcher_detects_plugin_catalog_entry_changes() {
+        let _env_guard = test_env_lock();
+        let previous_claude_home = std::env::var_os("CLAUDE_HOME");
+        std::env::set_var("CLAUDE_HOME", "/tmp/cmux-home-test-claude");
+
+        let plugin_install_event = NotifyEvent {
+            kind: NotifyEventKind::Create(notify::event::CreateKind::Folder),
+            paths: vec![PathBuf::from(
+                "/tmp/cmux-home-test-claude/plugins/cache/new-plugin",
+            )],
+            attrs: Default::default(),
+        };
+
+        let matches_plugin_install =
+            skill_fs_event_affects_catalog(&plugin_install_event, "/workspace");
+
+        match previous_claude_home {
+            Some(value) => std::env::set_var("CLAUDE_HOME", value),
+            None => std::env::remove_var("CLAUDE_HOME"),
+        }
+        assert!(matches_plugin_install);
     }
 
     #[test]
