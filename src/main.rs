@@ -6952,6 +6952,28 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_deletes_character_in_all_textbox_modes() {
+        assert_all_textbox_modes(|mode| {
+            let mut app = app_with_textbox_mode(mode, "hello");
+            move_composer_cursor_to(&mut app.composer, (0, 2));
+            let (tx, _rx) = mpsc::channel();
+
+            let action = handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &tx,
+                Rect::new(0, 0, 80, 24),
+            )
+            .expect("ctrl+d");
+
+            assert!(matches!(action, KeyAction::Continue));
+            assert_eq!(app.composer.lines(), &["helo".to_string()]);
+            assert_eq!(app.composer.cursor(), (0, 2));
+            assert_ne!(app.status_line, "press ctrl+d to quit");
+        });
+    }
+
+    #[test]
     fn ctrl_h_opens_history_only_when_textbox_is_inactive() {
         let mut app = test_app();
         app.history = vec![draft_from_parts(
