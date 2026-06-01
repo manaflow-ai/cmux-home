@@ -2449,11 +2449,11 @@ fn handle_key(
 ) -> Result<KeyAction> {
     match key {
         KeyEvent {
-            code: KeyCode::Char(ch @ ('c' | 'd')),
+            code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
             ..
         } => {
-            return if app.record_quit_tap(ch) {
+            return if app.record_quit_tap('c') {
                 Ok(KeyAction::Quit)
             } else {
                 Ok(KeyAction::Continue)
@@ -2866,6 +2866,19 @@ fn handle_textbox_key(
             } else {
                 app.selected_image = None;
                 app.composer.input(key);
+            }
+            true
+        }
+        KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } => {
+            if options.allow_image_tokens && delete_image_token_after_cursor(&mut app.composer) {
+                app.selected_image = None;
+            } else {
+                app.selected_image = None;
+                app.composer.delete_next_char();
             }
             true
         }
@@ -6949,6 +6962,54 @@ mod tests {
             );
             assert_eq!(app.composer.lines(), &["hello ".to_string()]);
         });
+    }
+
+    #[test]
+    fn ctrl_d_deletes_character_in_all_textbox_modes() {
+        assert_all_textbox_modes(|mode| {
+            let mut app = app_with_textbox_mode(mode, "hello");
+            move_composer_cursor_to(&mut app.composer, (0, 2));
+            let (tx, _rx) = mpsc::channel();
+
+            let action = handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                &tx,
+                Rect::new(0, 0, 80, 24),
+            )
+            .expect("ctrl+d");
+
+            assert!(matches!(action, KeyAction::Continue));
+            assert_eq!(app.composer.lines(), &["helo".to_string()]);
+            assert_eq!(app.composer.cursor(), (0, 2));
+            assert_ne!(app.status_line, "press ctrl+d to quit");
+        });
+    }
+
+    #[test]
+    fn ctrl_d_never_quits_from_workspace_view() {
+        let mut app = test_app();
+        app.reset_composer();
+        let (tx, _rx) = mpsc::channel();
+
+        let first = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &tx,
+            Rect::new(0, 0, 80, 24),
+        )
+        .expect("first ctrl+d");
+        let second = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &tx,
+            Rect::new(0, 0, 80, 24),
+        )
+        .expect("second ctrl+d");
+
+        assert!(matches!(first, KeyAction::Continue));
+        assert!(matches!(second, KeyAction::Continue));
+        assert_ne!(app.status_line, "press ctrl+d to quit");
     }
 
     #[test]

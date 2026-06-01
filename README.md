@@ -44,7 +44,8 @@ cargo run --release -- --config ./cmux-home.json
 - `/history` opens previous prompts.
 - `/`, `$`, and `@` open command, skill, and file suggestions.
 - `Ctrl+J` or `Shift+Enter` inserts a newline.
-- `Ctrl+Q`, double `Ctrl+C`, or double `Ctrl+D` quits.
+- `Ctrl+D` deletes the character under the cursor while editing text.
+- `Ctrl+Q` or double `Ctrl+C` quits.
 
 ## Event-Driven Updates
 
