@@ -2264,6 +2264,8 @@ fn optimistic_workspace_status(
 ) -> WorkspaceStatus {
     WorkspaceStatus {
         id: workspace_id.to_string(),
+        window_id: None,
+        window_ref: None,
         title,
         latest_message: latest_message.clone(),
         selected: false,
@@ -5845,6 +5847,8 @@ fn workspace_from_list_item_with_statuses(
         .unwrap_or_else(|| "standing by for task".to_string());
     let mut workspace = WorkspaceStatus {
         id: id.clone(),
+        window_id: None,
+        window_ref: None,
         title: string_field(item, "title").unwrap_or_else(|| id.chars().take(8).collect()),
         latest_message,
         selected: item
@@ -5867,6 +5871,30 @@ fn workspace_from_list_item_with_statuses(
 
 fn workspace_primary_id(item: &Value) -> Option<String> {
     string_field(item, "id").or_else(|| string_field(item, "ref"))
+}
+
+fn workspace_list_params(_window_id: Option<&str>) -> Value {
+    json!({})
+}
+
+fn workspace_select_params(workspace: &WorkspaceStatus) -> Value {
+    json!({
+        "workspace_id": workspace.id,
+    })
+}
+
+fn workspace_action_params(workspace: &WorkspaceStatus, action: &str) -> Value {
+    json!({
+        "workspace_id": workspace.id,
+        "action": action,
+    })
+}
+
+fn workspace_rename_params(workspace_id: &str, _window_id: Option<&str>, title: &str) -> Value {
+    json!({
+        "workspace_id": workspace_id,
+        "title": title,
+    })
 }
 
 fn workspace_item_keys(item: &Value) -> Vec<String> {
@@ -8096,6 +8124,78 @@ mod tests {
         assert!(!top_has_cmux_home_launcher(
             "0.0\t1\t1\tprocess\t123\tsurface:9\tcodex prompt mentions cmux-home\n"
         ));
+    }
+
+    #[test]
+    fn workspace_items_preserve_window_context() {
+        let item = json!({
+            "id": "workspace-uuid",
+            "ref": "workspace:9",
+            "window_id": "window-uuid",
+            "window_ref": "window:2",
+            "title": "other window task"
+        });
+        let conversation = ConversationSnapshot {
+            actor: ConversationActor::User,
+            preview: "latest prompt".to_string(),
+            modified_at: SystemTime::UNIX_EPOCH,
+        };
+        let mut client = CmuxClient::new("/tmp/cmux-home-test.sock".to_string());
+
+        let workspace = workspace_from_list_item_with_statuses(
+            &mut client,
+            &item,
+            0,
+            Some(&conversation),
+            Some(HashMap::new()),
+        )
+        .expect("workspace item");
+
+        assert_eq!(workspace.window_id.as_deref(), Some("window-uuid"));
+        assert_eq!(workspace.window_ref.as_deref(), Some("window:2"));
+    }
+
+    #[test]
+    fn workspace_rpc_params_include_window_context() {
+        let workspace = WorkspaceStatus {
+            id: "workspace-uuid".to_string(),
+            window_id: Some("window-uuid".to_string()),
+            title: "other window task".to_string(),
+            ..WorkspaceStatus::default()
+        };
+
+        assert_eq!(
+            workspace_select_params(&workspace),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+            })
+        );
+        assert_eq!(
+            workspace_action_params(&workspace, "pin"),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+                "action": "pin",
+            })
+        );
+        assert_eq!(
+            workspace_rename_params("workspace-uuid", workspace.window_id.as_deref(), "renamed"),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+                "title": "renamed",
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_list_params_targets_window_id() {
+        assert_eq!(
+            workspace_list_params(Some("window-uuid")),
+            json!({ "window_id": "window-uuid" })
+        );
+        assert_eq!(workspace_list_params(None), json!({}));
     }
 
     #[test]
