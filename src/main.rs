@@ -281,6 +281,7 @@ enum RefreshRequest {
 struct RefreshSnapshot {
     reason: String,
     workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
     loaded_at: Instant,
 }
 
@@ -306,6 +307,7 @@ struct SubmitRequest {
     latest_message: String,
     command: String,
     command_accepts_prompt: bool,
+    group_id: Option<String>,
     submit_template: Option<String>,
     rename_template: Option<String>,
 }
@@ -354,6 +356,7 @@ struct App {
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     own_workspace_keys: HashSet<String>,
+    own_workspace_group_id: Option<String>,
     selected: usize,
     list_scroll: usize,
     focus_target: FocusTarget,
@@ -529,6 +532,7 @@ impl App {
             show_shortcuts: false,
             workspaces: Vec::new(),
             own_workspace_keys: current_workspace_keys(),
+            own_workspace_group_id: None,
             selected: 0,
             list_scroll: 0,
             focus_target: FocusTarget::MainContent,
@@ -614,6 +618,7 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        self.own_workspace_group_id = snapshot.own_workspace_group_id.clone();
         let pending_workspaces = self
             .workspaces
             .iter()
@@ -1057,6 +1062,7 @@ impl App {
             latest_message: latest_message.clone(),
             command,
             command_accepts_prompt,
+            group_id: self.own_workspace_group_id.clone(),
             submit_template: self.submit_template().map(str::to_string),
             rename_template: self.rename_template.clone(),
         };
@@ -2294,7 +2300,12 @@ fn main() -> Result<()> {
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
     spawn_submit_worker(submit_rx, ui_tx.clone());
     spawn_skill_watcher(app.workspace_cwd.clone(), ui_tx.clone());
-    spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
+    spawn_refresh_worker(
+        app.socket_path.clone(),
+        app.own_workspace_keys.clone(),
+        refresh_rx,
+        ui_tx,
+    );
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
     run_tui(&mut app, ui_rx, refresh_tx, submit_tx)
@@ -5385,6 +5396,9 @@ fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
     if let Some(path) = request.terminal_path.as_deref() {
         params["initial_env"] = json!({ "PATH": path });
     }
+    if let Some(group_id) = request.group_id.as_deref() {
+        params["group_id"] = json!(group_id);
+    }
 
     let mut client = CmuxClient::new(request.socket_path.clone());
     let created = client.v2("workspace.create", params)?;
@@ -5477,6 +5491,7 @@ fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
 
 fn spawn_refresh_worker(
     socket_path: String,
+    own_workspace_keys: HashSet<String>,
     requests: Receiver<RefreshRequest>,
     tx: Sender<UiEvent>,
 ) {
@@ -5487,10 +5502,11 @@ fn spawn_refresh_worker(
             }
             match request {
                 RefreshRequest::All(reason) => {
-                    let result = load_workspaces(&socket_path)
-                        .map(|workspaces| RefreshSnapshot {
+                    let result = load_workspaces(&socket_path, &own_workspace_keys)
+                        .map(|loaded| RefreshSnapshot {
                             reason,
-                            workspaces,
+                            workspaces: loaded.workspaces,
+                            own_workspace_group_id: loaded.own_workspace_group_id,
                             loaded_at: Instant::now(),
                         })
                         .map_err(|err| err.to_string());
@@ -5693,7 +5709,15 @@ fn path_is_plugin_catalog_root(path: &Path) -> bool {
     )
 }
 
-fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
+struct LoadedWorkspaces {
+    workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
+}
+
+fn load_workspaces(
+    socket_path: &str,
+    own_workspace_keys: &HashSet<String>,
+) -> Result<LoadedWorkspaces> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
     let unread_by_workspace = unread_notifications_by_workspace(
@@ -5706,6 +5730,14 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let own_workspace_group_id = workspaces
+        .iter()
+        .find(|item| {
+            workspace_item_keys(item)
+                .iter()
+                .any(|key| own_workspace_keys.contains(key))
+        })
+        .and_then(|item| string_field(item, "group_id"));
     let top = load_top_metadata_tsv(&mut client, "--all");
     let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
     let top_agent_statuses = parse_top_agent_statuses(&top);
@@ -5713,6 +5745,9 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
 
     let mut next = Vec::new();
     for item in workspaces {
+        if !workspace_item_matches_group_scope(&item, own_workspace_group_id.as_deref()) {
+            continue;
+        }
         if workspace_item_is_cmux_home_launcher(&item)
             || workspace_item_keys(&item)
                 .iter()
@@ -5740,7 +5775,10 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         }
     }
 
-    Ok(next)
+    Ok(LoadedWorkspaces {
+        workspaces: next,
+        own_workspace_group_id,
+    })
 }
 
 fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<WorkspaceStatus>> {
@@ -5879,6 +5917,13 @@ fn workspace_item_keys(item: &Value) -> Vec<String> {
         }
     }
     keys
+}
+
+fn workspace_item_matches_group_scope(item: &Value, own_workspace_group_id: Option<&str>) -> bool {
+    match own_workspace_group_id {
+        Some(group_id) => string_field(item, "group_id").as_deref() == Some(group_id),
+        None => true,
+    }
 }
 
 fn workspace_item_ref(item: &Value) -> Option<String> {
@@ -7988,6 +8033,7 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
             loaded_at: Instant::now(),
         });
 
@@ -8046,11 +8092,35 @@ mod tests {
                     ..WorkspaceStatus::default()
                 },
             ],
+            own_workspace_group_id: Some("group-1".to_string()),
             loaded_at: Instant::now(),
         });
 
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, "task-workspace");
+        assert_eq!(app.own_workspace_group_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn workspace_group_scope_filters_to_launcher_group() {
+        let grouped = json!({ "id": "workspace:1", "group_id": "group-1" });
+        let other_group = json!({ "id": "workspace:2", "group_id": "group-2" });
+        let ungrouped = json!({ "id": "workspace:3" });
+
+        assert!(workspace_item_matches_group_scope(
+            &grouped,
+            Some("group-1")
+        ));
+        assert!(!workspace_item_matches_group_scope(
+            &other_group,
+            Some("group-1")
+        ));
+        assert!(!workspace_item_matches_group_scope(
+            &ungrouped,
+            Some("group-1")
+        ));
+        assert!(workspace_item_matches_group_scope(&other_group, None));
+        assert!(workspace_item_matches_group_scope(&ungrouped, None));
     }
 
     #[test]
@@ -8248,6 +8318,7 @@ mod tests {
         app.state_path = state_path.clone();
         app.history.clear();
         app.stashes.clear();
+        app.own_workspace_group_id = Some("group-1".to_string());
         app.composer = composer_from_lines(vec!["instant submit".to_string()]);
         app.composer.move_cursor(CursorMove::End);
         let (tx, rx) = mpsc::channel();
@@ -8256,6 +8327,7 @@ mod tests {
 
         let request = rx.try_recv().expect("background submit request");
         assert_eq!(request.prompt, "instant submit");
+        assert_eq!(request.group_id.as_deref(), Some("group-1"));
         assert!(!app.composer_has_input());
         assert!(app
             .workspaces
@@ -8337,6 +8409,7 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
             loaded_at: Instant::now(),
         });
 
