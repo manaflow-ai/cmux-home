@@ -5796,10 +5796,17 @@ struct GroupMembership {
 
 impl GroupMembership {
     fn load(client: &mut CmuxClient) -> Self {
+        match client.v2("workspace.group.list", json!({})) {
+            Ok(payload) => Self::from_group_list_payload(&payload),
+            Err(_) => GroupMembership::default(),
+        }
+    }
+
+    /// Builds membership from a `workspace.group.list` result payload. Split out
+    /// from [`GroupMembership::load`] so the parsing can be tested without a
+    /// socket.
+    fn from_group_list_payload(payload: &Value) -> Self {
         let mut membership = GroupMembership::default();
-        let Ok(payload) = client.v2("workspace.group.list", json!({})) else {
-            return membership;
-        };
         let groups = payload
             .get("groups")
             .and_then(Value::as_array)
@@ -8293,6 +8300,55 @@ mod tests {
 
         assert_eq!(app.workspaces.len(), 2);
         assert!(app.scoped_group_label().is_none());
+    }
+
+    #[test]
+    fn group_membership_parses_group_list_payload() {
+        // Mirrors the shape cmux emits from `workspace.group.list`
+        // (v2WorkspaceGroupPayload): id, name, member_workspace_ids (uuids),
+        // member_workspace_refs (workspace:N).
+        let payload = json!({
+            "groups": [
+                {
+                    "id": "group-1",
+                    "name": "Group One",
+                    "member_workspace_ids": ["ws-uuid-1", "ws-uuid-2"],
+                    "member_workspace_refs": ["workspace:1", "workspace:2"],
+                },
+                {
+                    "id": "group-2",
+                    "name": "Group Two",
+                    "member_workspace_ids": ["ws-uuid-3"],
+                    "member_workspace_refs": ["workspace:3"],
+                },
+            ],
+        });
+        let membership = GroupMembership::from_group_list_payload(&payload);
+
+        // group_id_for_item matches a workspace.list item on its id or ref.
+        let item_by_id = json!({ "id": "ws-uuid-2", "ref": "workspace:2" });
+        assert_eq!(
+            membership.group_id_for_item(&item_by_id).as_deref(),
+            Some("group-1")
+        );
+        let item_by_ref_only = json!({ "ref": "workspace:3" });
+        assert_eq!(
+            membership.group_id_for_item(&item_by_ref_only).as_deref(),
+            Some("group-2")
+        );
+        let item_ungrouped = json!({ "id": "ws-uuid-9", "ref": "workspace:9" });
+        assert!(membership.group_id_for_item(&item_ungrouped).is_none());
+
+        // own_group resolves the group id + name from the home's workspace keys.
+        let own_keys = HashSet::from(["ws-uuid-1".to_string(), "workspace:1".to_string()]);
+        assert_eq!(
+            membership.own_group(&own_keys),
+            Some(("group-1".to_string(), Some("Group One".to_string())))
+        );
+
+        // Home outside every group -> no scope.
+        let outside = HashSet::from(["workspace:99".to_string()]);
+        assert!(membership.own_group(&outside).is_none());
     }
 
     #[test]
