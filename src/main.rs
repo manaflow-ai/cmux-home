@@ -771,6 +771,22 @@ impl App {
         self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title)
     }
 
+    fn refresh_workspace_from_event(
+        &self,
+        workspace_id: &str,
+        reason: impl Into<String>,
+    ) -> RefreshRequest {
+        let reason = reason.into();
+        if self.own_workspace_group_id.is_some() {
+            RefreshRequest::All(reason)
+        } else {
+            RefreshRequest::Workspace {
+                workspace_id: workspace_id.to_string(),
+                reason,
+            }
+        }
+    }
+
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
         match frame.name.as_deref() {
             Some("workspace.created") => {
@@ -784,6 +800,9 @@ impl App {
                 {
                     return None;
                 }
+                if self.own_workspace_group_id.is_some() {
+                    return Some(RefreshRequest::All("workspace created".to_string()));
+                }
                 if self
                     .workspaces
                     .iter()
@@ -793,10 +812,7 @@ impl App {
                 }
                 self.workspaces
                     .insert(0, workspace_from_created_event(frame, workspace_id));
-                Some(RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: "workspace created".to_string(),
-                })
+                Some(self.refresh_workspace_from_event(workspace_id, "workspace created"))
             }
             Some("workspace.selected") => {
                 let selected_id = event_workspace_id(frame).map(str::to_string);
@@ -849,10 +865,7 @@ impl App {
                     workspace.updated_at = Some(Instant::now());
                     return None;
                 }
-                Some(RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: "workspace renamed".to_string(),
-                })
+                Some(self.refresh_workspace_from_event(workspace_id, "workspace renamed"))
             }
             Some("workspace.closed") | Some("workspace.deleted") => {
                 let Some(workspace_id) = event_workspace_id(frame) else {
@@ -874,9 +887,8 @@ impl App {
                 if self.patch_workspace_action(frame) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "workspace action".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "workspace action")
                     })
                 }
             }
@@ -905,9 +917,8 @@ impl App {
                 if self.patch_sidebar_status(frame, true) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "sidebar updated".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "sidebar updated")
                     })
                 }
             }
@@ -915,9 +926,8 @@ impl App {
                 if self.patch_sidebar_status(frame, false) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "sidebar cleared".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "sidebar cleared")
                     })
                 }
             }
@@ -936,12 +946,9 @@ impl App {
             | Some("pane.created")
             | Some("pane.closed")
             | Some("pane.broken")
-            | Some("pane.joined") => {
-                event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: event_name(frame),
-                })
-            }
+            | Some("pane.joined") => event_workspace_id(frame).map(|workspace_id| {
+                self.refresh_workspace_from_event(workspace_id, event_name(frame))
+            }),
             Some(_) => Some(RefreshRequest::All(event_name(frame))),
             None => Some(RefreshRequest::All("event".to_string())),
         }
