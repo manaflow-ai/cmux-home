@@ -8124,6 +8124,28 @@ mod tests {
     }
 
     #[test]
+    fn group_scoped_workspace_created_event_uses_filtered_refresh() {
+        let mut app = test_app();
+        app.own_workspace_group_id = Some("group-1".to_string());
+
+        let refresh = app.apply_cmux_event(&EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("outside-workspace".to_string()),
+            payload: json!({
+                "workspace_id": "outside-workspace",
+                "title": "outside sentinel",
+            }),
+        });
+
+        assert!(app.workspaces.is_empty());
+        match refresh {
+            Some(RefreshRequest::All(reason)) => assert_eq!(reason, "workspace created"),
+            other => panic!("expected filtered full refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn workspace_refresh_removes_cmux_home_launcher() {
         let mut app = test_app();
         app.workspaces = vec![WorkspaceStatus {
