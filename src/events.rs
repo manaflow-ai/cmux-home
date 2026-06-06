@@ -99,6 +99,9 @@ pub(crate) fn workspace_from_created_event(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pinned: false,
+        // Group membership is resolved on the next full refresh via
+        // workspace.group.list; optimistic event rows start ungrouped.
+        group_id: None,
         statuses: HashMap::new(),
         unread_notifications: 0,
         conversation: optimistic_preview.map(|preview| ConversationSnapshot {

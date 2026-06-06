@@ -92,6 +92,10 @@ pub(crate) struct WorkspaceStatus {
     pub(crate) latest_message: String,
     pub(crate) selected: bool,
     pub(crate) pinned: bool,
+    /// Identifier of the workspace group this workspace belongs to, or `None`
+    /// when it is ungrouped. cmux home uses this to scope its list to the group
+    /// it was launched inside.
+    pub(crate) group_id: Option<String>,
     pub(crate) statuses: HashMap<String, String>,
     pub(crate) unread_notifications: usize,
     pub(crate) conversation: Option<ConversationSnapshot>,
