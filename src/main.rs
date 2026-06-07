@@ -594,7 +594,7 @@ impl App {
         }
         match self.selected_visible_row()? {
             WorkspaceListRow::Workspace(index) => Some(index),
-            WorkspaceListRow::Header(_, _) => None,
+            WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::GroupHeader(_) => None,
             WorkspaceListRow::Blank => None,
         }
     }
@@ -604,7 +604,8 @@ impl App {
             return None;
         }
         match self.selected_visible_row()? {
-            WorkspaceListRow::Header(group, _) => Some(group),
+            WorkspaceListRow::StatusHeader(group, _) => Some(group),
+            WorkspaceListRow::GroupHeader(_) => None,
             WorkspaceListRow::Workspace(_) => None,
             WorkspaceListRow::Blank => None,
         }
@@ -664,7 +665,7 @@ impl App {
                         WorkspaceListRow::Workspace(index) => {
                             self.workspaces.get(*index).map(|workspace| &workspace.id) == Some(&id)
                         }
-                        WorkspaceListRow::Header(_, _) => false,
+                        WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::GroupHeader(_) => false,
                         WorkspaceListRow::Blank => false,
                     })
                 })
@@ -2279,6 +2280,9 @@ fn optimistic_workspace_status(
         id: workspace_id.to_string(),
         title,
         latest_message: latest_message.clone(),
+        group_id: None,
+        group_ref: None,
+        group_name: None,
         selected: false,
         pinned: false,
         statuses: HashMap::new(),
@@ -3355,7 +3359,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
                 visible_rows(&app.workspaces, &app.collapsed_groups)
                     .into_iter()
                     .nth(visible_index),
-                Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
+                Some(WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::Workspace(_))
             ) {
                 app.selected = visible_index;
                 app.focus_target = FocusTarget::MainContent;
@@ -4459,8 +4463,11 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .take(area.height as usize)
         .map(|row| match row {
             (_, WorkspaceListRow::Blank) => Line::raw(""),
-            (row_index, WorkspaceListRow::Header(_, label)) => {
+            (row_index, WorkspaceListRow::StatusHeader(_, label)) => {
                 render_group_header(label, row_index == app.selected, area.width as usize)
+            }
+            (_, WorkspaceListRow::GroupHeader(label)) => {
+                render_workspace_group_header(label, area.width as usize)
             }
             (row_index, WorkspaceListRow::Workspace(index)) => render_workspace_row(
                 app.workspaces.get(index),
@@ -5012,7 +5019,8 @@ fn render_history_row(
 
 #[derive(Clone)]
 enum WorkspaceListRow {
-    Header(AgentState, String),
+    StatusHeader(AgentState, String),
+    GroupHeader(String),
     Workspace(usize),
     Blank,
 }
@@ -5027,12 +5035,44 @@ fn visible_rows(
         (AgentState::Idle, "Completed"),
     ];
     let mut rows = Vec::new();
+    let mut grouped_indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut group_order: Vec<(String, String)> = Vec::new();
+    let mut ungrouped_indexes = Vec::new();
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let Some(group_key) = workspace_group_key(workspace) else {
+            ungrouped_indexes.push(index);
+            continue;
+        };
+        if !grouped_indexes.contains_key(&group_key) {
+            group_order.push((group_key.clone(), workspace_group_label(workspace)));
+        }
+        grouped_indexes.entry(group_key).or_default().push(index);
+    }
+
+    for (group_key, label) in group_order {
+        let indexes = grouped_indexes.remove(&group_key).unwrap_or_default();
+        if indexes.is_empty() {
+            continue;
+        }
+        if !rows.is_empty() {
+            rows.push(WorkspaceListRow::Blank);
+        }
+        rows.push(WorkspaceListRow::GroupHeader(format!(
+            "Group: {label} ({})",
+            indexes.len()
+        )));
+        rows.extend(indexes.into_iter().map(WorkspaceListRow::Workspace));
+    }
+
     for (group_state, label) in groups {
-        let indexes = workspaces
+        let indexes = ungrouped_indexes
             .iter()
-            .enumerate()
-            .filter_map(|(index, workspace)| {
-                (display_group(workspace.agent_state()) == group_state).then_some(index)
+            .copied()
+            .filter_map(|index| {
+                workspaces
+                    .get(index)
+                    .is_some_and(|workspace| display_group(workspace.agent_state()) == group_state)
+                    .then_some(index)
             })
             .collect::<Vec<_>>();
         if indexes.is_empty() {
@@ -5043,7 +5083,7 @@ fn visible_rows(
         }
         let collapsed = collapsed_groups.contains(&group_state);
         let suffix = if collapsed { " collapsed" } else { "" };
-        rows.push(WorkspaceListRow::Header(
+        rows.push(WorkspaceListRow::StatusHeader(
             group_state,
             format!("{label} ({}){suffix}", indexes.len()),
         ));
@@ -5067,7 +5107,7 @@ fn selectable_row_after(rows: &[WorkspaceListRow], selected: usize) -> Option<us
 fn is_selectable_row(row: Option<&WorkspaceListRow>) -> bool {
     matches!(
         row,
-        Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
+        Some(WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::Workspace(_))
     )
 }
 
@@ -5078,6 +5118,33 @@ fn render_group_header(label: String, selected: bool, width: usize) -> Line<'sta
         muted_style()
     };
     Line::from(Span::styled(format!("{label:<width$}"), style))
+}
+
+fn render_workspace_group_header(label: String, width: usize) -> Line<'static> {
+    let label = truncate(&label, width);
+    let trailing = width.saturating_sub(label.chars().count());
+    Line::from(Span::styled(
+        format!("{label}{}", " ".repeat(trailing)),
+        input_style(),
+    ))
+}
+
+fn workspace_group_key(workspace: &WorkspaceStatus) -> Option<String> {
+    workspace
+        .group_ref
+        .clone()
+        .or_else(|| workspace.group_id.clone())
+        .or_else(|| workspace.group_name.clone())
+        .filter(|value| !value.is_empty())
+}
+
+fn workspace_group_label(workspace: &WorkspaceStatus) -> String {
+    workspace
+        .group_name
+        .clone()
+        .or_else(|| workspace.group_ref.clone())
+        .or_else(|| workspace.group_id.clone())
+        .unwrap_or_else(|| "Group".to_string())
 }
 
 fn render_workspace_row(
@@ -5095,11 +5162,18 @@ fn render_workspace_row(
         .map(time_ago)
         .unwrap_or_else(|| "-".to_string());
     let group = display_group(state);
-    let unread = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention {
+    let row_indent = if workspace_group_key(workspace).is_some() {
+        "  "
+    } else {
+        ""
+    };
+    let unread_marker = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention
+    {
         "    ∙"
     } else {
         "     "
     };
+    let unread = format!("{row_indent}{unread_marker}");
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let marker = match group {
         AgentState::Working => spinner[spinner_tick % spinner.len()],
@@ -5133,7 +5207,7 @@ fn render_workspace_row(
             + age.chars().count(),
     );
     let mut spans = vec![
-        Span::styled(unread.to_string(), unread_style(selected)),
+        Span::styled(unread, unread_style(selected)),
         Span::styled(format!("{marker} "), base_style),
     ];
     spans.push(Span::styled(
@@ -5721,6 +5795,13 @@ struct LoadedWorkspaces {
     own_workspace_group_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceGroupInfo {
+    id: Option<String>,
+    reference: Option<String>,
+    name: String,
+}
+
 fn load_workspaces(
     socket_path: &str,
     own_workspace_keys: &HashSet<String>,
@@ -5737,6 +5818,7 @@ fn load_workspaces(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let group_info_by_key = load_group_info_by_key(&mut client);
     let own_workspace_group_id = workspaces
         .iter()
         .find(|item| {
@@ -5771,12 +5853,14 @@ fn load_workspaces(
             .iter()
             .find_map(|key| conversations_by_workspace.get(key));
         let statuses = statuses_for_workspace_item(&item, &top_agent_statuses);
+        let group_info = workspace_group_info_for_item(&item, &group_info_by_key);
         if let Some(workspace) = workspace_from_list_item_with_statuses(
             &mut client,
             &item,
             unread_notifications,
             conversation,
             Some(statuses),
+            group_info,
         ) {
             next.push(workspace);
         }
@@ -5801,6 +5885,7 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let group_info_by_key = load_group_info_by_key(&mut client);
     let item = workspaces
         .iter()
         .find(|item| {
@@ -5835,12 +5920,85 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
     let conversation = workspace_item_keys(&item)
         .iter()
         .find_map(|key| conversations_by_workspace.get(key));
+    let group_info = workspace_group_info_for_item(&item, &group_info_by_key);
     Ok(workspace_from_list_item(
         &mut client,
         &item,
         unread_notifications,
         conversation,
+        group_info,
     ))
+}
+
+fn load_group_info_by_key(client: &mut CmuxClient) -> HashMap<String, WorkspaceGroupInfo> {
+    let payload = client
+        .v2("workspace.group.list", json!({}))
+        .unwrap_or_else(|_| json!({ "groups": [] }));
+    let mut groups = HashMap::new();
+    let Some(items) = payload.get("groups").and_then(Value::as_array) else {
+        return groups;
+    };
+
+    for item in items {
+        let id = string_field(item, "id");
+        let reference = string_field(item, "ref");
+        let name = string_field(item, "name")
+            .or_else(|| reference.clone())
+            .or_else(|| id.clone())
+            .unwrap_or_else(|| "Group".to_string());
+        let info = WorkspaceGroupInfo {
+            id: id.clone(),
+            reference: reference.clone(),
+            name,
+        };
+        for key in [id, reference].into_iter().flatten() {
+            groups.insert(key, info.clone());
+        }
+        for member_key in group_member_keys(item) {
+            groups.insert(member_key, info.clone());
+        }
+    }
+
+    groups
+}
+
+fn group_member_keys(item: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for field in ["member_workspace_ids", "member_workspace_refs"] {
+        let Some(values) = item.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            let Some(key) = value.as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn workspace_group_info_for_item(
+    item: &Value,
+    group_info_by_key: &HashMap<String, WorkspaceGroupInfo>,
+) -> Option<WorkspaceGroupInfo> {
+    ["group_id", "group_ref"]
+        .into_iter()
+        .filter_map(|key| string_field(item, key))
+        .chain(workspace_item_keys(item))
+        .find_map(|key| group_info_by_key.get(&key).cloned())
+        .or_else(|| {
+            let id = string_field(item, "group_id");
+            let reference = string_field(item, "group_ref");
+            let name = reference.clone().or_else(|| id.clone())?;
+            Some(WorkspaceGroupInfo {
+                id,
+                reference,
+                name,
+            })
+        })
 }
 
 fn workspace_from_list_item(
@@ -5848,8 +6006,16 @@ fn workspace_from_list_item(
     item: &Value,
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
+    group_info: Option<WorkspaceGroupInfo>,
 ) -> Option<WorkspaceStatus> {
-    workspace_from_list_item_with_statuses(client, item, unread_notifications, conversation, None)
+    workspace_from_list_item_with_statuses(
+        client,
+        item,
+        unread_notifications,
+        conversation,
+        None,
+        group_info,
+    )
 }
 
 fn workspace_from_list_item_with_statuses(
@@ -5858,6 +6024,7 @@ fn workspace_from_list_item_with_statuses(
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
     statuses: Option<HashMap<String, String>>,
+    group_info: Option<WorkspaceGroupInfo>,
 ) -> Option<WorkspaceStatus> {
     let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
@@ -5892,6 +6059,15 @@ fn workspace_from_list_item_with_statuses(
         id: id.clone(),
         title: string_field(item, "title").unwrap_or_else(|| id.chars().take(8).collect()),
         latest_message,
+        group_id: group_info
+            .as_ref()
+            .and_then(|group| group.id.clone())
+            .or_else(|| string_field(item, "group_id")),
+        group_ref: group_info
+            .as_ref()
+            .and_then(|group| group.reference.clone())
+            .or_else(|| string_field(item, "group_ref")),
+        group_name: group_info.map(|group| group.name),
         selected: item
             .get("selected")
             .and_then(Value::as_bool)
@@ -8131,6 +8307,40 @@ mod tests {
     }
 
     #[test]
+    fn visible_rows_render_workspace_groups_as_sections() {
+        let workspaces = vec![
+            WorkspaceStatus {
+                id: "workspace:1".to_string(),
+                title: "group task".to_string(),
+                group_id: Some("group-1".to_string()),
+                group_ref: Some("workspace_group:1".to_string()),
+                group_name: Some("ios".to_string()),
+                ..WorkspaceStatus::default()
+            },
+            WorkspaceStatus {
+                id: "workspace:2".to_string(),
+                title: "ungrouped task".to_string(),
+                ..WorkspaceStatus::default()
+            },
+        ];
+
+        let rows = visible_rows(&workspaces, &HashSet::new());
+
+        assert!(matches!(
+            rows.first(),
+            Some(WorkspaceListRow::GroupHeader(label)) if label == "Group: ios (1)"
+        ));
+        assert!(matches!(rows.get(1), Some(WorkspaceListRow::Workspace(0))));
+        assert!(matches!(rows.get(2), Some(WorkspaceListRow::Blank)));
+        assert!(matches!(
+            rows.get(3),
+            Some(WorkspaceListRow::StatusHeader(AgentState::Idle, label))
+                if label == "Completed (1)"
+        ));
+        assert!(matches!(rows.get(4), Some(WorkspaceListRow::Workspace(1))));
+    }
+
+    #[test]
     fn group_scoped_workspace_created_event_uses_filtered_refresh() {
         let mut app = test_app();
         app.own_workspace_group_id = Some("group-1".to_string());
@@ -8292,6 +8502,27 @@ mod tests {
             .collect::<String>();
 
         assert!(text.starts_with("    ∙"));
+    }
+
+    #[test]
+    fn grouped_workspace_rows_are_indented_under_group_header() {
+        let workspace = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix layout".to_string(),
+            latest_message: "standing by".to_string(),
+            group_id: Some("group-1".to_string()),
+            group_name: Some("ios".to_string()),
+            ..WorkspaceStatus::default()
+        };
+
+        let line = render_workspace_row(Some(&workspace), false, 80, 0);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("       ∙"));
     }
 
     #[test]
