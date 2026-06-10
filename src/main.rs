@@ -281,6 +281,8 @@ enum RefreshRequest {
 struct RefreshSnapshot {
     reason: String,
     workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
+    own_workspace_group_name: Option<String>,
     loaded_at: Instant,
 }
 
@@ -306,6 +308,7 @@ struct SubmitRequest {
     latest_message: String,
     command: String,
     command_accepts_prompt: bool,
+    group_id: Option<String>,
     submit_template: Option<String>,
     rename_template: Option<String>,
 }
@@ -354,6 +357,8 @@ struct App {
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     own_workspace_keys: HashSet<String>,
+    own_workspace_group_id: Option<String>,
+    own_workspace_group_name: Option<String>,
     selected: usize,
     list_scroll: usize,
     focus_target: FocusTarget,
@@ -529,6 +534,8 @@ impl App {
             show_shortcuts: false,
             workspaces: Vec::new(),
             own_workspace_keys: current_workspace_keys(),
+            own_workspace_group_id: None,
+            own_workspace_group_name: None,
             selected: 0,
             list_scroll: 0,
             focus_target: FocusTarget::MainContent,
@@ -614,6 +621,10 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        // Update the group scope before filtering so `should_hide_workspace`
+        // sees the latest membership for this refresh.
+        self.own_workspace_group_id = snapshot.own_workspace_group_id.clone();
+        self.own_workspace_group_name = snapshot.own_workspace_group_name.clone();
         let pending_workspaces = self
             .workspaces
             .iter()
@@ -763,7 +774,35 @@ impl App {
     }
 
     fn should_hide_workspace(&self, workspace: &WorkspaceStatus) -> bool {
-        self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title)
+        if self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title) {
+            return true;
+        }
+        // When cmux home was launched inside a workspace group, scope the list
+        // to that group only. Pending (optimistic) rows from this session are
+        // always kept so a freshly submitted workspace stays visible until the
+        // server confirms its membership.
+        if let Some(scope) = self.own_workspace_group_id.as_deref() {
+            if !is_pending_workspace_id(&workspace.id)
+                && workspace.group_id.as_deref() != Some(scope)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Display label for the active group scope, or `None` when cmux home is not
+    /// scoped to a group. Falls back to a short id when the group has no name.
+    fn scoped_group_label(&self) -> Option<String> {
+        let group_id = self.own_workspace_group_id.as_ref()?;
+        let label = self
+            .own_workspace_group_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| group_id.chars().take(8).collect());
+        Some(label)
     }
 
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
@@ -1057,6 +1096,7 @@ impl App {
             latest_message: latest_message.clone(),
             command,
             command_accepts_prompt,
+            group_id: self.own_workspace_group_id.clone(),
             submit_template: self.submit_template().map(str::to_string),
             rename_template: self.rename_template.clone(),
         };
@@ -1084,7 +1124,10 @@ impl App {
         title: String,
         latest_message: String,
     ) {
-        let workspace = optimistic_workspace_status(&workspace_id, title, latest_message);
+        let mut workspace = optimistic_workspace_status(&workspace_id, title, latest_message);
+        // Keep optimistic rows inside the active group scope so a freshly
+        // submitted workspace is not filtered out before the server confirms it.
+        workspace.group_id = self.own_workspace_group_id.clone();
         if let Some(existing) = self
             .workspaces
             .iter_mut()
@@ -1097,11 +1140,12 @@ impl App {
     }
 
     fn apply_submit_success(&mut self, success: SubmitSuccess) {
-        let workspace = optimistic_workspace_status(
+        let mut workspace = optimistic_workspace_status(
             &success.workspace_id,
             success.title,
             success.latest_message,
         );
+        workspace.group_id = self.own_workspace_group_id.clone();
         if let Some(index) = self
             .workspaces
             .iter()
@@ -2271,6 +2315,7 @@ fn optimistic_workspace_status(
         latest_message: latest_message.clone(),
         selected: false,
         pinned: false,
+        group_id: None,
         statuses: HashMap::new(),
         unread_notifications: 0,
         conversation: Some(ConversationSnapshot {
@@ -2297,7 +2342,12 @@ fn main() -> Result<()> {
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
     spawn_submit_worker(submit_rx, ui_tx.clone());
     spawn_skill_watcher(app.workspace_cwd.clone(), ui_tx.clone());
-    spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
+    spawn_refresh_worker(
+        app.socket_path.clone(),
+        app.own_workspace_keys.clone(),
+        refresh_rx,
+        ui_tx,
+    );
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
     run_tui(&mut app, ui_rx, refresh_tx, submit_tx)
@@ -4406,6 +4456,19 @@ fn draw_workspaces(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         draw_history_list(frame, area, app);
         return;
     }
+    // When scoped to a group, reserve the top line for a banner so the user can
+    // see the list is filtered and that Enter creates a workspace in the group.
+    let area = match app.scoped_group_label() {
+        Some(label) => {
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(0)])
+                .split(area);
+            frame.render_widget(Paragraph::new(render_scope_banner(label)), parts[0]);
+            parts[1]
+        }
+        None => area,
+    };
     if app.autocomplete_is_active() {
         let suggestions_height = autocomplete_height(app, area.height);
         if suggestions_height == 0 || suggestions_height >= area.height {
@@ -5065,6 +5128,13 @@ fn render_group_header(label: String, selected: bool, width: usize) -> Line<'sta
     Line::from(Span::styled(format!("{label:<width$}"), style))
 }
 
+fn render_scope_banner(label: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("group: ".to_string(), muted_style()),
+        Span::styled(label, input_style()),
+    ])
+}
+
 fn render_workspace_row(
     workspace: Option<&WorkspaceStatus>,
     selected: bool,
@@ -5393,6 +5463,16 @@ fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
     let created = client.v2("workspace.create", params)?;
     let workspace_id = string_field(&created, "workspace_id")
         .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+    // `workspace.create` does not place the new workspace into a group, so when
+    // cmux home is scoped to a group, add the workspace to it explicitly. This
+    // runs before the prompt is submitted so the next refresh already reflects
+    // the membership.
+    if let Some(group_id) = request.group_id.as_deref() {
+        let _ = client.v2(
+            "workspace.group.add",
+            json!({ "group_id": group_id, "workspace_id": workspace_id }),
+        );
+    }
     let _ = client.v1("refresh-surfaces");
     if !request.command_accepts_prompt {
         spawn_submit_hook_for_request(request, &workspace_id);
@@ -5480,6 +5560,7 @@ fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
 
 fn spawn_refresh_worker(
     socket_path: String,
+    own_workspace_keys: HashSet<String>,
     requests: Receiver<RefreshRequest>,
     tx: Sender<UiEvent>,
 ) {
@@ -5490,10 +5571,12 @@ fn spawn_refresh_worker(
             }
             match request {
                 RefreshRequest::All(reason) => {
-                    let result = load_workspaces(&socket_path)
-                        .map(|workspaces| RefreshSnapshot {
+                    let result = load_workspaces(&socket_path, &own_workspace_keys)
+                        .map(|loaded| RefreshSnapshot {
                             reason,
-                            workspaces,
+                            workspaces: loaded.workspaces,
+                            own_workspace_group_id: loaded.own_workspace_group_id,
+                            own_workspace_group_name: loaded.own_workspace_group_name,
                             loaded_at: Instant::now(),
                         })
                         .map_err(|err| err.to_string());
@@ -5696,7 +5779,86 @@ fn path_is_plugin_catalog_root(path: &Path) -> bool {
     )
 }
 
-fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
+/// Result of a full workspace refresh, including the group cmux home is scoped
+/// to (if any).
+struct LoadedWorkspaces {
+    workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
+    own_workspace_group_name: Option<String>,
+}
+
+/// Workspace-group membership resolved from `workspace.group.list`, used to map
+/// each workspace to its group and to find the group cmux home was launched in.
+#[derive(Default)]
+struct GroupMembership {
+    /// Maps a workspace key (uuid `id` or `workspace:N` ref) to its group id.
+    group_by_key: HashMap<String, String>,
+    /// Maps a group id to its display name.
+    name_by_group: HashMap<String, String>,
+}
+
+impl GroupMembership {
+    fn load(client: &mut CmuxClient) -> Self {
+        match client.v2("workspace.group.list", json!({})) {
+            Ok(payload) => Self::from_group_list_payload(&payload),
+            Err(_) => GroupMembership::default(),
+        }
+    }
+
+    /// Builds membership from a `workspace.group.list` result payload. Split out
+    /// from [`GroupMembership::load`] so the parsing can be tested without a
+    /// socket.
+    fn from_group_list_payload(payload: &Value) -> Self {
+        let mut membership = GroupMembership::default();
+        let groups = payload
+            .get("groups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for group in groups {
+            let Some(group_id) = string_field(&group, "id") else {
+                continue;
+            };
+            if let Some(name) = string_field(&group, "name") {
+                membership.name_by_group.insert(group_id.clone(), name);
+            }
+            for key in ["member_workspace_ids", "member_workspace_refs"] {
+                let Some(members) = group.get(key).and_then(Value::as_array) else {
+                    continue;
+                };
+                for member in members {
+                    if let Some(member) = member.as_str() {
+                        membership
+                            .group_by_key
+                            .insert(member.to_string(), group_id.clone());
+                    }
+                }
+            }
+        }
+        membership
+    }
+
+    /// Group id for a `workspace.list` item, matched on its id or ref.
+    fn group_id_for_item(&self, item: &Value) -> Option<String> {
+        workspace_item_keys(item)
+            .iter()
+            .find_map(|key| self.group_by_key.get(key))
+            .cloned()
+    }
+
+    /// The group containing the workspace cmux home runs in, as `(id, name)`.
+    fn own_group(&self, own_keys: &HashSet<String>) -> Option<(String, Option<String>)> {
+        own_keys
+            .iter()
+            .find_map(|key| self.group_by_key.get(key))
+            .map(|group_id| (group_id.clone(), self.name_by_group.get(group_id).cloned()))
+    }
+}
+
+fn load_workspaces(
+    socket_path: &str,
+    own_workspace_keys: &HashSet<String>,
+) -> Result<LoadedWorkspaces> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
     let unread_by_workspace = unread_notifications_by_workspace(
@@ -5709,6 +5871,12 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let membership = GroupMembership::load(&mut client);
+    let (own_workspace_group_id, own_workspace_group_name) =
+        match membership.own_group(own_workspace_keys) {
+            Some((group_id, group_name)) => (Some(group_id), group_name),
+            None => (None, None),
+        };
     let top = load_top_metadata_tsv(&mut client, "--all");
     let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
     let top_agent_statuses = parse_top_agent_statuses(&top);
@@ -5732,18 +5900,23 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
             .iter()
             .find_map(|key| conversations_by_workspace.get(key));
         let statuses = statuses_for_workspace_item(&item, &top_agent_statuses);
-        if let Some(workspace) = workspace_from_list_item_with_statuses(
+        if let Some(mut workspace) = workspace_from_list_item_with_statuses(
             &mut client,
             &item,
             unread_notifications,
             conversation,
             Some(statuses),
         ) {
+            workspace.group_id = membership.group_id_for_item(&item);
             next.push(workspace);
         }
     }
 
-    Ok(next)
+    Ok(LoadedWorkspaces {
+        workspaces: next,
+        own_workspace_group_id,
+        own_workspace_group_name,
+    })
 }
 
 fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<WorkspaceStatus>> {
@@ -5793,12 +5966,17 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
     let conversation = workspace_item_keys(&item)
         .iter()
         .find_map(|key| conversations_by_workspace.get(key));
-    Ok(workspace_from_list_item(
+    let membership = GroupMembership::load(&mut client);
+    let mut workspace = workspace_from_list_item(
         &mut client,
         &item,
         unread_notifications,
         conversation,
-    ))
+    );
+    if let Some(workspace) = workspace.as_mut() {
+        workspace.group_id = membership.group_id_for_item(&item);
+    }
+    Ok(workspace)
 }
 
 fn workspace_from_list_item(
@@ -5855,6 +6033,7 @@ fn workspace_from_list_item_with_statuses(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         pinned: item.get("pinned").and_then(Value::as_bool).unwrap_or(false),
+        group_id: None,
         statuses: HashMap::new(),
         unread_notifications,
         conversation,
@@ -7999,6 +8178,8 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
+            own_workspace_group_name: None,
             loaded_at: Instant::now(),
         });
 
@@ -8057,11 +8238,128 @@ mod tests {
                     ..WorkspaceStatus::default()
                 },
             ],
+            own_workspace_group_id: None,
+            own_workspace_group_name: None,
             loaded_at: Instant::now(),
         });
 
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, "task-workspace");
+    }
+
+    #[test]
+    fn refresh_scopes_to_own_group() {
+        let mut app = test_app();
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: vec![
+                WorkspaceStatus {
+                    id: "in-group".to_string(),
+                    title: "scoped task".to_string(),
+                    group_id: Some("group-1".to_string()),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "other-group".to_string(),
+                    title: "different group".to_string(),
+                    group_id: Some("group-2".to_string()),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "ungrouped".to_string(),
+                    title: "no group".to_string(),
+                    group_id: None,
+                    ..WorkspaceStatus::default()
+                },
+            ],
+            own_workspace_group_id: Some("group-1".to_string()),
+            own_workspace_group_name: Some("Group One".to_string()),
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, "in-group");
+        assert_eq!(app.own_workspace_group_id.as_deref(), Some("group-1"));
+        assert_eq!(app.scoped_group_label().as_deref(), Some("Group One"));
+    }
+
+    #[test]
+    fn refresh_without_group_scope_shows_all_groups() {
+        let mut app = test_app();
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: vec![
+                WorkspaceStatus {
+                    id: "grouped".to_string(),
+                    title: "grouped task".to_string(),
+                    group_id: Some("group-1".to_string()),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "ungrouped".to_string(),
+                    title: "loose task".to_string(),
+                    group_id: None,
+                    ..WorkspaceStatus::default()
+                },
+            ],
+            own_workspace_group_id: None,
+            own_workspace_group_name: None,
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 2);
+        assert!(app.scoped_group_label().is_none());
+    }
+
+    #[test]
+    fn group_membership_parses_group_list_payload() {
+        // Mirrors the shape cmux emits from `workspace.group.list`
+        // (v2WorkspaceGroupPayload): id, name, member_workspace_ids (uuids),
+        // member_workspace_refs (workspace:N).
+        let payload = json!({
+            "groups": [
+                {
+                    "id": "group-1",
+                    "name": "Group One",
+                    "member_workspace_ids": ["ws-uuid-1", "ws-uuid-2"],
+                    "member_workspace_refs": ["workspace:1", "workspace:2"],
+                },
+                {
+                    "id": "group-2",
+                    "name": "Group Two",
+                    "member_workspace_ids": ["ws-uuid-3"],
+                    "member_workspace_refs": ["workspace:3"],
+                },
+            ],
+        });
+        let membership = GroupMembership::from_group_list_payload(&payload);
+
+        // group_id_for_item matches a workspace.list item on its id or ref.
+        let item_by_id = json!({ "id": "ws-uuid-2", "ref": "workspace:2" });
+        assert_eq!(
+            membership.group_id_for_item(&item_by_id).as_deref(),
+            Some("group-1")
+        );
+        let item_by_ref_only = json!({ "ref": "workspace:3" });
+        assert_eq!(
+            membership.group_id_for_item(&item_by_ref_only).as_deref(),
+            Some("group-2")
+        );
+        let item_ungrouped = json!({ "id": "ws-uuid-9", "ref": "workspace:9" });
+        assert!(membership.group_id_for_item(&item_ungrouped).is_none());
+
+        // own_group resolves the group id + name from the home's workspace keys.
+        let own_keys = HashSet::from(["ws-uuid-1".to_string(), "workspace:1".to_string()]);
+        assert_eq!(
+            membership.own_group(&own_keys),
+            Some(("group-1".to_string(), Some("Group One".to_string())))
+        );
+
+        // Home outside every group -> no scope.
+        let outside = HashSet::from(["workspace:99".to_string()]);
+        assert!(membership.own_group(&outside).is_none());
     }
 
     #[test]
@@ -8348,6 +8646,8 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
+            own_workspace_group_name: None,
             loaded_at: Instant::now(),
         });
 
