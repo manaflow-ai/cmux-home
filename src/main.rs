@@ -281,6 +281,7 @@ enum RefreshRequest {
 struct RefreshSnapshot {
     reason: String,
     workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
     loaded_at: Instant,
 }
 
@@ -306,6 +307,7 @@ struct SubmitRequest {
     latest_message: String,
     command: String,
     command_accepts_prompt: bool,
+    group_id: Option<String>,
     submit_template: Option<String>,
     rename_template: Option<String>,
 }
@@ -354,6 +356,7 @@ struct App {
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     own_workspace_keys: HashSet<String>,
+    own_workspace_group_id: Option<String>,
     selected: usize,
     list_scroll: usize,
     focus_target: FocusTarget,
@@ -529,6 +532,7 @@ impl App {
             show_shortcuts: false,
             workspaces: Vec::new(),
             own_workspace_keys: current_workspace_keys(),
+            own_workspace_group_id: None,
             selected: 0,
             list_scroll: 0,
             focus_target: FocusTarget::MainContent,
@@ -590,7 +594,7 @@ impl App {
         }
         match self.selected_visible_row()? {
             WorkspaceListRow::Workspace(index) => Some(index),
-            WorkspaceListRow::Header(_, _) => None,
+            WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::GroupHeader(_) => None,
             WorkspaceListRow::Blank => None,
         }
     }
@@ -600,7 +604,8 @@ impl App {
             return None;
         }
         match self.selected_visible_row()? {
-            WorkspaceListRow::Header(group, _) => Some(group),
+            WorkspaceListRow::StatusHeader(group, _) => Some(group),
+            WorkspaceListRow::GroupHeader(_) => None,
             WorkspaceListRow::Workspace(_) => None,
             WorkspaceListRow::Blank => None,
         }
@@ -614,6 +619,7 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        self.own_workspace_group_id = snapshot.own_workspace_group_id.clone();
         let pending_workspaces = self
             .workspaces
             .iter()
@@ -659,7 +665,7 @@ impl App {
                         WorkspaceListRow::Workspace(index) => {
                             self.workspaces.get(*index).map(|workspace| &workspace.id) == Some(&id)
                         }
-                        WorkspaceListRow::Header(_, _) => false,
+                        WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::GroupHeader(_) => false,
                         WorkspaceListRow::Blank => false,
                     })
                 })
@@ -766,6 +772,22 @@ impl App {
         self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title)
     }
 
+    fn refresh_workspace_from_event(
+        &self,
+        workspace_id: &str,
+        reason: impl Into<String>,
+    ) -> RefreshRequest {
+        let reason = reason.into();
+        if self.own_workspace_group_id.is_some() {
+            RefreshRequest::All(reason)
+        } else {
+            RefreshRequest::Workspace {
+                workspace_id: workspace_id.to_string(),
+                reason,
+            }
+        }
+    }
+
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
         match frame.name.as_deref() {
             Some("workspace.created") => {
@@ -779,6 +801,9 @@ impl App {
                 {
                     return None;
                 }
+                if self.own_workspace_group_id.is_some() {
+                    return Some(RefreshRequest::All("workspace created".to_string()));
+                }
                 if self
                     .workspaces
                     .iter()
@@ -788,10 +813,7 @@ impl App {
                 }
                 self.workspaces
                     .insert(0, workspace_from_created_event(frame, workspace_id));
-                Some(RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: "workspace created".to_string(),
-                })
+                Some(self.refresh_workspace_from_event(workspace_id, "workspace created"))
             }
             Some("workspace.selected") => {
                 let selected_id = event_workspace_id(frame).map(str::to_string);
@@ -844,10 +866,7 @@ impl App {
                     workspace.updated_at = Some(Instant::now());
                     return None;
                 }
-                Some(RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: "workspace renamed".to_string(),
-                })
+                Some(self.refresh_workspace_from_event(workspace_id, "workspace renamed"))
             }
             Some("workspace.closed") | Some("workspace.deleted") => {
                 let Some(workspace_id) = event_workspace_id(frame) else {
@@ -869,9 +888,8 @@ impl App {
                 if self.patch_workspace_action(frame) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "workspace action".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "workspace action")
                     })
                 }
             }
@@ -900,9 +918,8 @@ impl App {
                 if self.patch_sidebar_status(frame, true) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "sidebar updated".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "sidebar updated")
                     })
                 }
             }
@@ -910,9 +927,8 @@ impl App {
                 if self.patch_sidebar_status(frame, false) {
                     None
                 } else {
-                    event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                        workspace_id: workspace_id.to_string(),
-                        reason: "sidebar cleared".to_string(),
+                    event_workspace_id(frame).map(|workspace_id| {
+                        self.refresh_workspace_from_event(workspace_id, "sidebar cleared")
                     })
                 }
             }
@@ -931,12 +947,9 @@ impl App {
             | Some("pane.created")
             | Some("pane.closed")
             | Some("pane.broken")
-            | Some("pane.joined") => {
-                event_workspace_id(frame).map(|workspace_id| RefreshRequest::Workspace {
-                    workspace_id: workspace_id.to_string(),
-                    reason: event_name(frame),
-                })
-            }
+            | Some("pane.joined") => event_workspace_id(frame).map(|workspace_id| {
+                self.refresh_workspace_from_event(workspace_id, event_name(frame))
+            }),
             Some(_) => Some(RefreshRequest::All(event_name(frame))),
             None => Some(RefreshRequest::All("event".to_string())),
         }
@@ -1057,6 +1070,7 @@ impl App {
             latest_message: latest_message.clone(),
             command,
             command_accepts_prompt,
+            group_id: self.own_workspace_group_id.clone(),
             submit_template: self.submit_template().map(str::to_string),
             rename_template: self.rename_template.clone(),
         };
@@ -2269,6 +2283,9 @@ fn optimistic_workspace_status(
         id: workspace_id.to_string(),
         title,
         latest_message: latest_message.clone(),
+        group_id: None,
+        group_ref: None,
+        group_name: None,
         selected: false,
         pinned: false,
         statuses: HashMap::new(),
@@ -2297,7 +2314,12 @@ fn main() -> Result<()> {
     spawn_event_stream(app.socket_path.clone(), ui_tx.clone());
     spawn_submit_worker(submit_rx, ui_tx.clone());
     spawn_skill_watcher(app.workspace_cwd.clone(), ui_tx.clone());
-    spawn_refresh_worker(app.socket_path.clone(), refresh_rx, ui_tx);
+    spawn_refresh_worker(
+        app.socket_path.clone(),
+        app.own_workspace_keys.clone(),
+        refresh_rx,
+        ui_tx,
+    );
     let _ = refresh_tx.send(RefreshRequest::All("startup".to_string()));
 
     run_tui(&mut app, ui_rx, refresh_tx, submit_tx)
@@ -3340,7 +3362,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, area: Rect) {
                 visible_rows(&app.workspaces, &app.collapsed_groups)
                     .into_iter()
                     .nth(visible_index),
-                Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
+                Some(WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::Workspace(_))
             ) {
                 app.selected = visible_index;
                 app.focus_target = FocusTarget::MainContent;
@@ -4444,8 +4466,11 @@ fn draw_workspace_list(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .take(area.height as usize)
         .map(|row| match row {
             (_, WorkspaceListRow::Blank) => Line::raw(""),
-            (row_index, WorkspaceListRow::Header(_, label)) => {
+            (row_index, WorkspaceListRow::StatusHeader(_, label)) => {
                 render_group_header(label, row_index == app.selected, area.width as usize)
+            }
+            (_, WorkspaceListRow::GroupHeader(label)) => {
+                render_workspace_group_header(label, area.width as usize)
             }
             (row_index, WorkspaceListRow::Workspace(index)) => render_workspace_row(
                 app.workspaces.get(index),
@@ -4997,7 +5022,8 @@ fn render_history_row(
 
 #[derive(Clone)]
 enum WorkspaceListRow {
-    Header(AgentState, String),
+    StatusHeader(AgentState, String),
+    GroupHeader(String),
     Workspace(usize),
     Blank,
 }
@@ -5012,12 +5038,44 @@ fn visible_rows(
         (AgentState::Idle, "Completed"),
     ];
     let mut rows = Vec::new();
+    let mut grouped_indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut group_order: Vec<(String, String)> = Vec::new();
+    let mut ungrouped_indexes = Vec::new();
+    for (index, workspace) in workspaces.iter().enumerate() {
+        let Some(group_key) = workspace_group_key(workspace) else {
+            ungrouped_indexes.push(index);
+            continue;
+        };
+        if !grouped_indexes.contains_key(&group_key) {
+            group_order.push((group_key.clone(), workspace_group_label(workspace)));
+        }
+        grouped_indexes.entry(group_key).or_default().push(index);
+    }
+
+    for (group_key, label) in group_order {
+        let indexes = grouped_indexes.remove(&group_key).unwrap_or_default();
+        if indexes.is_empty() {
+            continue;
+        }
+        if !rows.is_empty() {
+            rows.push(WorkspaceListRow::Blank);
+        }
+        rows.push(WorkspaceListRow::GroupHeader(format!(
+            "Group: {label} ({})",
+            indexes.len()
+        )));
+        rows.extend(indexes.into_iter().map(WorkspaceListRow::Workspace));
+    }
+
     for (group_state, label) in groups {
-        let indexes = workspaces
+        let indexes = ungrouped_indexes
             .iter()
-            .enumerate()
-            .filter_map(|(index, workspace)| {
-                (display_group(workspace.agent_state()) == group_state).then_some(index)
+            .copied()
+            .filter_map(|index| {
+                workspaces
+                    .get(index)
+                    .is_some_and(|workspace| display_group(workspace.agent_state()) == group_state)
+                    .then_some(index)
             })
             .collect::<Vec<_>>();
         if indexes.is_empty() {
@@ -5028,7 +5086,7 @@ fn visible_rows(
         }
         let collapsed = collapsed_groups.contains(&group_state);
         let suffix = if collapsed { " collapsed" } else { "" };
-        rows.push(WorkspaceListRow::Header(
+        rows.push(WorkspaceListRow::StatusHeader(
             group_state,
             format!("{label} ({}){suffix}", indexes.len()),
         ));
@@ -5052,7 +5110,7 @@ fn selectable_row_after(rows: &[WorkspaceListRow], selected: usize) -> Option<us
 fn is_selectable_row(row: Option<&WorkspaceListRow>) -> bool {
     matches!(
         row,
-        Some(WorkspaceListRow::Header(_, _) | WorkspaceListRow::Workspace(_))
+        Some(WorkspaceListRow::StatusHeader(_, _) | WorkspaceListRow::Workspace(_))
     )
 }
 
@@ -5063,6 +5121,33 @@ fn render_group_header(label: String, selected: bool, width: usize) -> Line<'sta
         muted_style()
     };
     Line::from(Span::styled(format!("{label:<width$}"), style))
+}
+
+fn render_workspace_group_header(label: String, width: usize) -> Line<'static> {
+    let label = truncate(&label, width);
+    let trailing = width.saturating_sub(label.chars().count());
+    Line::from(Span::styled(
+        format!("{label}{}", " ".repeat(trailing)),
+        input_style(),
+    ))
+}
+
+fn workspace_group_key(workspace: &WorkspaceStatus) -> Option<String> {
+    workspace
+        .group_ref
+        .clone()
+        .or_else(|| workspace.group_id.clone())
+        .or_else(|| workspace.group_name.clone())
+        .filter(|value| !value.is_empty())
+}
+
+fn workspace_group_label(workspace: &WorkspaceStatus) -> String {
+    workspace
+        .group_name
+        .clone()
+        .or_else(|| workspace.group_ref.clone())
+        .or_else(|| workspace.group_id.clone())
+        .unwrap_or_else(|| "Group".to_string())
 }
 
 fn render_workspace_row(
@@ -5080,11 +5165,18 @@ fn render_workspace_row(
         .map(time_ago)
         .unwrap_or_else(|| "-".to_string());
     let group = display_group(state);
-    let unread = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention {
+    let row_indent = if workspace_group_key(workspace).is_some() {
+        "  "
+    } else {
+        ""
+    };
+    let unread_marker = if workspace.unread_notifications > 0 || group == AgentState::NeedsAttention
+    {
         "    ∙"
     } else {
         "     "
     };
+    let unread = format!("{row_indent}{unread_marker}");
     let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let marker = match group {
         AgentState::Working => spinner[spinner_tick % spinner.len()],
@@ -5118,7 +5210,7 @@ fn render_workspace_row(
             + age.chars().count(),
     );
     let mut spans = vec![
-        Span::styled(unread.to_string(), unread_style(selected)),
+        Span::styled(unread, unread_style(selected)),
         Span::styled(format!("{marker} "), base_style),
     ];
     spans.push(Span::styled(
@@ -5388,6 +5480,9 @@ fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
     if let Some(path) = request.terminal_path.as_deref() {
         params["initial_env"] = json!({ "PATH": path });
     }
+    if let Some(group_id) = request.group_id.as_deref() {
+        params["group_id"] = json!(group_id);
+    }
 
     let mut client = CmuxClient::new(request.socket_path.clone());
     let created = client.v2("workspace.create", params)?;
@@ -5480,6 +5575,7 @@ fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
 
 fn spawn_refresh_worker(
     socket_path: String,
+    own_workspace_keys: HashSet<String>,
     requests: Receiver<RefreshRequest>,
     tx: Sender<UiEvent>,
 ) {
@@ -5490,10 +5586,11 @@ fn spawn_refresh_worker(
             }
             match request {
                 RefreshRequest::All(reason) => {
-                    let result = load_workspaces(&socket_path)
-                        .map(|workspaces| RefreshSnapshot {
+                    let result = load_workspaces(&socket_path, &own_workspace_keys)
+                        .map(|loaded| RefreshSnapshot {
                             reason,
-                            workspaces,
+                            workspaces: loaded.workspaces,
+                            own_workspace_group_id: loaded.own_workspace_group_id,
                             loaded_at: Instant::now(),
                         })
                         .map_err(|err| err.to_string());
@@ -5696,7 +5793,22 @@ fn path_is_plugin_catalog_root(path: &Path) -> bool {
     )
 }
 
-fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
+struct LoadedWorkspaces {
+    workspaces: Vec<WorkspaceStatus>,
+    own_workspace_group_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceGroupInfo {
+    id: Option<String>,
+    reference: Option<String>,
+    name: String,
+}
+
+fn load_workspaces(
+    socket_path: &str,
+    own_workspace_keys: &HashSet<String>,
+) -> Result<LoadedWorkspaces> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
     let unread_by_workspace = unread_notifications_by_workspace(
@@ -5709,6 +5821,15 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let group_info_by_key = load_group_info_by_key(&mut client);
+    let own_workspace_group_id = workspaces
+        .iter()
+        .find(|item| {
+            workspace_item_keys(item)
+                .iter()
+                .any(|key| own_workspace_keys.contains(key))
+        })
+        .and_then(|item| string_field(item, "group_id"));
     let top = load_top_metadata_tsv(&mut client, "--all");
     let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
     let top_agent_statuses = parse_top_agent_statuses(&top);
@@ -5716,6 +5837,9 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
 
     let mut next = Vec::new();
     for item in workspaces {
+        if !workspace_item_matches_group_scope(&item, own_workspace_group_id.as_deref()) {
+            continue;
+        }
         if workspace_item_is_cmux_home_launcher(&item)
             || workspace_item_keys(&item)
                 .iter()
@@ -5732,18 +5856,23 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
             .iter()
             .find_map(|key| conversations_by_workspace.get(key));
         let statuses = statuses_for_workspace_item(&item, &top_agent_statuses);
+        let group_info = workspace_group_info_for_item(&item, &group_info_by_key);
         if let Some(workspace) = workspace_from_list_item_with_statuses(
             &mut client,
             &item,
             unread_notifications,
             conversation,
             Some(statuses),
+            group_info,
         ) {
             next.push(workspace);
         }
     }
 
-    Ok(next)
+    Ok(LoadedWorkspaces {
+        workspaces: next,
+        own_workspace_group_id,
+    })
 }
 
 fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<WorkspaceStatus>> {
@@ -5759,6 +5888,7 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let group_info_by_key = load_group_info_by_key(&mut client);
     let item = workspaces
         .iter()
         .find(|item| {
@@ -5793,12 +5923,85 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
     let conversation = workspace_item_keys(&item)
         .iter()
         .find_map(|key| conversations_by_workspace.get(key));
+    let group_info = workspace_group_info_for_item(&item, &group_info_by_key);
     Ok(workspace_from_list_item(
         &mut client,
         &item,
         unread_notifications,
         conversation,
+        group_info,
     ))
+}
+
+fn load_group_info_by_key(client: &mut CmuxClient) -> HashMap<String, WorkspaceGroupInfo> {
+    let payload = client
+        .v2("workspace.group.list", json!({}))
+        .unwrap_or_else(|_| json!({ "groups": [] }));
+    let mut groups = HashMap::new();
+    let Some(items) = payload.get("groups").and_then(Value::as_array) else {
+        return groups;
+    };
+
+    for item in items {
+        let id = string_field(item, "id");
+        let reference = string_field(item, "ref");
+        let name = string_field(item, "name")
+            .or_else(|| reference.clone())
+            .or_else(|| id.clone())
+            .unwrap_or_else(|| "Group".to_string());
+        let info = WorkspaceGroupInfo {
+            id: id.clone(),
+            reference: reference.clone(),
+            name,
+        };
+        for key in [id, reference].into_iter().flatten() {
+            groups.insert(key, info.clone());
+        }
+        for member_key in group_member_keys(item) {
+            groups.insert(member_key, info.clone());
+        }
+    }
+
+    groups
+}
+
+fn group_member_keys(item: &Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    for field in ["member_workspace_ids", "member_workspace_refs"] {
+        let Some(values) = item.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            let Some(key) = value.as_str().filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if !keys.iter().any(|existing| existing == key) {
+                keys.push(key.to_string());
+            }
+        }
+    }
+    keys
+}
+
+fn workspace_group_info_for_item(
+    item: &Value,
+    group_info_by_key: &HashMap<String, WorkspaceGroupInfo>,
+) -> Option<WorkspaceGroupInfo> {
+    ["group_id", "group_ref"]
+        .into_iter()
+        .filter_map(|key| string_field(item, key))
+        .chain(workspace_item_keys(item))
+        .find_map(|key| group_info_by_key.get(&key).cloned())
+        .or_else(|| {
+            let id = string_field(item, "group_id");
+            let reference = string_field(item, "group_ref");
+            let name = reference.clone().or_else(|| id.clone())?;
+            Some(WorkspaceGroupInfo {
+                id,
+                reference,
+                name,
+            })
+        })
 }
 
 fn workspace_from_list_item(
@@ -5806,8 +6009,16 @@ fn workspace_from_list_item(
     item: &Value,
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
+    group_info: Option<WorkspaceGroupInfo>,
 ) -> Option<WorkspaceStatus> {
-    workspace_from_list_item_with_statuses(client, item, unread_notifications, conversation, None)
+    workspace_from_list_item_with_statuses(
+        client,
+        item,
+        unread_notifications,
+        conversation,
+        None,
+        group_info,
+    )
 }
 
 fn workspace_from_list_item_with_statuses(
@@ -5816,6 +6027,7 @@ fn workspace_from_list_item_with_statuses(
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
     statuses: Option<HashMap<String, String>>,
+    group_info: Option<WorkspaceGroupInfo>,
 ) -> Option<WorkspaceStatus> {
     let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
@@ -5850,6 +6062,15 @@ fn workspace_from_list_item_with_statuses(
         id: id.clone(),
         title: string_field(item, "title").unwrap_or_else(|| id.chars().take(8).collect()),
         latest_message,
+        group_id: group_info
+            .as_ref()
+            .and_then(|group| group.id.clone())
+            .or_else(|| string_field(item, "group_id")),
+        group_ref: group_info
+            .as_ref()
+            .and_then(|group| group.reference.clone())
+            .or_else(|| string_field(item, "group_ref")),
+        group_name: group_info.map(|group| group.name),
         selected: item
             .get("selected")
             .and_then(Value::as_bool)
@@ -5882,6 +6103,13 @@ fn workspace_item_keys(item: &Value) -> Vec<String> {
         }
     }
     keys
+}
+
+fn workspace_item_matches_group_scope(item: &Value, own_workspace_group_id: Option<&str>) -> bool {
+    match own_workspace_group_id {
+        Some(group_id) => string_field(item, "group_id").as_deref() == Some(group_id),
+        None => true,
+    }
 }
 
 fn workspace_item_ref(item: &Value) -> Option<String> {
@@ -7999,6 +8227,7 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
             loaded_at: Instant::now(),
         });
 
@@ -8057,11 +8286,91 @@ mod tests {
                     ..WorkspaceStatus::default()
                 },
             ],
+            own_workspace_group_id: Some("group-1".to_string()),
             loaded_at: Instant::now(),
         });
 
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, "task-workspace");
+        assert_eq!(app.own_workspace_group_id.as_deref(), Some("group-1"));
+    }
+
+    #[test]
+    fn workspace_group_scope_filters_to_launcher_group() {
+        let grouped = json!({ "id": "workspace:1", "group_id": "group-1" });
+        let other_group = json!({ "id": "workspace:2", "group_id": "group-2" });
+        let ungrouped = json!({ "id": "workspace:3" });
+
+        assert!(workspace_item_matches_group_scope(
+            &grouped,
+            Some("group-1")
+        ));
+        assert!(!workspace_item_matches_group_scope(
+            &other_group,
+            Some("group-1")
+        ));
+        assert!(!workspace_item_matches_group_scope(
+            &ungrouped,
+            Some("group-1")
+        ));
+        assert!(workspace_item_matches_group_scope(&other_group, None));
+        assert!(workspace_item_matches_group_scope(&ungrouped, None));
+    }
+
+    #[test]
+    fn visible_rows_render_workspace_groups_as_sections() {
+        let workspaces = vec![
+            WorkspaceStatus {
+                id: "workspace:1".to_string(),
+                title: "group task".to_string(),
+                group_id: Some("group-1".to_string()),
+                group_ref: Some("workspace_group:1".to_string()),
+                group_name: Some("ios".to_string()),
+                ..WorkspaceStatus::default()
+            },
+            WorkspaceStatus {
+                id: "workspace:2".to_string(),
+                title: "ungrouped task".to_string(),
+                ..WorkspaceStatus::default()
+            },
+        ];
+
+        let rows = visible_rows(&workspaces, &HashSet::new());
+
+        assert!(matches!(
+            rows.first(),
+            Some(WorkspaceListRow::GroupHeader(label)) if label == "Group: ios (1)"
+        ));
+        assert!(matches!(rows.get(1), Some(WorkspaceListRow::Workspace(0))));
+        assert!(matches!(rows.get(2), Some(WorkspaceListRow::Blank)));
+        assert!(matches!(
+            rows.get(3),
+            Some(WorkspaceListRow::StatusHeader(AgentState::Idle, label))
+                if label == "Completed (1)"
+        ));
+        assert!(matches!(rows.get(4), Some(WorkspaceListRow::Workspace(1))));
+    }
+
+    #[test]
+    fn group_scoped_workspace_created_event_uses_filtered_refresh() {
+        let mut app = test_app();
+        app.own_workspace_group_id = Some("group-1".to_string());
+
+        let refresh = app.apply_cmux_event(&EventFrame {
+            kind: Some("event".to_string()),
+            name: Some("workspace.created".to_string()),
+            workspace_id: Some("outside-workspace".to_string()),
+            payload: json!({
+                "workspace_id": "outside-workspace",
+                "title": "outside sentinel",
+            }),
+        });
+
+        assert!(app.workspaces.is_empty());
+        match refresh {
+            Some(RefreshRequest::All(reason)) => assert_eq!(reason, "workspace created"),
+            other => panic!("expected filtered full refresh, got {other:?}"),
+        }
     }
 
     #[test]
@@ -8207,6 +8516,27 @@ mod tests {
     }
 
     #[test]
+    fn grouped_workspace_rows_are_indented_under_group_header() {
+        let workspace = WorkspaceStatus {
+            id: "workspace:1".to_string(),
+            title: "codex: fix layout".to_string(),
+            latest_message: "standing by".to_string(),
+            group_id: Some("group-1".to_string()),
+            group_name: Some("ios".to_string()),
+            ..WorkspaceStatus::default()
+        };
+
+        let line = render_workspace_row(Some(&workspace), false, 80, 0);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.starts_with("       ∙"));
+    }
+
+    #[test]
     fn welcome_logo_lines_match_cmux_welcome_logo() {
         let lines = welcome_logo_lines();
         let text = lines
@@ -8259,6 +8589,7 @@ mod tests {
         app.state_path = state_path.clone();
         app.history.clear();
         app.stashes.clear();
+        app.own_workspace_group_id = Some("group-1".to_string());
         app.composer = composer_from_lines(vec!["instant submit".to_string()]);
         app.composer.move_cursor(CursorMove::End);
         let (tx, rx) = mpsc::channel();
@@ -8267,6 +8598,7 @@ mod tests {
 
         let request = rx.try_recv().expect("background submit request");
         assert_eq!(request.prompt, "instant submit");
+        assert_eq!(request.group_id.as_deref(), Some("group-1"));
         assert!(!app.composer_has_input());
         assert!(app
             .workspaces
@@ -8348,6 +8680,7 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            own_workspace_group_id: None,
             loaded_at: Instant::now(),
         });
 

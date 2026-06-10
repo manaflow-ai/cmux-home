@@ -118,6 +118,9 @@ pub(crate) struct WorkspaceStatus {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) latest_message: String,
+    pub(crate) group_id: Option<String>,
+    pub(crate) group_ref: Option<String>,
+    pub(crate) group_name: Option<String>,
     pub(crate) selected: bool,
     pub(crate) pinned: bool,
     pub(crate) statuses: HashMap<String, String>,
@@ -183,9 +186,12 @@ impl WorkspaceStatus {
             .collect::<Vec<_>>();
         statuses.sort();
         format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.title,
             self.latest_message,
+            self.group_id.as_deref().unwrap_or(""),
+            self.group_ref.as_deref().unwrap_or(""),
+            self.group_name.as_deref().unwrap_or(""),
             self.agent_state().label(),
             self.unread_notifications,
             self.conversation

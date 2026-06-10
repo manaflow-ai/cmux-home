@@ -93,6 +93,9 @@ pub(crate) fn workspace_from_created_event(
         id: workspace_id.to_string(),
         title,
         latest_message: latest_message.clone(),
+        group_id: None,
+        group_ref: None,
+        group_name: None,
         selected: frame
             .payload
             .get("selected")
