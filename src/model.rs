@@ -8,36 +8,64 @@ use crate::util::contains_any;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgentKind {
     Codex,
-    Claude,
+    ClaudeOpus,
+    ClaudeFable,
 }
 
 impl AgentKind {
     pub(crate) fn toggle(self) -> Self {
         match self {
-            AgentKind::Codex => AgentKind::Claude,
-            AgentKind::Claude => AgentKind::Codex,
+            AgentKind::Codex => AgentKind::ClaudeOpus,
+            AgentKind::ClaudeOpus => AgentKind::ClaudeFable,
+            AgentKind::ClaudeFable => AgentKind::Codex,
         }
     }
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             AgentKind::Codex => "codex",
-            AgentKind::Claude => "claude",
+            AgentKind::ClaudeOpus => "claude-opus",
+            AgentKind::ClaudeFable => "claude-fable",
         }
     }
 
     pub(crate) fn from_label(label: &str) -> Option<Self> {
         match label {
             "codex" => Some(AgentKind::Codex),
-            "claude" => Some(AgentKind::Claude),
+            // Accept legacy "claude" persisted state as the Opus option.
+            "claude" | "claude-opus" => Some(AgentKind::ClaudeOpus),
+            "claude-fable" => Some(AgentKind::ClaudeFable),
             _ => None,
         }
+    }
+
+    /// Shared CLI family ("codex" or "claude") used for skill source matching
+    /// and submit-script routing, independent of the model-specific label.
+    pub(crate) fn family(self) -> &'static str {
+        match self {
+            AgentKind::Codex => "codex",
+            AgentKind::ClaudeOpus | AgentKind::ClaudeFable => "claude",
+        }
+    }
+
+    /// `--model` argument for the Claude variants. Empty for Codex.
+    pub(crate) fn claude_model(self) -> &'static str {
+        match self {
+            AgentKind::Codex => "",
+            AgentKind::ClaudeOpus => "opus",
+            AgentKind::ClaudeFable => "claude-fable-5",
+        }
+    }
+
+    pub(crate) fn is_claude(self) -> bool {
+        matches!(self, AgentKind::ClaudeOpus | AgentKind::ClaudeFable)
     }
 
     pub(crate) fn color(self) -> Color {
         match self {
             AgentKind::Codex => Color::Rgb(102, 217, 239),
-            AgentKind::Claude => Color::Rgb(215, 119, 87),
+            AgentKind::ClaudeOpus => Color::Rgb(215, 119, 87),
+            AgentKind::ClaudeFable => Color::Rgb(180, 142, 255),
         }
     }
 }
