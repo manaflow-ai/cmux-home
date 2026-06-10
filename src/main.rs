@@ -5419,7 +5419,7 @@ fn spawn_submit_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
         workspace_id,
         prompt: &request.prompt,
         title: &request.title,
-        agent: request.provider.label(),
+        agent: request.provider.family(),
         mode,
         workspace_cwd: &request.workspace_cwd,
         socket: &request.socket_path,
@@ -5461,7 +5461,7 @@ fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
             ("workspace_id", workspace_id),
             ("prompt", &request.prompt),
             ("title", &request.title),
-            ("agent", request.provider.label()),
+            ("agent", request.provider.family()),
             ("mode", mode),
             ("workspace_cwd", &request.workspace_cwd),
             ("socket", &request.socket_path),
@@ -8453,6 +8453,49 @@ mod tests {
         assert!(command.contains("claude --dangerously-skip-permissions"));
         assert!(command.contains("hello claude"));
         assert!(command.starts_with("/bin/zsh -lc "));
+    }
+
+    #[test]
+    fn claude_variants_share_claude_hook_family() {
+        // Hooks ({agent} in submit_command / rename.command) must stay on the
+        // shared family name so existing claude-keyed hooks keep matching.
+        assert_eq!(AgentKind::ClaudeOpus.family(), "claude");
+        assert_eq!(AgentKind::ClaudeFable.family(), "claude");
+        assert_eq!(AgentKind::Codex.family(), "codex");
+    }
+
+    #[test]
+    fn rendered_claude_command_pins_model_per_variant() {
+        let make_app = || {
+            App::new(Args {
+                socket: Some("/tmp/cmux-home-test.sock".to_string()),
+                workspace_cwd: Some(".".to_string()),
+                config: None,
+                codex_command: "codex {prompt}".to_string(),
+                codex_plan_command: "codex {prompt}".to_string(),
+                claude_command: "claude --model {claude_model} {prompt}".to_string(),
+                claude_plan_command: "claude --permission-mode plan --model {claude_model} {prompt}"
+                    .to_string(),
+            })
+        };
+
+        // The model arg is shell-quoted and the whole command is wrapped in
+        // `/bin/zsh -lc '...'`, so assert on substrings that survive escaping.
+        let mut opus = make_app();
+        opus.provider = AgentKind::ClaudeOpus;
+        let (opus_command, _) = opus.render_agent_command(&[], "hi");
+        assert!(opus_command.contains("model"));
+        assert!(opus_command.contains("opus"));
+        assert!(!opus_command.contains("claude-fable-5"));
+
+        let mut fable = make_app();
+        fable.provider = AgentKind::ClaudeFable;
+        let (fable_command, _) = fable.render_agent_command(&[], "hi");
+        assert!(fable_command.contains("model"));
+        assert!(fable_command.contains("claude-fable-5"));
+
+        // The two variants must render distinct commands.
+        assert_ne!(opus_command, fable_command);
     }
 
     #[test]
