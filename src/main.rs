@@ -244,14 +244,14 @@ struct Args {
 
     #[arg(
         long,
-        default_value = "claude {prompt}",
+        default_value = "claude --model {claude_model} {prompt}",
         env = "CMUX_AGENT_TUI_CLAUDE_COMMAND"
     )]
     claude_command: String,
 
     #[arg(
         long,
-        default_value = "claude --permission-mode plan {prompt}",
+        default_value = "claude --permission-mode plan --model {claude_model} {prompt}",
         env = "CMUX_AGENT_TUI_CLAUDE_PLAN_COMMAND"
     )]
     claude_plan_command: String,
@@ -1552,7 +1552,7 @@ impl App {
                 let source_match = skill
                     .sources
                     .iter()
-                    .any(|source| source.contains(self.provider.label()));
+                    .any(|source| source.contains(self.provider.family()));
                 let prefix_match = search.is_empty() || name.starts_with(&search);
                 let title_score = title_match.as_ref().map(|item| item.score).unwrap_or(0);
                 let score = full_match.score + title_score.saturating_mul(3);
@@ -1944,7 +1944,7 @@ impl App {
 
     fn agent_start_prompt(&self, prompt: &str, images: &[String]) -> String {
         let mut message = prompt.to_string();
-        if self.provider != AgentKind::Codex && !images.is_empty() {
+        if self.provider.is_claude() && !images.is_empty() {
             if !message.is_empty() {
                 message.push_str("\n\n");
             }
@@ -1961,8 +1961,8 @@ impl App {
         let template = match self.provider {
             AgentKind::Codex if self.plan_mode => &self.codex_plan_template,
             AgentKind::Codex => &self.codex_template,
-            AgentKind::Claude if self.plan_mode => &self.claude_plan_template,
-            AgentKind::Claude => &self.claude_template,
+            _ if self.plan_mode => &self.claude_plan_template,
+            _ => &self.claude_template,
         };
         let accepts_prompt = template.contains("{prompt}");
         let image_args = images
@@ -1977,6 +1977,7 @@ impl App {
                 ("prompt", prompt),
                 ("codex_bin", &self.codex_bin),
                 ("claude_bin", &self.claude_bin),
+                ("claude_model", self.provider.claude_model()),
                 (
                     "terminal_path",
                     self.terminal_path.as_deref().unwrap_or_default(),
@@ -1994,7 +1995,9 @@ impl App {
     fn submit_template(&self) -> Option<&str> {
         match self.provider {
             AgentKind::Codex => self.codex_submit_template.as_deref(),
-            AgentKind::Claude => self.claude_submit_template.as_deref(),
+            AgentKind::ClaudeOpus | AgentKind::ClaudeFable => {
+                self.claude_submit_template.as_deref()
+            }
         }
     }
 }
@@ -5416,7 +5419,7 @@ fn spawn_submit_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
         workspace_id,
         prompt: &request.prompt,
         title: &request.title,
-        agent: request.provider.label(),
+        agent: request.provider.family(),
         mode,
         workspace_cwd: &request.workspace_cwd,
         socket: &request.socket_path,
@@ -5458,7 +5461,7 @@ fn spawn_rename_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
             ("workspace_id", workspace_id),
             ("prompt", &request.prompt),
             ("title", &request.title),
-            ("agent", request.provider.label()),
+            ("agent", request.provider.family()),
             ("mode", mode),
             ("workspace_cwd", &request.workspace_cwd),
             ("socket", &request.socket_path),
@@ -7076,7 +7079,7 @@ mod tests {
             draft_from_parts(
                 vec!["latest stash".to_string()],
                 Vec::new(),
-                AgentKind::Claude,
+                AgentKind::ClaudeOpus,
                 true,
             ),
         ];
@@ -7088,7 +7091,7 @@ mod tests {
         );
 
         assert_eq!(app.composer.lines(), &["latest stash".to_string()]);
-        assert_eq!(app.provider, AgentKind::Claude);
+        assert_eq!(app.provider, AgentKind::ClaudeOpus);
         assert!(app.plan_mode);
         assert_eq!(app.stashes.len(), 1);
         assert_eq!(app.stashes[0].lines, vec!["older stash".to_string()]);
@@ -7147,7 +7150,7 @@ mod tests {
             false,
         )];
         app.composer = composer_from_lines(vec!["stash me".to_string()]);
-        app.provider = AgentKind::Claude;
+        app.provider = AgentKind::ClaudeOpus;
         app.plan_mode = true;
 
         press_key(
@@ -7158,7 +7161,7 @@ mod tests {
 
         assert_eq!(app.history.len(), 2);
         assert_eq!(app.history[0].lines, vec!["stash me".to_string()]);
-        assert_eq!(app.history[0].provider, "claude");
+        assert_eq!(app.history[0].provider, "claude-opus");
         assert!(app.history[0].plan_mode);
         assert_eq!(app.history[1].lines, vec!["previous prompt".to_string()]);
         let persisted: PersistedState =
@@ -7182,7 +7185,7 @@ mod tests {
             draft_from_parts(
                 vec!["stashed draft".to_string()],
                 Vec::new(),
-                AgentKind::Claude,
+                AgentKind::ClaudeOpus,
                 true,
             ),
             draft_from_parts(
@@ -7195,7 +7198,7 @@ mod tests {
         app.stashes = vec![draft_from_parts(
             vec!["stashed draft".to_string()],
             Vec::new(),
-            AgentKind::Claude,
+            AgentKind::ClaudeOpus,
             true,
         )];
         app.reset_composer();
@@ -7234,7 +7237,7 @@ mod tests {
             draft_from_parts(
                 vec!["stashed draft".to_string()],
                 Vec::new(),
-                AgentKind::Claude,
+                AgentKind::ClaudeOpus,
                 true,
             ),
             draft_from_parts(
@@ -7247,7 +7250,7 @@ mod tests {
         app.stashes = vec![draft_from_parts(
             vec!["stashed draft".to_string()],
             Vec::new(),
-            AgentKind::Claude,
+            AgentKind::ClaudeOpus,
             true,
         )];
         app.reset_composer();
@@ -7573,7 +7576,11 @@ mod tests {
 
     #[test]
     fn enter_with_slash_skill_autocomplete_completes_and_submits_for_both_agents() {
-        for provider in [AgentKind::Codex, AgentKind::Claude] {
+        for provider in [
+            AgentKind::Codex,
+            AgentKind::ClaudeOpus,
+            AgentKind::ClaudeFable,
+        ] {
             let mut app = test_app();
             app.provider = provider;
             app.skills = vec![SkillEntry {
@@ -7738,7 +7745,11 @@ mod tests {
 
     #[test]
     fn slash_skill_prompt_submits_for_both_agents() {
-        for provider in [AgentKind::Codex, AgentKind::Claude] {
+        for provider in [
+            AgentKind::Codex,
+            AgentKind::ClaudeOpus,
+            AgentKind::ClaudeFable,
+        ] {
             let mut app = test_app();
             app.provider = provider;
             app.skills = vec![SkillEntry {
@@ -8312,7 +8323,7 @@ mod tests {
         assert!(app.workspaces.is_empty());
         assert_eq!(app.composer.lines().join("\n"), "retry me");
         assert_eq!(app.image_paths, vec!["/tmp/screenshot.png".to_string()]);
-        assert_eq!(app.provider, AgentKind::Claude);
+        assert_eq!(app.provider, AgentKind::ClaudeOpus);
         assert!(app.plan_mode);
         assert!(app.status_line.contains("draft restored"));
     }
@@ -8434,7 +8445,7 @@ mod tests {
             claude_command: "claude --dangerously-skip-permissions {prompt}".to_string(),
             claude_plan_command: "claude --permission-mode plan {prompt}".to_string(),
         });
-        app.provider = AgentKind::Claude;
+        app.provider = AgentKind::ClaudeOpus;
 
         let (command, accepts_prompt) = app.render_agent_command(&[], "hello claude");
 
@@ -8442,6 +8453,49 @@ mod tests {
         assert!(command.contains("claude --dangerously-skip-permissions"));
         assert!(command.contains("hello claude"));
         assert!(command.starts_with("/bin/zsh -lc "));
+    }
+
+    #[test]
+    fn claude_variants_share_claude_hook_family() {
+        // Hooks ({agent} in submit_command / rename.command) must stay on the
+        // shared family name so existing claude-keyed hooks keep matching.
+        assert_eq!(AgentKind::ClaudeOpus.family(), "claude");
+        assert_eq!(AgentKind::ClaudeFable.family(), "claude");
+        assert_eq!(AgentKind::Codex.family(), "codex");
+    }
+
+    #[test]
+    fn rendered_claude_command_pins_model_per_variant() {
+        let make_app = || {
+            App::new(Args {
+                socket: Some("/tmp/cmux-home-test.sock".to_string()),
+                workspace_cwd: Some(".".to_string()),
+                config: None,
+                codex_command: "codex {prompt}".to_string(),
+                codex_plan_command: "codex {prompt}".to_string(),
+                claude_command: "claude --model {claude_model} {prompt}".to_string(),
+                claude_plan_command: "claude --permission-mode plan --model {claude_model} {prompt}"
+                    .to_string(),
+            })
+        };
+
+        // The model arg is shell-quoted and the whole command is wrapped in
+        // `/bin/zsh -lc '...'`, so assert on substrings that survive escaping.
+        let mut opus = make_app();
+        opus.provider = AgentKind::ClaudeOpus;
+        let (opus_command, _) = opus.render_agent_command(&[], "hi");
+        assert!(opus_command.contains("model"));
+        assert!(opus_command.contains("opus"));
+        assert!(!opus_command.contains("claude-fable-5"));
+
+        let mut fable = make_app();
+        fable.provider = AgentKind::ClaudeFable;
+        let (fable_command, _) = fable.render_agent_command(&[], "hi");
+        assert!(fable_command.contains("model"));
+        assert!(fable_command.contains("claude-fable-5"));
+
+        // The two variants must render distinct commands.
+        assert_ne!(opus_command, fable_command);
     }
 
     #[test]
