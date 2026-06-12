@@ -116,6 +116,8 @@ pub(crate) struct ConversationSnapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkspaceStatus {
     pub(crate) id: String,
+    pub(crate) window_id: Option<String>,
+    pub(crate) window_ref: Option<String>,
     pub(crate) title: String,
     pub(crate) latest_message: String,
     pub(crate) selected: bool,
@@ -183,7 +185,9 @@ impl WorkspaceStatus {
             .collect::<Vec<_>>();
         statuses.sort();
         format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.window_id.as_deref().unwrap_or_default(),
+            self.window_ref.as_deref().unwrap_or_default(),
             self.title,
             self.latest_message,
             self.agent_state().label(),

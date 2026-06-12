@@ -595,6 +595,13 @@ impl App {
         }
     }
 
+    fn workspace_window_id(&self, workspace_id: &str) -> Option<String> {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .and_then(|workspace| workspace.window_id.clone())
+    }
+
     fn selected_group(&self) -> Option<AgentState> {
         if self.view_mode != ViewMode::Workspaces {
             return None;
@@ -1171,13 +1178,11 @@ impl App {
         if title.is_empty() {
             self.status_line = "rename cancelled".to_string();
         } else {
+            let window_id = self.workspace_window_id(&workspace_id);
             let mut client = CmuxClient::new(self.socket_path.clone());
             client.v2(
                 "workspace.rename",
-                json!({
-                    "workspace_id": workspace_id,
-                    "title": title,
-                }),
+                workspace_rename_params(&workspace_id, window_id.as_deref(), &title),
             )?;
             if let Some(workspace) = self
                 .workspaces
@@ -1216,10 +1221,7 @@ impl App {
         let mut client = CmuxClient::new(self.socket_path.clone());
         client.v2(
             "workspace.action",
-            json!({
-                "workspace_id": workspace.id,
-                "action": action,
-            }),
+            workspace_action_params(&workspace, action),
         )?;
         self.status_line = format!("{action}ned workspace");
         Ok(())
@@ -1402,19 +1404,11 @@ impl App {
     }
 
     fn open_selected_workspace(&mut self) -> Result<()> {
-        let Some(workspace_id) = self
-            .selected_workspace()
-            .map(|workspace| workspace.id.clone())
-        else {
+        let Some(workspace) = self.selected_workspace().cloned() else {
             return Ok(());
         };
         let mut client = CmuxClient::new(self.socket_path.clone());
-        client.v2(
-            "workspace.select",
-            json!({
-                "workspace_id": workspace_id,
-            }),
-        )?;
+        client.v2("workspace.select", workspace_select_params(&workspace))?;
         Ok(())
     }
 
@@ -2267,6 +2261,8 @@ fn optimistic_workspace_status(
 ) -> WorkspaceStatus {
     WorkspaceStatus {
         id: workspace_id.to_string(),
+        window_id: None,
+        window_ref: None,
         title,
         latest_message: latest_message.clone(),
         selected: false,
@@ -5698,17 +5694,12 @@ fn path_is_plugin_catalog_root(path: &Path) -> bool {
 
 fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
     let mut client = CmuxClient::new(socket_path.to_string());
-    let workspaces_payload = client.v2("workspace.list", json!({}))?;
+    let workspaces = load_workspace_items_for_all_windows(&mut client)?;
     let unread_by_workspace = unread_notifications_by_workspace(
         client
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
-    let workspaces = workspaces_payload
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let top = load_top_metadata_tsv(&mut client, "--all");
     let cmux_home_workspace_refs = cmux_home_workspace_refs_from_top(&top);
     let top_agent_statuses = parse_top_agent_statuses(&top);
@@ -5748,17 +5739,12 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
 
 fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<WorkspaceStatus>> {
     let mut client = CmuxClient::new(socket_path.to_string());
-    let workspaces_payload = client.v2("workspace.list", json!({}))?;
+    let workspaces = load_workspace_items_for_all_windows(&mut client)?;
     let unread_by_workspace = unread_notifications_by_workspace(
         client
             .v2("notification.list", json!({}))
             .unwrap_or_else(|_| json!({ "notifications": [] })),
     );
-    let workspaces = workspaces_payload
-        .get("workspaces")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
     let item = workspaces
         .iter()
         .find(|item| {
@@ -5810,6 +5796,83 @@ fn workspace_from_list_item(
     workspace_from_list_item_with_statuses(client, item, unread_notifications, conversation, None)
 }
 
+fn load_workspace_items_for_all_windows(client: &mut CmuxClient) -> Result<Vec<Value>> {
+    if let Ok(window_payload) = client.v2("window.list", json!({})) {
+        let windows = window_payload
+            .get("windows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut workspaces = Vec::new();
+        let mut saw_window = false;
+        for window in windows {
+            let Some(window_id) = string_field(&window, "id") else {
+                continue;
+            };
+            saw_window = true;
+            let window_ref = string_field(&window, "ref");
+            let Ok(payload) = client.v2("workspace.list", workspace_list_params(Some(&window_id)))
+            else {
+                continue;
+            };
+            workspaces.extend(workspace_items_from_payload(
+                &payload,
+                Some(&window_id),
+                window_ref.as_deref(),
+            ));
+        }
+        if saw_window {
+            return Ok(workspaces);
+        }
+    }
+
+    let payload = client.v2("workspace.list", workspace_list_params(None))?;
+    Ok(workspace_items_from_payload(&payload, None, None))
+}
+
+fn workspace_items_from_payload(
+    payload: &Value,
+    fallback_window_id: Option<&str>,
+    fallback_window_ref: Option<&str>,
+) -> Vec<Value> {
+    let window_id =
+        string_field(payload, "window_id").or_else(|| fallback_window_id.map(str::to_string));
+    let window_ref =
+        string_field(payload, "window_ref").or_else(|| fallback_window_ref.map(str::to_string));
+
+    payload
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|mut item| {
+            annotate_workspace_item_window(&mut item, window_id.as_deref(), window_ref.as_deref());
+            item
+        })
+        .collect()
+}
+
+fn annotate_workspace_item_window(
+    item: &mut Value,
+    window_id: Option<&str>,
+    window_ref: Option<&str>,
+) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    if !object.contains_key("window_id") {
+        if let Some(window_id) = window_id {
+            object.insert("window_id".to_string(), json!(window_id));
+        }
+    }
+    if !object.contains_key("window_ref") {
+        if let Some(window_ref) = window_ref {
+            object.insert("window_ref".to_string(), json!(window_ref));
+        }
+    }
+}
+
 fn workspace_from_list_item_with_statuses(
     client: &mut CmuxClient,
     item: &Value,
@@ -5848,6 +5911,8 @@ fn workspace_from_list_item_with_statuses(
         .unwrap_or_else(|| "standing by for task".to_string());
     let mut workspace = WorkspaceStatus {
         id: id.clone(),
+        window_id: string_field(item, "window_id"),
+        window_ref: string_field(item, "window_ref"),
         title: string_field(item, "title").unwrap_or_else(|| id.chars().take(8).collect()),
         latest_message,
         selected: item
@@ -5870,6 +5935,48 @@ fn workspace_from_list_item_with_statuses(
 
 fn workspace_primary_id(item: &Value) -> Option<String> {
     string_field(item, "id").or_else(|| string_field(item, "ref"))
+}
+
+fn workspace_list_params(window_id: Option<&str>) -> Value {
+    let mut params = json!({});
+    add_window_id_param(&mut params, window_id);
+    params
+}
+
+fn workspace_select_params(workspace: &WorkspaceStatus) -> Value {
+    let mut params = json!({
+        "workspace_id": workspace.id,
+    });
+    add_window_id_param(&mut params, workspace.window_id.as_deref());
+    params
+}
+
+fn workspace_action_params(workspace: &WorkspaceStatus, action: &str) -> Value {
+    let mut params = json!({
+        "workspace_id": workspace.id,
+        "action": action,
+    });
+    add_window_id_param(&mut params, workspace.window_id.as_deref());
+    params
+}
+
+fn workspace_rename_params(workspace_id: &str, window_id: Option<&str>, title: &str) -> Value {
+    let mut params = json!({
+        "workspace_id": workspace_id,
+        "title": title,
+    });
+    add_window_id_param(&mut params, window_id);
+    params
+}
+
+fn add_window_id_param(params: &mut Value, window_id: Option<&str>) {
+    let Some(window_id) = window_id else {
+        return;
+    };
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    object.insert("window_id".to_string(), json!(window_id));
 }
 
 fn workspace_item_keys(item: &Value) -> Vec<String> {
@@ -8107,6 +8214,104 @@ mod tests {
         assert!(!top_has_cmux_home_launcher(
             "0.0\t1\t1\tprocess\t123\tsurface:9\tcodex prompt mentions cmux-home\n"
         ));
+    }
+
+    #[test]
+    fn workspace_items_preserve_window_context() {
+        let item = json!({
+            "id": "workspace-uuid",
+            "ref": "workspace:9",
+            "window_id": "window-uuid",
+            "window_ref": "window:2",
+            "title": "other window task"
+        });
+        let conversation = ConversationSnapshot {
+            actor: ConversationActor::User,
+            preview: "latest prompt".to_string(),
+            modified_at: SystemTime::UNIX_EPOCH,
+        };
+        let mut client = CmuxClient::new("/tmp/cmux-home-test.sock".to_string());
+
+        let workspace = workspace_from_list_item_with_statuses(
+            &mut client,
+            &item,
+            0,
+            Some(&conversation),
+            Some(HashMap::new()),
+        )
+        .expect("workspace item");
+
+        assert_eq!(workspace.window_id.as_deref(), Some("window-uuid"));
+        assert_eq!(workspace.window_ref.as_deref(), Some("window:2"));
+    }
+
+    #[test]
+    fn workspace_payload_fallback_annotates_window_context() {
+        let payload = json!({
+            "workspaces": [
+                {
+                    "id": "workspace-uuid",
+                    "ref": "workspace:9",
+                    "title": "other window task"
+                }
+            ]
+        });
+
+        let workspaces =
+            workspace_items_from_payload(&payload, Some("window-uuid"), Some("window:2"));
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(
+            workspaces[0].get("window_id").and_then(Value::as_str),
+            Some("window-uuid")
+        );
+        assert_eq!(
+            workspaces[0].get("window_ref").and_then(Value::as_str),
+            Some("window:2")
+        );
+    }
+
+    #[test]
+    fn workspace_rpc_params_include_window_context() {
+        let workspace = WorkspaceStatus {
+            id: "workspace-uuid".to_string(),
+            window_id: Some("window-uuid".to_string()),
+            title: "other window task".to_string(),
+            ..WorkspaceStatus::default()
+        };
+
+        assert_eq!(
+            workspace_select_params(&workspace),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+            })
+        );
+        assert_eq!(
+            workspace_action_params(&workspace, "pin"),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+                "action": "pin",
+            })
+        );
+        assert_eq!(
+            workspace_rename_params("workspace-uuid", workspace.window_id.as_deref(), "renamed"),
+            json!({
+                "workspace_id": "workspace-uuid",
+                "window_id": "window-uuid",
+                "title": "renamed",
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_list_params_targets_window_id() {
+        assert_eq!(
+            workspace_list_params(Some("window-uuid")),
+            json!({ "window_id": "window-uuid" })
+        );
+        assert_eq!(workspace_list_params(None), json!({}));
     }
 
     #[test]
