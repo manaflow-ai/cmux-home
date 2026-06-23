@@ -3238,13 +3238,23 @@ fn handle_composer_command(app: &mut App) -> bool {
         }
         if complete_autocomplete_selection(app) {
             let completed_text = app.composer.lines().join("\n").trim().to_string();
-            return !slash_skill_prompt(app, &completed_text);
+            return slash_command_prompt(&completed_text)
+                && !slash_skill_prompt(app, &completed_text);
         }
-        app.status_line = "unknown command".to_string();
-        return true;
+        return slash_command_prompt(&text);
     }
 
     false
+}
+
+fn slash_command_prompt(text: &str) -> bool {
+    let Some(body) = text.strip_prefix('/') else {
+        return false;
+    };
+    let Some(name) = body.split_whitespace().next() else {
+        return false;
+    };
+    !name.is_empty() && command_name_exists(name)
 }
 
 fn slash_skill_prompt(app: &App, text: &str) -> bool {
@@ -7959,6 +7969,44 @@ mod tests {
             let request = rx.try_recv().expect("background submit request");
             assert_eq!(request.provider, provider);
             assert_eq!(request.prompt, "/auto-issue reproduce and fix");
+            assert!(!app.composer_has_input());
+            assert_ne!(app.status_line, "unknown command");
+        }
+    }
+
+    #[test]
+    fn unknown_slash_skill_prompt_submits_for_both_agents() {
+        for provider in [
+            AgentKind::Codex,
+            AgentKind::ClaudeOpus,
+            AgentKind::ClaudeFable,
+        ] {
+            let mut app = test_app();
+            app.provider = provider;
+            app.skills = vec![SkillEntry {
+                name: "auto-issue".to_string(),
+                description: "bug helper".to_string(),
+                sources: vec!["codex".to_string(), "claude".to_string()],
+                priority: 0,
+                path: PathBuf::from("/tmp/auto-issue/SKILL.md"),
+            }];
+            app.composer =
+                composer_from_lines(vec!["/missing-skill reproduce and fix".to_string()]);
+            app.composer.move_cursor(CursorMove::End);
+            let (tx, rx) = mpsc::channel();
+
+            let action = handle_composer_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+                Rect::new(0, 0, 120, 40),
+            )
+            .expect("enter");
+
+            assert!(matches!(action, KeyAction::Continue));
+            let request = rx.try_recv().expect("background submit request");
+            assert_eq!(request.provider, provider);
+            assert_eq!(request.prompt, "/missing-skill reproduce and fix");
             assert!(!app.composer_has_input());
             assert_ne!(app.status_line, "unknown command");
         }
