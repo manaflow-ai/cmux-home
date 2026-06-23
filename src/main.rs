@@ -281,6 +281,7 @@ enum RefreshRequest {
 struct RefreshSnapshot {
     reason: String,
     workspaces: Vec<WorkspaceStatus>,
+    group_scope: Option<WorkspaceGroupScope>,
     loaded_at: Instant,
 }
 
@@ -304,6 +305,7 @@ struct SubmitRequest {
     images: Vec<String>,
     title: String,
     latest_message: String,
+    group_scope: Option<WorkspaceGroupScope>,
     command: String,
     command_accepts_prompt: bool,
     submit_template: Option<String>,
@@ -316,6 +318,7 @@ struct SubmitSuccess {
     workspace_id: String,
     title: String,
     latest_message: String,
+    group_scope: Option<WorkspaceGroupScope>,
 }
 
 #[derive(Debug)]
@@ -354,6 +357,7 @@ struct App {
     show_shortcuts: bool,
     workspaces: Vec<WorkspaceStatus>,
     own_workspace_keys: HashSet<String>,
+    group_scope: Option<WorkspaceGroupScope>,
     selected: usize,
     list_scroll: usize,
     focus_target: FocusTarget,
@@ -375,6 +379,29 @@ struct App {
     loading_reason: Option<String>,
     loading_started_at: Option<Instant>,
     started_at: Instant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkspaceGroupScope {
+    group_id: String,
+    anchor_workspace_id: String,
+    member_workspace_keys: HashSet<String>,
+}
+
+impl WorkspaceGroupScope {
+    fn contains_workspace_item(&self, item: &Value) -> bool {
+        workspace_item_keys(item)
+            .iter()
+            .any(|key| self.member_workspace_keys.contains(key))
+    }
+
+    fn contains_workspace(&self, workspace: &WorkspaceStatus) -> bool {
+        self.member_workspace_keys.contains(&workspace.id)
+            || workspace
+                .group_id
+                .as_ref()
+                .is_some_and(|group_id| group_id == &self.group_id)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -529,6 +556,7 @@ impl App {
             show_shortcuts: false,
             workspaces: Vec::new(),
             own_workspace_keys: current_workspace_keys(),
+            group_scope: None,
             selected: 0,
             list_scroll: 0,
             focus_target: FocusTarget::MainContent,
@@ -614,10 +642,12 @@ impl App {
 
     fn apply_refresh(&mut self, snapshot: RefreshSnapshot) {
         let previously_selected_id = self.selected_workspace().map(|ws| ws.id.clone());
+        self.group_scope = snapshot.group_scope;
         let pending_workspaces = self
             .workspaces
             .iter()
             .filter(|workspace| is_pending_workspace_id(&workspace.id))
+            .filter(|workspace| self.workspace_is_in_scope(workspace))
             .cloned()
             .collect::<Vec<_>>();
         let previous = self
@@ -763,7 +793,16 @@ impl App {
     }
 
     fn should_hide_workspace(&self, workspace: &WorkspaceStatus) -> bool {
-        self.workspace_key_is_self(&workspace.id) || cmux_home_launcher_label(&workspace.title)
+        self.workspace_key_is_self(&workspace.id)
+            || cmux_home_launcher_label(&workspace.title)
+            || !self.workspace_is_in_scope(workspace)
+    }
+
+    fn workspace_is_in_scope(&self, workspace: &WorkspaceStatus) -> bool {
+        match self.group_scope.as_ref() {
+            Some(scope) => scope.contains_workspace(workspace),
+            None => true,
+        }
     }
 
     fn apply_cmux_event(&mut self, frame: &EventFrame) -> Option<RefreshRequest> {
@@ -785,6 +824,9 @@ impl App {
                     .any(|workspace| workspace.id == workspace_id)
                 {
                     return None;
+                }
+                if self.group_scope.is_some() {
+                    return Some(RefreshRequest::All("workspace created".to_string()));
                 }
                 self.workspaces
                     .insert(0, workspace_from_created_event(frame, workspace_id));
@@ -1027,6 +1069,10 @@ impl App {
     }
 
     fn submit_new_workspace(&mut self, submit_tx: &Sender<SubmitRequest>) -> Result<()> {
+        if self.group_scope.is_none() {
+            self.group_scope = caller_group_scope(&self.socket_path).ok().flatten();
+        }
+        let group_scope = self.group_scope.clone();
         let prompt = self.composer.lines().join("\n").trim().to_string();
         let images = self.image_paths.clone();
         let start_prompt = self.agent_start_prompt(&prompt, &images);
@@ -1055,12 +1101,13 @@ impl App {
             images,
             title: title.clone(),
             latest_message: latest_message.clone(),
+            group_scope: group_scope.clone(),
             command,
             command_accepts_prompt,
             submit_template: self.submit_template().map(str::to_string),
             rename_template: self.rename_template.clone(),
         };
-        self.upsert_optimistic_workspace(pending_id.clone(), title, latest_message);
+        self.upsert_optimistic_workspace(pending_id.clone(), title, latest_message, group_scope);
         self.select_workspace_by_id(&pending_id);
         self.composer = new_composer();
         self.image_paths.clear();
@@ -1083,8 +1130,14 @@ impl App {
         workspace_id: String,
         title: String,
         latest_message: String,
+        group_scope: Option<WorkspaceGroupScope>,
     ) {
-        let workspace = optimistic_workspace_status(&workspace_id, title, latest_message);
+        let workspace = optimistic_workspace_status(
+            &workspace_id,
+            title,
+            latest_message,
+            group_scope.map(|scope| scope.group_id),
+        );
         if let Some(existing) = self
             .workspaces
             .iter_mut()
@@ -1101,6 +1154,7 @@ impl App {
             &success.workspace_id,
             success.title,
             success.latest_message,
+            success.group_scope.clone().map(|scope| scope.group_id),
         );
         if let Some(index) = self
             .workspaces
@@ -1119,6 +1173,7 @@ impl App {
                 success.workspace_id.clone(),
                 workspace.title,
                 workspace.latest_message,
+                success.group_scope,
             );
         }
         self.select_workspace_by_id(&success.workspace_id);
@@ -2264,9 +2319,11 @@ fn optimistic_workspace_status(
     workspace_id: &str,
     title: String,
     latest_message: String,
+    group_id: Option<String>,
 ) -> WorkspaceStatus {
     WorkspaceStatus {
         id: workspace_id.to_string(),
+        group_id,
         title,
         latest_message: latest_message.clone(),
         selected: false,
@@ -5368,6 +5425,7 @@ fn run_submit_request(request: SubmitRequest) -> std::result::Result<SubmitSucce
             workspace_id,
             title: request.title,
             latest_message: request.latest_message,
+            group_scope: request.group_scope,
         }),
         Err(err) => Err(SubmitFailure {
             pending_id: request.pending_id.clone(),
@@ -5388,11 +5446,21 @@ fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
     if let Some(path) = request.terminal_path.as_deref() {
         params["initial_env"] = json!({ "PATH": path });
     }
+    if let Some(group_scope) = &request.group_scope {
+        params["group_id"] = json!(&group_scope.group_id);
+        params["group_placement"] = json!("top");
+    }
 
     let mut client = CmuxClient::new(request.socket_path.clone());
     let created = client.v2("workspace.create", params)?;
     let workspace_id = string_field(&created, "workspace_id")
         .ok_or_else(|| anyhow!("workspace.create did not return workspace_id"))?;
+    if let Some(group_scope) = &request.group_scope {
+        let created_group_id = string_field(&created, "group_id");
+        if created_group_id.as_deref() != Some(group_scope.group_id.as_str()) {
+            add_workspace_to_group_top(&mut client, &workspace_id, group_scope)?;
+        }
+    }
     let _ = client.v1("refresh-surfaces");
     if !request.command_accepts_prompt {
         spawn_submit_hook_for_request(request, &workspace_id);
@@ -5405,6 +5473,31 @@ fn submit_request_inner(request: &SubmitRequest) -> Result<String> {
         );
     }
     Ok(workspace_id)
+}
+
+fn add_workspace_to_group_top(
+    client: &mut CmuxClient,
+    workspace_id: &str,
+    group_scope: &WorkspaceGroupScope,
+) -> Result<()> {
+    client.v2(
+        "workspace.group.add",
+        json!({
+            "group_id": &group_scope.group_id,
+            "workspace_id": workspace_id,
+            "placement": "top",
+        }),
+    )?;
+    if group_scope.anchor_workspace_id != workspace_id {
+        let _ = client.v2(
+            "workspace.reorder",
+            json!({
+                "workspace_id": workspace_id,
+                "after_workspace_id": &group_scope.anchor_workspace_id,
+            }),
+        );
+    }
+    Ok(())
 }
 
 fn spawn_submit_hook_for_request(request: &SubmitRequest, workspace_id: &str) {
@@ -5490,10 +5583,12 @@ fn spawn_refresh_worker(
             }
             match request {
                 RefreshRequest::All(reason) => {
-                    let result = load_workspaces(&socket_path)
+                    let group_scope = caller_group_scope(&socket_path).ok().flatten();
+                    let result = load_workspaces(&socket_path, group_scope.as_ref())
                         .map(|workspaces| RefreshSnapshot {
                             reason,
                             workspaces,
+                            group_scope,
                             loaded_at: Instant::now(),
                         })
                         .map_err(|err| err.to_string());
@@ -5503,7 +5598,8 @@ fn spawn_refresh_worker(
                     workspace_id,
                     reason,
                 } => {
-                    let result = load_workspace(&socket_path, &workspace_id)
+                    let group_scope = caller_group_scope(&socket_path).ok().flatten();
+                    let result = load_workspace(&socket_path, &workspace_id, group_scope.as_ref())
                         .map(|workspace| WorkspaceRefresh {
                             reason,
                             workspace_id,
@@ -5696,7 +5792,10 @@ fn path_is_plugin_catalog_root(path: &Path) -> bool {
     )
 }
 
-fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
+fn load_workspaces(
+    socket_path: &str,
+    group_scope: Option<&WorkspaceGroupScope>,
+) -> Result<Vec<WorkspaceStatus>> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
     let unread_by_workspace = unread_notifications_by_workspace(
@@ -5716,6 +5815,9 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
 
     let mut next = Vec::new();
     for item in workspaces {
+        if group_scope.is_some_and(|scope| !scope.contains_workspace_item(&item)) {
+            continue;
+        }
         if workspace_item_is_cmux_home_launcher(&item)
             || workspace_item_keys(&item)
                 .iter()
@@ -5738,6 +5840,7 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
             unread_notifications,
             conversation,
             Some(statuses),
+            group_scope.map(|scope| scope.group_id.clone()),
         ) {
             next.push(workspace);
         }
@@ -5746,7 +5849,11 @@ fn load_workspaces(socket_path: &str) -> Result<Vec<WorkspaceStatus>> {
     Ok(next)
 }
 
-fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<WorkspaceStatus>> {
+fn load_workspace(
+    socket_path: &str,
+    workspace_id: &str,
+    group_scope: Option<&WorkspaceGroupScope>,
+) -> Result<Option<WorkspaceStatus>> {
     let mut client = CmuxClient::new(socket_path.to_string());
     let workspaces_payload = client.v2("workspace.list", json!({}))?;
     let unread_by_workspace = unread_notifications_by_workspace(
@@ -5770,6 +5877,9 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
     let Some(item) = item else {
         return Ok(None);
     };
+    if group_scope.is_some_and(|scope| !scope.contains_workspace_item(&item)) {
+        return Ok(None);
+    }
     if workspace_item_is_cmux_home_launcher(&item)
         || workspace_item_ref(&item)
             .and_then(|workspace_ref| {
@@ -5798,6 +5908,7 @@ fn load_workspace(socket_path: &str, workspace_id: &str) -> Result<Option<Worksp
         &item,
         unread_notifications,
         conversation,
+        group_scope.map(|scope| scope.group_id.clone()),
     ))
 }
 
@@ -5806,8 +5917,16 @@ fn workspace_from_list_item(
     item: &Value,
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
+    group_id: Option<String>,
 ) -> Option<WorkspaceStatus> {
-    workspace_from_list_item_with_statuses(client, item, unread_notifications, conversation, None)
+    workspace_from_list_item_with_statuses(
+        client,
+        item,
+        unread_notifications,
+        conversation,
+        None,
+        group_id,
+    )
 }
 
 fn workspace_from_list_item_with_statuses(
@@ -5816,6 +5935,7 @@ fn workspace_from_list_item_with_statuses(
     unread_notifications: usize,
     conversation: Option<&ConversationSnapshot>,
     statuses: Option<HashMap<String, String>>,
+    group_id: Option<String>,
 ) -> Option<WorkspaceStatus> {
     let id = workspace_primary_id(item).unwrap_or_default();
     if id.is_empty() {
@@ -5848,6 +5968,7 @@ fn workspace_from_list_item_with_statuses(
         .unwrap_or_else(|| "standing by for task".to_string());
     let mut workspace = WorkspaceStatus {
         id: id.clone(),
+        group_id,
         title: string_field(item, "title").unwrap_or_else(|| id.chars().take(8).collect()),
         latest_message,
         selected: item
@@ -5898,6 +6019,69 @@ fn current_workspace_keys() -> HashSet<String> {
         .filter_map(|key| std::env::var(key).ok())
         .filter(|value| !value.trim().is_empty())
         .collect()
+}
+
+fn current_workspace_route_key() -> Option<String> {
+    ["CMUX_WORKSPACE_REF", "CMUX_WORKSPACE_ID"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+}
+
+fn workspace_group_list_params(workspace_key: &str) -> Value {
+    json!({ "workspace_id": workspace_key })
+}
+
+fn caller_group_scope(socket_path: &str) -> Result<Option<WorkspaceGroupScope>> {
+    let caller_keys = current_workspace_keys();
+    if caller_keys.is_empty() {
+        return Ok(None);
+    }
+    let mut client = CmuxClient::new(socket_path.to_string());
+    let route_key = current_workspace_route_key()
+        .or_else(|| caller_keys.iter().next().cloned())
+        .unwrap_or_default();
+    let payload = client.v2(
+        "workspace.group.list",
+        workspace_group_list_params(&route_key),
+    )?;
+    Ok(group_scope_for_workspace_keys(&payload, &caller_keys))
+}
+
+fn group_scope_for_workspace_keys(
+    payload: &Value,
+    caller_keys: &HashSet<String>,
+) -> Option<WorkspaceGroupScope> {
+    let groups = payload.get("groups").and_then(Value::as_array)?;
+    for group in groups {
+        let mut member_workspace_keys = HashSet::new();
+        for key in ["member_workspace_ids", "member_workspace_refs"] {
+            if let Some(values) = group.get(key).and_then(Value::as_array) {
+                member_workspace_keys.extend(
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
+        if member_workspace_keys.is_disjoint(caller_keys) {
+            continue;
+        }
+        let Some(group_id) = string_field(group, "id") else {
+            continue;
+        };
+        let Some(anchor_workspace_id) = string_field(group, "anchor_workspace_id") else {
+            continue;
+        };
+        return Some(WorkspaceGroupScope {
+            group_id,
+            anchor_workspace_id,
+            member_workspace_keys,
+        });
+    }
+    None
 }
 
 fn workspace_item_is_cmux_home_launcher(item: &Value) -> bool {
@@ -7999,6 +8183,7 @@ mod tests {
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            group_scope: None,
             loaded_at: Instant::now(),
         });
 
@@ -8057,11 +8242,130 @@ mod tests {
                     ..WorkspaceStatus::default()
                 },
             ],
+            group_scope: None,
             loaded_at: Instant::now(),
         });
 
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, "task-workspace");
+    }
+
+    #[test]
+    fn group_scope_filters_refresh_to_group_members() {
+        let mut app = test_app();
+        let scope = WorkspaceGroupScope {
+            group_id: "group-1".to_string(),
+            anchor_workspace_id: "workspace:anchor".to_string(),
+            member_workspace_keys: HashSet::from([
+                "workspace:anchor".to_string(),
+                "workspace:member".to_string(),
+            ]),
+        };
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: vec![
+                WorkspaceStatus {
+                    id: "workspace:anchor".to_string(),
+                    title: "anchor".to_string(),
+                    group_id: Some("group-1".to_string()),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "workspace:member".to_string(),
+                    title: "member".to_string(),
+                    group_id: Some("group-1".to_string()),
+                    ..WorkspaceStatus::default()
+                },
+                WorkspaceStatus {
+                    id: "workspace:outside".to_string(),
+                    title: "outside".to_string(),
+                    ..WorkspaceStatus::default()
+                },
+            ],
+            group_scope: Some(scope),
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(
+            app.workspaces
+                .iter()
+                .map(|workspace| workspace.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace:anchor", "workspace:member"]
+        );
+    }
+
+    #[test]
+    fn group_scope_keeps_matching_pending_submission_rows() {
+        let mut app = test_app();
+        let scope = WorkspaceGroupScope {
+            group_id: "group-1".to_string(),
+            anchor_workspace_id: "workspace:anchor".to_string(),
+            member_workspace_keys: HashSet::from(["workspace:anchor".to_string()]),
+        };
+        app.group_scope = Some(scope.clone());
+        app.workspaces = vec![
+            optimistic_workspace_status(
+                "pending:in-group",
+                "codex: in group".to_string(),
+                "in group".to_string(),
+                Some("group-1".to_string()),
+            ),
+            optimistic_workspace_status(
+                "pending:outside",
+                "codex: outside".to_string(),
+                "outside".to_string(),
+                Some("group-2".to_string()),
+            ),
+        ];
+
+        app.apply_refresh(RefreshSnapshot {
+            reason: "test".to_string(),
+            workspaces: Vec::new(),
+            group_scope: Some(scope),
+            loaded_at: Instant::now(),
+        });
+
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].id, "pending:in-group");
+    }
+
+    #[test]
+    fn group_scope_lookup_routes_through_caller_workspace() {
+        assert_eq!(
+            workspace_group_list_params("workspace:caller"),
+            json!({ "workspace_id": "workspace:caller" })
+        );
+    }
+
+    #[test]
+    fn group_scope_resolves_from_caller_workspace_refs() {
+        let payload = json!({
+            "groups": [
+                {
+                    "id": "group-a",
+                    "anchor_workspace_id": "anchor-a",
+                    "member_workspace_ids": ["anchor-a"],
+                    "member_workspace_refs": ["workspace:1"]
+                },
+                {
+                    "id": "group-b",
+                    "anchor_workspace_id": "anchor-b",
+                    "member_workspace_ids": ["anchor-b", "member-b"],
+                    "member_workspace_refs": ["workspace:2", "workspace:3"]
+                }
+            ]
+        });
+
+        let scope =
+            group_scope_for_workspace_keys(&payload, &HashSet::from(["workspace:3".to_string()]))
+                .expect("caller group");
+
+        assert_eq!(scope.group_id, "group-b");
+        assert_eq!(scope.anchor_workspace_id, "anchor-b");
+        assert!(scope.member_workspace_keys.contains("member-b"));
+        assert!(scope.member_workspace_keys.contains("workspace:3"));
     }
 
     #[test]
@@ -8302,6 +8606,7 @@ mod tests {
             "pending:1",
             "codex: retry me".to_string(),
             "retry me".to_string(),
+            None,
         )];
         app.composer = new_composer();
         app.image_paths.clear();
@@ -8343,11 +8648,13 @@ mod tests {
             "pending:1",
             "codex: instant submit".to_string(),
             "instant submit".to_string(),
+            None,
         )];
 
         app.apply_refresh(RefreshSnapshot {
             reason: "test".to_string(),
             workspaces: Vec::new(),
+            group_scope: None,
             loaded_at: Instant::now(),
         });
 
@@ -8375,11 +8682,13 @@ mod tests {
                 "workspace:7",
                 "codex: instant submit".to_string(),
                 "instant submit".to_string(),
+                None,
             ),
             optimistic_workspace_status(
                 "pending:1",
                 "codex: instant submit".to_string(),
                 "instant submit".to_string(),
+                None,
             ),
         ];
 
@@ -8388,6 +8697,7 @@ mod tests {
             workspace_id: "workspace:7".to_string(),
             title: "codex: instant submit".to_string(),
             latest_message: "instant submit".to_string(),
+            group_scope: None,
         });
 
         let matches = app
@@ -8474,8 +8784,8 @@ mod tests {
                 codex_command: "codex {prompt}".to_string(),
                 codex_plan_command: "codex {prompt}".to_string(),
                 claude_command: "claude --model {claude_model} {prompt}".to_string(),
-                claude_plan_command: "claude --permission-mode plan --model {claude_model} {prompt}"
-                    .to_string(),
+                claude_plan_command:
+                    "claude --permission-mode plan --model {claude_model} {prompt}".to_string(),
             })
         };
 

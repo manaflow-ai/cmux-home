@@ -91,6 +91,7 @@ pub(crate) fn workspace_from_created_event(
         .unwrap_or_else(|| "starting workspace".to_string());
     WorkspaceStatus {
         id: workspace_id.to_string(),
+        group_id: None,
         title,
         latest_message: latest_message.clone(),
         selected: frame

@@ -116,6 +116,7 @@ pub(crate) struct ConversationSnapshot {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WorkspaceStatus {
     pub(crate) id: String,
+    pub(crate) group_id: Option<String>,
     pub(crate) title: String,
     pub(crate) latest_message: String,
     pub(crate) selected: bool,
