@@ -6021,13 +6021,30 @@ fn current_workspace_keys() -> HashSet<String> {
         .collect()
 }
 
+fn current_workspace_route_key() -> Option<String> {
+    ["CMUX_WORKSPACE_REF", "CMUX_WORKSPACE_ID"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+}
+
+fn workspace_group_list_params(workspace_key: &str) -> Value {
+    json!({ "workspace_id": workspace_key })
+}
+
 fn caller_group_scope(socket_path: &str) -> Result<Option<WorkspaceGroupScope>> {
     let caller_keys = current_workspace_keys();
     if caller_keys.is_empty() {
         return Ok(None);
     }
     let mut client = CmuxClient::new(socket_path.to_string());
-    let payload = client.v2("workspace.group.list", json!({}))?;
+    let route_key = current_workspace_route_key()
+        .or_else(|| caller_keys.iter().next().cloned())
+        .unwrap_or_default();
+    let payload = client.v2(
+        "workspace.group.list",
+        workspace_group_list_params(&route_key),
+    )?;
     Ok(group_scope_for_workspace_keys(&payload, &caller_keys))
 }
 
@@ -8312,6 +8329,14 @@ mod tests {
 
         assert_eq!(app.workspaces.len(), 1);
         assert_eq!(app.workspaces[0].id, "pending:in-group");
+    }
+
+    #[test]
+    fn group_scope_lookup_routes_through_caller_workspace() {
+        assert_eq!(
+            workspace_group_list_params("workspace:caller"),
+            json!({ "workspace_id": "workspace:caller" })
+        );
     }
 
     #[test]
