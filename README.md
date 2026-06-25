@@ -9,20 +9,24 @@ Minimal Rust TUI for starting Claude/Codex cmux workspaces and watching their li
 From inside a cmux-launched shell:
 
 ```bash
-cargo run --release
+./scripts/cmux-home.sh
 ```
 
 Or point it at a cmux socket:
 
 ```bash
-cargo run --release -- --socket /tmp/cmux.sock
+./scripts/cmux-home.sh --socket /tmp/cmux.sock
 ```
 
 With a config file:
 
 ```bash
-cargo run --release -- --config ./cmux-home.json
+./scripts/cmux-home.sh --config ./cmux-home.json
 ```
+
+The launcher builds the release binary, selects a reachable cmux socket from
+the current app family, and passes the current directory as `--workspace-cwd`.
+If no config is provided and `./cmux-home.json` exists, it uses that file.
 
 ## What It Does
 

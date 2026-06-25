@@ -14,7 +14,9 @@ Use this when your parallel work does not fit one built-in pattern:
 
 ## Config Shape
 
-Pass a JSON config with `--config` or set `CMUX_HOME_CONFIG`:
+Pass a JSON config with `--config` or set `CMUX_HOME_CONFIG`. The
+`scripts/cmux-home.sh` launcher also uses `./cmux-home.json` from the current
+workspace when no explicit config is provided:
 
 ```json
 {
