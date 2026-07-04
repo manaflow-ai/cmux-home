@@ -8012,6 +8012,55 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn bare_slash_command_not_in_catalog_submits_verbatim() {
+        // `/fable` is a Claude `.claude/commands/*` command, not a SKILL.md skill, so it is not in
+        // cmux-home's catalog. Pressing Enter must submit `/fable` verbatim for the agent to run,
+        // not silently substitute the top fuzzy skill match (regression: it became
+        // `/nightly-promotion`).
+        for provider in [
+            AgentKind::Codex,
+            AgentKind::ClaudeOpus,
+            AgentKind::ClaudeFable,
+        ] {
+            let mut app = test_app();
+            app.provider = provider;
+            // "fabulous-legend" fuzzy-matches "fable" (subsequence f-a-b-l-e) but is not a prefix.
+            app.skills = vec![SkillEntry {
+                name: "fabulous-legend".to_string(),
+                description: "a fuzzy trap".to_string(),
+                sources: vec!["codex".to_string(), "claude".to_string()],
+                priority: 0,
+                path: PathBuf::from("/tmp/fabulous-legend/SKILL.md"),
+            }];
+            app.composer = composer_from_lines(vec!["/fable".to_string()]);
+            app.composer.move_cursor(CursorMove::End);
+
+            // Precondition: the fuzzy skill IS the highlighted autocomplete item, so without the
+            // confidence gate Enter would have completed to it.
+            assert_eq!(
+                app.autocomplete_items().first().map(|item| item.label.clone()),
+                Some("/fabulous-legend".to_string())
+            );
+
+            let (tx, rx) = mpsc::channel();
+            let action = handle_composer_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &tx,
+                Rect::new(0, 0, 120, 40),
+            )
+            .expect("enter");
+
+            assert!(matches!(action, KeyAction::Continue));
+            let request = rx.try_recv().expect("background submit request");
+            assert_eq!(request.provider, provider);
+            assert_eq!(request.prompt, "/fable");
+            assert!(!app.composer_has_input());
+        }
+    }
+
     #[test]
     fn selected_text_from_range_handles_multiline_text() {
         let lines = vec![
