@@ -3122,7 +3122,9 @@ fn handle_composer_key(
             ..
         } => match app.composer_mode.clone() {
             ComposerMode::NewWorkspace if app.composer_has_text() => {
-                let _ = complete_autocomplete_selection(app);
+                if autocomplete_enter_should_complete(app) {
+                    let _ = complete_autocomplete_selection(app);
+                }
                 if handle_composer_command(app) {
                     return Ok(KeyAction::Continue);
                 }
@@ -3236,7 +3238,7 @@ fn handle_composer_command(app: &mut App) -> bool {
         if slash_skill_prompt(app, &text) {
             return false;
         }
-        if complete_autocomplete_selection(app) {
+        if autocomplete_enter_should_complete(app) && complete_autocomplete_selection(app) {
             let completed_text = app.composer.lines().join("\n").trim().to_string();
             return slash_command_prompt(&completed_text)
                 && !slash_skill_prompt(app, &completed_text);
@@ -3265,6 +3267,36 @@ fn slash_skill_prompt(app: &App, text: &str) -> bool {
         return false;
     };
     !name.is_empty() && skill_name_exists(&app.skills, name)
+}
+
+/// Whether pressing Enter should accept the highlighted autocomplete item before submitting.
+///
+/// For `$` skills and `@` files, fuzzy Enter-completion is intended, so this always accepts. For
+/// `/` slash commands it does not: many agent commands (Claude `.claude/commands/*`, Codex prompts,
+/// built-ins like `/model`) are not in cmux-home's skill catalog, and blindly substituting the top
+/// fuzzy match would rewrite an unknown-but-valid command into an unrelated skill (e.g. `/fable`
+/// became `/nightly-promotion`). A slash token is only auto-completed when the highlighted item is a
+/// confident match: its name is a case-insensitive prefix of what was typed, the user explicitly
+/// moved off the top suggestion, or nothing was typed after the slash. Otherwise the raw token is
+/// submitted verbatim so the agent receives the command it was given.
+fn autocomplete_enter_should_complete(app: &App) -> bool {
+    let Some(query) = app.autocomplete_query() else {
+        return false;
+    };
+    if query.marker != AutocompleteMarker::Slash {
+        return true;
+    }
+    let search = query.search.trim();
+    if search.is_empty() || app.autocomplete.selected > 0 {
+        return true;
+    }
+    let items = app.autocomplete_items();
+    let Some(item) = items.get(app.autocomplete.selected) else {
+        return false;
+    };
+    let name = item.label.trim_start_matches(query.marker.as_char());
+    name.to_ascii_lowercase()
+        .starts_with(&search.to_ascii_lowercase())
 }
 
 fn complete_autocomplete_selection(app: &mut App) -> bool {
@@ -8012,7 +8044,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn bare_slash_command_not_in_catalog_submits_verbatim() {
         // `/fable` is a Claude `.claude/commands/*` command, not a SKILL.md skill, so it is not in
@@ -8059,6 +8090,61 @@ mod tests {
             assert_eq!(request.prompt, "/fable");
             assert!(!app.composer_has_input());
         }
+    }
+
+    #[test]
+    fn bare_slash_prefix_still_completes_and_submits() {
+        // A genuine prefix of a catalog skill should still fuzzy-complete on Enter.
+        let mut app = test_app();
+        app.skills = vec![SkillEntry {
+            name: "nightly-promotion".to_string(),
+            description: "promote a build".to_string(),
+            sources: vec!["codex".to_string(), "claude".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/nightly-promotion/SKILL.md"),
+        }];
+        app.composer = composer_from_lines(vec!["/night".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+
+        let (tx, rx) = mpsc::channel();
+        let action = handle_composer_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+            Rect::new(0, 0, 120, 40),
+        )
+        .expect("enter");
+
+        assert!(matches!(action, KeyAction::Continue));
+        let request = rx.try_recv().expect("background submit request");
+        assert_eq!(request.prompt, "/nightly-promotion");
+    }
+
+    #[test]
+    fn autocomplete_enter_gate_honors_marker_and_navigation() {
+        let mut app = test_app();
+        app.skills = vec![SkillEntry {
+            name: "fabulous-legend".to_string(),
+            description: "a fuzzy trap".to_string(),
+            sources: vec!["codex".to_string(), "claude".to_string()],
+            priority: 0,
+            path: PathBuf::from("/tmp/fabulous-legend/SKILL.md"),
+        }];
+
+        // Non-prefix slash token at the top suggestion: do not auto-complete.
+        app.composer = composer_from_lines(vec!["/fable".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        assert!(!autocomplete_enter_should_complete(&app));
+
+        // Same token, but the user navigated off the top suggestion: honor the explicit pick.
+        app.autocomplete.selected = 1;
+        assert!(autocomplete_enter_should_complete(&app));
+        app.autocomplete.selected = 0;
+
+        // `$` skill references keep fuzzy Enter-completion.
+        app.composer = composer_from_lines(vec!["$fable".to_string()]);
+        app.composer.move_cursor(CursorMove::End);
+        assert!(autocomplete_enter_should_complete(&app));
     }
 
     #[test]
