@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/manaflow-ai/cmux/main/web/data/cmux-extension.schema.json",
+  "manifestVersion": 1,
+  "id": "home",
+  "name": "cmux Home",
+  "version": "0.1.0",
+  "description": "Minimal home TUI for launching and monitoring Claude/Codex agent workspaces. Requires the Rust toolchain (cargo).",
+  "icon": "house",
+  "build": [
+    { "command": ["cargo", "build", "--release"] }
+  ],
+  "panes": [
+    {
+      "id": "home",
+      "title": "Home",
+      "command": ["bash", "scripts/cmux-home.sh"]
+    }
+  ]
+}
