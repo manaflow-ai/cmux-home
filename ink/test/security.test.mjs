@@ -39,6 +39,7 @@ import {
 import {
   redactSecrets,
   buildSecureInstallDirectoryScript,
+  isValidFreestyleHostKeyLine,
   sanitizedEnvironment,
   sha256CheckShell,
 } from "../bin/remote-security.mjs";
@@ -958,6 +959,13 @@ test("SSH host policy uses a private known_hosts file and rejects embedded crede
     const options = freestyleHostKeyOptions();
     assert.deepEqual(options, [
       "StrictHostKeyChecking=accept-new",
+      `UserKnownHostsFile=${join(state, "cmux-home", "freestyle-known-hosts")}`,
+    ]);
+    process.env.CMUX_FREESTYLE_SSH_HOST_KEY =
+      "vm-ssh.freestyle.sh ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=";
+    assert.equal(isValidFreestyleHostKeyLine(process.env.CMUX_FREESTYLE_SSH_HOST_KEY), true);
+    assert.deepEqual(freestyleHostKeyOptions(), [
+      "StrictHostKeyChecking=yes",
       `UserKnownHostsFile=${join(state, "cmux-home", "freestyle-known-hosts")}`,
     ]);
     assert.equal(hasEmbeddedCredential("vm-test+cmux@vm-ssh.freestyle.sh"), false);
