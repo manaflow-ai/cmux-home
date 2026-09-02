@@ -46,6 +46,7 @@ import {
   buildCmuxCloneBootstrap,
   buildGitConfigIsolationScript,
   buildSshTransportArgs,
+  devServerBrowserUrlForVm,
   devServerMacPortForVm,
   buildSshpassArgs,
   localSecretFromFile,
@@ -171,7 +172,7 @@ test("secure install directory guard enforces filesystem policy before writes", 
 test("cmux clone bootstrap checks out only the reviewed commit", () => {
   const script = buildCmuxCloneBootstrap();
   assert.match(script, /0247f51a1f30308df595606d0951c802ec038550/);
-  assert.match(script, /cmux_git -C .*fetch --quiet --no-tags --depth 1 origin/);
+  assert.match(script, /cmux_git -C .*fetch --quiet --no-tags --depth 1(?: --upload-pack=\/usr\/bin\/git-upload-pack)? origin/);
   assert.match(script, /protocol\.https\.allow=always/);
   assert.match(script, /cmux_secret_mode\(\)/);
   assert.match(script, /cmux_secret_mode "\$\(stat -c '%a' "\$cmux_env_file"\)"/);
@@ -186,6 +187,7 @@ test("dev server browser endpoint has an authenticated loopback forward", async 
   const vmId = "vm-forward-test";
   const macPort = devServerMacPortForVm(vmId);
   assert.ok(macPort >= 30_000 && macPort < 40_000);
+  assert.equal(devServerBrowserUrlForVm(vmId), `http://127.0.0.1:${macPort}`);
   const transportArgs = buildSshTransportArgs(
     {
       devServerMacPort: macPort,
@@ -197,7 +199,7 @@ test("dev server browser endpoint has an authenticated loopback forward", async 
   );
   const forwardIndex = transportArgs.indexOf("-L");
   assert.notEqual(forwardIndex, -1);
-  assert.equal(transportArgs[forwardIndex + 1], `${macPort}:127.0.0.1:3000`);
+  assert.equal(transportArgs[forwardIndex + 1], `127.0.0.1:${macPort}:127.0.0.1:3000`);
   assert.ok(transportArgs.includes("-o"));
   const exitOnFailureIndex = transportArgs.indexOf("ExitOnForwardFailure=yes");
   assert.notEqual(exitOnFailureIndex, -1);
@@ -224,7 +226,7 @@ test("dev server browser endpoint has an authenticated loopback forward", async 
     method: "browser.open_split",
     params: {
       workspace_id: "workspace-id",
-      source_surface_id: "source-surface-id",
+      surface_id: "source-surface-id",
       url: `http://127.0.0.1:${macPort}`,
       focus: false,
       bypass_remote_proxy: true,
@@ -268,13 +270,14 @@ test("git isolation removes executable local configuration before fetch", () => 
       `origin=${shellQuoteForTest(`file://${bare}`)}`,
       "cmux_git_existing_origin=$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -C \"$repo\" config --no-includes --local --get remote.origin.url 2>/dev/null || true)",
       'test "$cmux_git_existing_origin" = "$origin"',
-      buildGitConfigIsolationScript(),
+      buildGitConfigIsolationScript({ allowFileOrigin: true }),
       'cmux_git_isolate_local_config "$repo" "$origin"',
-      'cmux_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c remote.origin.uploadpack=/usr/bin/git-upload-pack -c remote.origin.proxy= -c protocol.file.allow=always -c protocol.allow=never "$@"; }',
+      'cmux_git() { /usr/bin/env -i HOME="$HOME" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c remote.origin.uploadpack=/usr/bin/git-upload-pack -c remote.origin.proxy= -c protocol.file.allow=always -c protocol.allow=never "$@"; }',
+      'export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=filter.evil.process GIT_CONFIG_VALUE_0=' + shellQuoteForTest(markerScript),
       'cmux_git -C "$repo" fetch --quiet origin HEAD',
       'cmux_git -C "$repo" checkout --quiet --detach FETCH_HEAD',
       `test ! -e ${shellQuoteForTest(marker)}`,
-      'test "$(cmux_git -C "$repo" config --get remote.origin.uploadpack || true)" = ""',
+      'test "$(cmux_git -C "$repo" config --get remote.origin.uploadpack || true)" != "' + markerScript + '"',
       'test "$(cmux_git -C "$repo" config --get remote.origin.proxy || true)" = ""',
     ].join("\n");
     const result = spawnSync("bash", ["-euc", script], { encoding: "utf8" });

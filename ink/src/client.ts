@@ -93,16 +93,50 @@ export class CmuxClient {
     url: string;
     direction?: "right" | "left" | "up" | "down";
     focus?: boolean;
-  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
-    const result = (await this.rpc("pane.create", {
-      workspace_id: input.workspaceId,
-      type: "browser",
-      direction: input.direction ?? "right",
-      url: input.url,
-      focus: input.focus ?? false,
-    })) as { pane_ref?: string; surface_ref?: string } | undefined;
+    sourceSurfaceId?: string;
+    /** Keep a loopback URL on the local machine instead of the remote proxy. */
+    bypassRemoteProxy?: boolean;
+  }): Promise<{
+    paneRef: string;
+    surfaceRef: string;
+    paneId?: string;
+    surfaceId?: string;
+  } | null> {
+    const useBrowserOpenSplit = Boolean(input.sourceSurfaceId);
+    if (useBrowserOpenSplit && (input.direction ?? "right") !== "right") {
+      throw new Error("browser.open_split only supports a right-hand split");
+    }
+    const method = useBrowserOpenSplit ? "browser.open_split" : "pane.create";
+    const params: Record<string, unknown> = useBrowserOpenSplit
+      ? {
+          workspace_id: input.workspaceId,
+          surface_id: input.sourceSurfaceId,
+          url: input.url,
+          focus: input.focus ?? false,
+          bypass_remote_proxy: input.bypassRemoteProxy ?? false,
+        }
+      : {
+          workspace_id: input.workspaceId,
+          type: "browser",
+          direction: input.direction ?? "right",
+          url: input.url,
+          focus: input.focus ?? false,
+        };
+    const result = (await this.rpc(method, params)) as
+      | {
+          pane_id?: string;
+          pane_ref?: string;
+          surface_id?: string;
+          surface_ref?: string;
+        }
+      | undefined;
     if (!result?.pane_ref || !result?.surface_ref) return null;
-    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+    return {
+      paneId: result.pane_id,
+      paneRef: result.pane_ref,
+      surfaceId: result.surface_id,
+      surfaceRef: result.surface_ref,
+    };
   }
 
   async createTerminalPane(input: {

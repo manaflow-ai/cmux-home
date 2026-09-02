@@ -14,6 +14,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
+import {
+  devServerBrowserUrlForVm,
+  devServerMacPortForVm,
+} from "../bin/freestyle-vm-ssh.mjs";
 import { prepareFreestyleBootstrap } from "./cmux-ssh.js";
 import {
   CMUXD_SERVICE_USER,
@@ -127,13 +131,8 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
-  // With cmuxd-ws attach the workspace gets a local SOCKS5 proxy
-  // (cmux's app reports it as `remote.proxy.url`) that tunnels traffic
-  // through the daemon's WebSocket back to the VM's localhost.
-  // Browser panes routed through this proxy can dial `http://127.0.0.1:3000`
-  // and reach the VM's dev server with no per-VM mac port allocation.
   const browserUrlForVm = useCallback(
-    (_vmId: string): string => "http://127.0.0.1:3000",
+    (vmId: string): string => devServerBrowserUrlForVm(vmId),
     [],
   );
 
@@ -1352,7 +1351,17 @@ async function openTaskWorkspace(opts: {
   //   ├──────────────────────┼──────────────────────┤
   //   │  shell (~/cmux)      │  dev: bun dev        │
   //   └──────────────────────┴──────────────────────┘
-  const devCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-start`;
+  const devPort = portFromUrl(devUrl);
+  if (devPort === null || devPort < 1 || devPort > 65535) {
+    throw new Error("dev server URL must contain a valid local forward port");
+  }
+  const expectedDevPort = devServerMacPortForVm(vmId);
+  if (devPort !== expectedDevPort) {
+    throw new Error("dev server URL does not match the VM's authenticated forward");
+  }
+  const devCmd =
+    `node ${shellQuote(helperPath)} ${shellQuote(vmId)} ` +
+    `--attach-dev-start --dev-server-mac-port ${devPort}`;
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
     const initialSurfaces = await client.listPaneSurfaces(workspaceRef);
@@ -1362,14 +1371,15 @@ async function openTaskWorkspace(opts: {
       setStatusLine(`opened ws workspace, but no codex surface to anchor splits`);
       return workspaceRef;
     }
-    // Top-right: browser, anchored on the codex pane.
-    const browser = await client.createPane({
+    // Top-right: browser, anchored on the codex pane. The URL is loopback on
+    // this Mac; the dev pane owns the authenticated SSH forward to the VM.
+    const browser = await client.createBrowserPane({
       workspaceId: workspaceRef,
-      type: "browser",
-      direction: "right",
       url: devUrl,
+      direction: "right",
       focus: false,
       sourceSurfaceId: codex.surfaceId,
+      bypassRemoteProxy: true,
     });
     // Bottom-right: dev server, anchored on the browser pane.
     if (browser?.surfaceId) {

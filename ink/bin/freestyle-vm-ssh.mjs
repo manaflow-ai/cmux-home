@@ -57,6 +57,9 @@ const DEFAULT_TAILSCALE_PROXY_PORT = 1055;
 const IDENTITY_MAX_LIFETIME_MS = 2 * 60 * 60 * 1000;
 const CODEX_PROMPT_FILE_RE = /^\/run\/cmuxd\/codex-prompt-[A-Fa-f0-9]{32}\.txt$/;
 const TAILSCALE_DNS_SUFFIX_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
+const DEV_SERVER_VM_PORT = 3000;
+const DEV_SERVER_MAC_PORT_BASE = 30_000;
+const DEV_SERVER_MAC_PORT_COUNT = 10_000;
 const isMain = process.argv[1]
   ? import.meta.url === pathToFileURL(process.argv[1]).href
   : false;
@@ -193,7 +196,20 @@ function sshHostKeyOptions() {
   return ["StrictHostKeyChecking=accept-new", `UserKnownHostsFile=${path}`];
 }
 
-function buildSshTransportArgs(args, hostKeyOptions) {
+export function devServerMacPortForVm(vmId) {
+  if (!isSafeVmId(vmId)) throw new Error("invalid Freestyle VM id");
+  let hash = 0;
+  for (const codePoint of vmId.slice(0, 16)) {
+    hash = (hash * 31 + codePoint.codePointAt(0)) >>> 0;
+  }
+  return DEV_SERVER_MAC_PORT_BASE + (hash % DEV_SERVER_MAC_PORT_COUNT);
+}
+
+export function devServerBrowserUrlForVm(vmId) {
+  return `http://127.0.0.1:${devServerMacPortForVm(vmId)}`;
+}
+
+export function buildSshTransportArgs(args, hostKeyOptions) {
   const options = [
     "-F", "/dev/null",
     "-p", "22",
@@ -211,7 +227,12 @@ function buildSshTransportArgs(args, hostKeyOptions) {
     options.push("-R", `${args.subrouterPort}:127.0.0.1:${args.subrouterPort}`);
   }
   if (args.devServerMacPort) {
-    options.push("-L", `${args.devServerMacPort}:127.0.0.1:3000`);
+    options.push(
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-L",
+      `127.0.0.1:${args.devServerMacPort}:127.0.0.1:${DEV_SERVER_VM_PORT}`,
+    );
   } else {
     for (const port of args.forwardPorts) {
       options.push("-L", `${port}:127.0.0.1:${port}`);
@@ -587,6 +608,19 @@ try {
     if (!token || !passFile) {
       throw new Error("an SSH credential is required for direct attach mode");
     }
+    if (args.attachMode === "dev-start" && !args.devServerMacPort) {
+      throw new Error(
+        "--attach-dev-start requires --dev-server-mac-port so the browser uses an authenticated loopback forward",
+      );
+    }
+    if (
+      args.attachMode === "dev-start" &&
+      args.devServerMacPort !== devServerMacPortForVm(args.vmId)
+    ) {
+      throw new Error(
+        "--attach-dev-start port does not match the VM's authenticated browser endpoint",
+      );
+    }
     const hostKeyOptions = sshHostKeyOptions();
     baseSshArgs = buildSshTransportArgs(args, hostKeyOptions);
     const remoteHost = `${args.vmId}+${args.user}@vm-ssh.freestyle.sh`;
@@ -596,8 +630,8 @@ try {
           // bootstrap clones + runs bun install), ensure the
           // ~/.secrets/cmuxterm-dev.env stub exists (dev-local.sh errors
           // out without it), then exec bun dev in the foreground.
-          // The browser reaches this service through cmuxd's authenticated
-          // proxy, so keep it on loopback instead of exposing all interfaces.
+          // The browser reaches this service through the authenticated local
+          // SSH loopback forward, so keep Bun on VM loopback as well.
           // exec replaces the bash so Ctrl-C goes straight to bun.
           `printf '[freestyle-vm-ssh] waiting for ~/cmux/web…\\n' && ` +
           `while [ ! -f $HOME/cmux/web/package.json ]; do sleep 1; done && ` +
@@ -995,6 +1029,46 @@ function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * Return the shell function used to replace a checkout's local Git config
+ * with a minimal, reviewed config before fetch or checkout. Git has no
+ * supported environment switch that disables repository-local config, so
+ * command-line overrides alone cannot suppress unknown filter/process keys.
+ * Replacing the file removes that entire execution surface while retaining
+ * the repository objects and refs.
+ */
+export function buildGitConfigIsolationScript({ allowFileOrigin = false } = {}) {
+  const originPattern = allowFileOrigin
+    ? "https://github.com/manaflow-ai/cmux.git|file://*"
+    : "https://github.com/manaflow-ai/cmux.git";
+  return [
+    'cmux_git_isolate_local_config() {',
+    '  cmux_git_repo="$1"; cmux_git_origin="$2"',
+    '  case "$cmux_git_origin" in',
+    `    ${originPattern}) ;;`,
+    '    *) echo "[freestyle-vm-ssh] refusing an unapproved Git origin" >&2; return 1 ;;',
+    '  esac',
+    '  cmux_git_origin_without_controls=$(printf "%s" "$cmux_git_origin" | tr -d "\\r\\n")',
+    '  test "$cmux_git_origin_without_controls" = "$cmux_git_origin" || { echo "[freestyle-vm-ssh] Git origin contains control characters" >&2; return 1; }',
+    '  cmux_git_dir="$cmux_git_repo/.git"',
+    '  test -d "$cmux_git_dir" && test ! -L "$cmux_git_dir" || { echo "[freestyle-vm-ssh] refusing an unsafe Git directory" >&2; return 1; }',
+    '  if test -L "$cmux_git_dir/config"; then echo "[freestyle-vm-ssh] refusing a symlinked Git config" >&2; return 1; fi',
+    '  if test -e "$cmux_git_dir/config" && test ! -f "$cmux_git_dir/config"; then echo "[freestyle-vm-ssh] refusing a non-file Git config" >&2; return 1; fi',
+    '  cmux_git_config_tmp=$(mktemp "$cmux_git_dir/config.cmux-safe.XXXXXX")',
+    '  umask 077',
+    '  if ! printf \'%s\\n\' \'[core]\' \'    repositoryformatversion = 0\' \'    filemode = true\' \'    bare = false\' \'    logallrefupdates = true\' \'[remote "origin"]\' "    url = $cmux_git_origin" \'    fetch = +refs/heads/*:refs/remotes/origin/*\' > "$cmux_git_config_tmp"; then',
+    '    rm -f -- "$cmux_git_config_tmp"; return 1',
+    '  fi',
+    '  chmod 0600 "$cmux_git_config_tmp"',
+    '  mv -f -- "$cmux_git_config_tmp" "$cmux_git_dir/config"',
+    '  test ! -L "$cmux_git_dir/config" && test -f "$cmux_git_dir/config"',
+    '  cmux_git_config_stat=$(stat -c "%u:%g:%a" "$cmux_git_dir/config" 2>/dev/null || stat -f "%u:%g:%Lp" "$cmux_git_dir/config")',
+    '  cmux_git_config_uid=${cmux_git_config_stat%%:*}; cmux_git_config_mode=${cmux_git_config_stat##*:}',
+    '  test "$cmux_git_config_uid" = "$(id -u)" && test "$cmux_git_config_mode" = 600 || { echo "[freestyle-vm-ssh] unsafe Git config ownership or mode" >&2; return 1; }',
+    '}',
+  ].join("\n");
+}
+
 export function buildCmuxCloneBootstrap() {
   const repository = CMUX_REPOSITORY;
   if (
@@ -1025,15 +1099,21 @@ export function buildCmuxCloneBootstrap() {
     'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0',
     // Every Git operation uses a fixed command policy. This disables hooks,
     // credential helpers, filters, proxies, protocol extensions, and SSH
-    // command overrides that may be present in a pre-existing .git/config.
-    'cmux_git() { /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c http.proxy= -c https.proxy= -c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.https.allow=always -c protocol.allow=never -c fetch.fsckObjects=true -c transfer.fsckObjects=true "$@"; }',
-    'if [ -e "$cmux_home/cmux" ] && { test -L "$cmux_home/cmux" || test ! -d "$cmux_home/cmux"; }; then',
+    // command overrides. The local config is replaced below before this
+    // wrapper is used for fetch or checkout, so unknown filter/process keys
+    // cannot execute.
+    'cmux_git() { /usr/bin/env -i HOME="$cmux_home" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c remote.origin.uploadpack=/usr/bin/git-upload-pack -c remote.origin.receivepack=/usr/bin/git-receive-pack -c remote.origin.proxy= -c core.gitProxy=none -c http.proxy= -c https.proxy= -c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.https.allow=always -c protocol.allow=never -c fetch.fsckObjects=true -c transfer.fsckObjects=true "$@"; }',
+    buildGitConfigIsolationScript(),
+    'if [ -L "$cmux_home/cmux" ] || { test -e "$cmux_home/cmux" && test ! -d "$cmux_home/cmux"; }; then',
     '  echo "[freestyle-vm-ssh] refusing to replace a non-git ~/cmux directory" >&2; exit 1',
     "fi",
-    'if [ -d "$cmux_home/cmux/.git" ] && { test -L "$cmux_home/cmux/.git" || test ! -f "$cmux_home/cmux/.git/config"; }; then',
+    'if [ -L "$cmux_home/cmux/.git" ] || { test -e "$cmux_home/cmux/.git" && test ! -d "$cmux_home/cmux/.git"; }; then',
     '  echo "[freestyle-vm-ssh] refusing an unsafe ~/cmux git directory" >&2; exit 1',
     "fi",
     'if [ -d "$cmux_home/cmux/.git" ]; then',
+    '  test -f "$cmux_home/cmux/.git/config" && test ! -L "$cmux_home/cmux/.git/config" || { echo "[freestyle-vm-ssh] refusing an unsafe ~/cmux git config" >&2; exit 1; }',
+    `  cmux_existing_origin=$(/usr/bin/env -i HOME="$cmux_home" PATH="/usr/bin:/bin" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 /usr/bin/git -C "$cmux_home/cmux" config --no-includes --local --get remote.origin.url 2>/dev/null || true)`,
+    `  test "$cmux_existing_origin" = ${repoUrl} || { echo "[freestyle-vm-ssh] ~/cmux origin is not the reviewed repository" >&2; exit 1; }`,
     '  test "$(stat -c \'%u\' "$cmux_home/cmux")" = "$(id -u)"; cmux_private_mode "$(stat -c \'%a\' "$cmux_home/cmux")"',
     "fi",
     'if [ ! -d "$cmux_home/cmux/.git" ]; then',
@@ -1041,11 +1121,12 @@ export function buildCmuxCloneBootstrap() {
     '  cmux_git init --quiet "$cmux_home/cmux"',
     `  cmux_git -C "$cmux_home/cmux" remote add origin ${repoUrl}`,
     "fi",
+    `cmux_git_isolate_local_config "$cmux_home/cmux" ${repoUrl}`,
     `if ! cmux_git -C "$cmux_home/cmux" remote get-url origin >/dev/null 2>&1; then cmux_git -C "$cmux_home/cmux" remote add origin ${repoUrl}; fi`,
     `cmux_origin=$(cmux_git -C "$cmux_home/cmux" remote get-url origin 2>/dev/null || true)`,
     `test "$cmux_origin" = ${repoUrl} || { echo "[freestyle-vm-ssh] ~/cmux origin is not the reviewed repository" >&2; exit 1; }`,
     `test -z "$(cmux_git -C "$cmux_home/cmux" status --porcelain)" || { echo "[freestyle-vm-ssh] refusing to overwrite a dirty ~/cmux checkout" >&2; exit 1; }`,
-    `cmux_git -C "$cmux_home/cmux" fetch --quiet --no-tags --depth 1 origin ${repoCommit}`,
+    `cmux_git -C "$cmux_home/cmux" fetch --quiet --no-tags --depth 1 --upload-pack=/usr/bin/git-upload-pack origin ${repoCommit}`,
     `cmux_git -C "$cmux_home/cmux" cat-file -e ${repoCommit}^{commit}`,
     `cmux_git -C "$cmux_home/cmux" checkout --quiet --detach ${repoCommit}`,
     `test "$(cmux_git -C "$cmux_home/cmux" rev-parse HEAD)" = ${repoCommit}`,

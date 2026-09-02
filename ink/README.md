@@ -50,6 +50,13 @@ public, and IPv6 listeners are rejected. The launcher has no operator-writable
 environment-file override, so a deployment that needs a different interface
 must update the reviewed launcher and redeploy it as a root-owned file.
 
+Task browser previews use a deterministic loopback port in the 30000-39999
+range for each VM. The dev pane opens an authenticated SSH forward from
+`127.0.0.1:<port>` on the Mac to `127.0.0.1:3000` on the VM with
+`ExitOnForwardFailure`; the browser split sets `bypass_remote_proxy` so the
+loopback URL uses that forward. A local port collision fails closed. Do not
+run two task workspaces for the same VM at the same time.
+
 The default WebSocket bootstrap requires the VM to already be authenticated to
 Tailscale. This is deliberate: an auth key must never appear in a generated
 command, process argument list, shell history, or log. To transfer a one-time
