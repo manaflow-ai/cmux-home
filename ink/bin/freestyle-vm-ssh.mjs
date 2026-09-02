@@ -1014,7 +1014,7 @@ export function buildCmuxCloneBootstrap() {
     // The remote shell is part of the trust boundary. Validate HOME before
     // expanding it in any path, and reject a symlink or a directory writable
     // by another account.
-    'cmux_private_mode() { case "$1" in *[2367][0-7]|*[0-7][2367]) return 1 ;; esac; return 0; }; cmux_home="${HOME:-}"; case "$cmux_home" in /*) ;; *) echo "[freestyle-vm-ssh] remote HOME must be absolute" >&2; exit 1 ;; esac; test -d "$cmux_home" && test ! -L "$cmux_home"; cmux_private_mode "$(stat -c \'%a\' "$cmux_home")"; test "$(stat -c \'%u\' "$cmux_home")" = "$(id -u)"',
+    'cmux_private_mode() { case "$1" in *[2367][0-7]|*[0-7][2367]) return 1 ;; esac; return 0; }; cmux_secret_mode() { case "$1" in ""|*[!0-7]*|*[1-7][0-7]|*[0-7][1-7]) return 1 ;; esac; return 0; }; cmux_home="${HOME:-}"; case "$cmux_home" in /*) ;; *) echo "[freestyle-vm-ssh] remote HOME must be absolute" >&2; exit 1 ;; esac; test -d "$cmux_home" && test ! -L "$cmux_home"; cmux_private_mode "$(stat -c \'%a\' "$cmux_home")"; test "$(stat -c \'%u\' "$cmux_home")" = "$(id -u)"',
     'export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0',
     // Every Git operation uses a fixed command policy. This disables hooks,
     // credential helpers, filters, proxies, protocol extensions, and SSH
@@ -1044,8 +1044,8 @@ export function buildCmuxCloneBootstrap() {
     `test "$(cmux_git -C "$cmux_home/cmux" rev-parse HEAD)" = ${repoCommit}`,
     // Create the dev dotenv file atomically. Existing symlinks, foreign
     // ownership, and group/world writable modes are rejected before a write.
-    'cmux_secrets_dir="$cmux_home/.secrets"; if [ -e "$cmux_secrets_dir" ] && test ! -d "$cmux_secrets_dir"; then echo "[freestyle-vm-ssh] refusing an unsafe secrets directory" >&2; exit 1; fi; if [ -e "$cmux_secrets_dir" ] && test -L "$cmux_secrets_dir"; then echo "[freestyle-vm-ssh] refusing a symlink secrets directory" >&2; exit 1; fi; install -d -m 0700 "$cmux_secrets_dir"; test "$(stat -c \'%u\' "$cmux_secrets_dir")" = "$(id -u)"; cmux_private_mode "$(stat -c \'%a\' "$cmux_secrets_dir")"',
-    'cmux_env_file="$cmux_secrets_dir/cmuxterm-dev.env"; if [ -e "$cmux_env_file" ] && test -L "$cmux_env_file"; then echo "[freestyle-vm-ssh] refusing a symlink dev env file" >&2; exit 1; fi; if [ -e "$cmux_env_file" ]; then test -f "$cmux_env_file"; test "$(stat -c \'%u\' "$cmux_env_file")" = "$(id -u)"; cmux_private_mode "$(stat -c \'%a\' "$cmux_env_file")"; else umask 077; cmux_env_tmp=$(mktemp "$cmux_secrets_dir/.cmuxterm-dev.env.XXXXXX"); cat > "$cmux_env_tmp" <<\'STUB\'',
+    'cmux_secrets_dir="$cmux_home/.secrets"; if [ -e "$cmux_secrets_dir" ] && test ! -d "$cmux_secrets_dir"; then echo "[freestyle-vm-ssh] refusing an unsafe secrets directory" >&2; exit 1; fi; if [ -e "$cmux_secrets_dir" ] && test -L "$cmux_secrets_dir"; then echo "[freestyle-vm-ssh] refusing a symlink secrets directory" >&2; exit 1; fi; install -d -m 0700 "$cmux_secrets_dir"; test "$(stat -c \'%u\' "$cmux_secrets_dir")" = "$(id -u)"; cmux_secret_mode "$(stat -c \'%a\' "$cmux_secrets_dir")"',
+    'cmux_env_file="$cmux_secrets_dir/cmuxterm-dev.env"; if [ -e "$cmux_env_file" ] && test -L "$cmux_env_file"; then echo "[freestyle-vm-ssh] refusing a symlink dev env file" >&2; exit 1; fi; if [ -e "$cmux_env_file" ]; then test -f "$cmux_env_file"; test "$(stat -c \'%u\' "$cmux_env_file")" = "$(id -u)"; cmux_secret_mode "$(stat -c \'%a\' "$cmux_env_file")"; else umask 077; cmux_env_tmp=$(mktemp "$cmux_secrets_dir/.cmuxterm-dev.env.XXXXXX"); cat > "$cmux_env_tmp" <<\'STUB\'',
     "# Stub written by freestyle-vm-ssh so cmux web's dev-local.sh proceeds.",
     "# Most routes will 500 without real Stack Auth + Convex secrets, but the",
     "# top-level Next.js dev server still binds and renders public pages.",

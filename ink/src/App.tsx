@@ -17,10 +17,9 @@ import { CmuxClient, defaultSocketPath } from "./client.js";
 import { prepareFreestyleBootstrap } from "./cmux-ssh.js";
 import {
   createCodexPromptPath,
+  cleanupFreestyleWsResources,
   openCmuxWsWorkspace,
   prepareFreestyleWsAttach,
-  removeFreestyleWsLeases,
-  removeCodexPromptFile,
   transferCodexPromptFile,
 } from "./cmux-ws.js";
 import {
@@ -1274,6 +1273,16 @@ async function openTaskWorkspace(opts: {
   let promptTransferred = false;
   let attach: Awaited<ReturnType<typeof prepareFreestyleWsAttach>> | null = null;
   let ws: Awaited<ReturnType<typeof openCmuxWsWorkspace>>;
+  const cleanupPendingAttach = async () => {
+    if (!attach) return;
+    await cleanupFreestyleWsResources(
+      freestyle.sdk,
+      vmId,
+      promptTransferred ? codexPromptFile : null,
+    );
+    attach = null;
+    promptTransferred = false;
+  };
   try {
     attach = await prepareFreestyleWsAttach(freestyle.sdk, vmId);
     if (codexPromptFile && codexPrompt) {
@@ -1293,15 +1302,10 @@ async function openTaskWorkspace(opts: {
       // socket. Passing them through `cmux rpc` would expose them in argv.
       rpc: client.rpc.bind(client),
       noFocus: false,
-      cleanupLeases: () => removeFreestyleWsLeases(freestyle.sdk, vmId),
+      cleanupLeases: () => cleanupFreestyleWsResources(freestyle.sdk, vmId),
     });
   } catch (error) {
-    if (attach) {
-      await removeFreestyleWsLeases(freestyle.sdk, vmId);
-    }
-    if (promptTransferred && codexPromptFile) {
-      await removeCodexPromptFile(freestyle.sdk, vmId, codexPromptFile);
-    }
+    await cleanupPendingAttach();
     throw error;
   }
   const workspaceRef = ws.workspaceRef;
@@ -1321,13 +1325,14 @@ async function openTaskWorkspace(opts: {
       const payload = `\n${bootstrap.remoteCommand}\n`;
       await client.sendText(firstTerm.surfaceRef, payload);
     } else {
+      await cleanupPendingAttach();
       setStatusLine(`opened ws workspace, but no surface to send bootstrap to`);
+      return workspaceRef;
     }
   } catch (err) {
-    if (codexPromptFile) {
-      await removeCodexPromptFile(freestyle.sdk, vmId, codexPromptFile);
-    }
+    await cleanupPendingAttach();
     setStatusLine(`opened ws workspace, bootstrap send failed: ${(err as Error).message}`);
+    return workspaceRef;
   }
 
   // 4. Add the three auxiliary panes. The WebSocket attach leaves a focused
@@ -1351,6 +1356,7 @@ async function openTaskWorkspace(opts: {
     const initialSurfaces = await client.listPaneSurfaces(workspaceRef);
     const codex = initialSurfaces[0];
     if (!codex) {
+      await cleanupPendingAttach();
       setStatusLine(`opened ws workspace, but no codex surface to anchor splits`);
       return workspaceRef;
     }

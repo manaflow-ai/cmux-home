@@ -72,12 +72,16 @@ function assertCodexPrompt(path: string, prompt: string): void {
 
 function rootVmFor(freestyle: Freestyle, vmId: string) {
   const vmRef = freestyle.vms.ref({ vmId });
-  if (typeof (vmRef as { user?: unknown }).user !== "function") {
+  try {
+    // `Vm.user` is part of the Freestyle SDK's public type. Keep this call
+    // typed so an SDK contract change fails during compilation instead of
+    // being hidden by a double cast at a security boundary.
+    return vmRef.user({ username: "root" });
+  } catch {
+    // A malformed runtime SDK object can still arrive through JavaScript
+    // interop. Convert that failure to a stable, fail-closed diagnostic.
     throw new Error("Freestyle SDK must support an explicit root VM file/exec user");
   }
-  return (vmRef as unknown as {
-    user: (options: { username: string }) => typeof vmRef;
-  }).user({ username: "root" });
 }
 
 /**
@@ -425,15 +429,9 @@ export async function prepareFreestyleWsAttach(
   // default so normal WebSocket attaches do not require a secret-redaction
   // acknowledgement. Secret-bearing transfers (Tailscale keys and Codex
   // prompts) remain gated by providerFileTransferEnabled().
-  const vmRef = freestyle.vms.ref({ vmId });
-  if (typeof (vmRef as { user?: unknown }).user !== "function") {
-    throw new Error("Freestyle SDK must support an explicit root VM file/exec user");
-  }
   // The provider's default Linux user is not part of the public contract.
   // Select root explicitly because staging and ownership checks rely on it.
-  const vm = (vmRef as unknown as {
-    user: (options: { username: string }) => typeof vmRef;
-  }).user({ username: "root" });
+  const vm = rootVmFor(freestyle, vmId);
 
   // 1. Install a verified cmuxd-remote and a least-privilege systemd unit.
   // The script is intentionally idempotent and rewrites an old insecure unit
@@ -516,6 +514,22 @@ export async function removeFreestyleWsLeases(
     // Lease files are short-lived and the daemon rejects expired entries. A
     // provider outage must not turn cleanup into a second user-visible error.
   }
+}
+
+/**
+ * Remove resources created for a pending WebSocket workspace. The helper is
+ * idempotent and intentionally swallows provider cleanup failures, because a
+ * failed attach must not be turned into a second user-visible failure.
+ */
+export async function cleanupFreestyleWsResources(
+  freestyle: Freestyle,
+  vmId: string,
+  promptPath: string | null = null,
+): Promise<void> {
+  await Promise.allSettled([
+    removeFreestyleWsLeases(freestyle, vmId),
+    promptPath ? removeCodexPromptFile(freestyle, vmId, promptPath) : Promise.resolve(),
+  ]);
 }
 
 export interface OpenWsWorkspaceResult {
