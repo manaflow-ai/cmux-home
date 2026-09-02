@@ -1,6 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { EventEmitter } from "node:events";
 import type { EventFrame, Notification, Workspace } from "./types.js";
+import { assertTrustedUnixSocketPath } from "../bin/remote-security.mjs";
 
 export interface CmuxClientOptions {
   readonly socketPath: string;
@@ -34,7 +35,7 @@ export class CmuxClient {
     let parsed: RawResponse;
     try {
       parsed = JSON.parse(response.trim()) as RawResponse;
-    } catch (err) {
+    } catch {
       throw new Error(`cmux ${method} returned invalid JSON: ${response.slice(0, 200)}`);
     }
     if (parsed.ok !== true) {
@@ -92,16 +93,50 @@ export class CmuxClient {
     url: string;
     direction?: "right" | "left" | "up" | "down";
     focus?: boolean;
-  }): Promise<{ paneRef: string; surfaceRef: string } | null> {
-    const result = (await this.rpc("pane.create", {
-      workspace_id: input.workspaceId,
-      type: "browser",
-      direction: input.direction ?? "right",
-      url: input.url,
-      focus: input.focus ?? false,
-    })) as { pane_ref?: string; surface_ref?: string } | undefined;
+    sourceSurfaceId?: string;
+    /** Keep a loopback URL on the local machine instead of the remote proxy. */
+    bypassRemoteProxy?: boolean;
+  }): Promise<{
+    paneRef: string;
+    surfaceRef: string;
+    paneId?: string;
+    surfaceId?: string;
+  } | null> {
+    const useBrowserOpenSplit = Boolean(input.sourceSurfaceId);
+    if (useBrowserOpenSplit && (input.direction ?? "right") !== "right") {
+      throw new Error("browser.open_split only supports a right-hand split");
+    }
+    const method = useBrowserOpenSplit ? "browser.open_split" : "pane.create";
+    const params: Record<string, unknown> = useBrowserOpenSplit
+      ? {
+          workspace_id: input.workspaceId,
+          surface_id: input.sourceSurfaceId,
+          url: input.url,
+          focus: input.focus ?? false,
+          bypass_remote_proxy: input.bypassRemoteProxy ?? false,
+        }
+      : {
+          workspace_id: input.workspaceId,
+          type: "browser",
+          direction: input.direction ?? "right",
+          url: input.url,
+          focus: input.focus ?? false,
+        };
+    const result = (await this.rpc(method, params)) as
+      | {
+          pane_id?: string;
+          pane_ref?: string;
+          surface_id?: string;
+          surface_ref?: string;
+        }
+      | undefined;
     if (!result?.pane_ref || !result?.surface_ref) return null;
-    return { paneRef: result.pane_ref, surfaceRef: result.surface_ref };
+    return {
+      paneId: result.pane_id,
+      paneRef: result.pane_ref,
+      surfaceId: result.surface_id,
+      surfaceRef: result.surface_ref,
+    };
   }
 
   async createTerminalPane(input: {
@@ -298,6 +333,17 @@ export class CmuxEventStream {
 
   private connect(): void {
     if (this.closed) return;
+    try {
+      assertTrustedUnixSocketPath(this.socketPath);
+    } catch (error) {
+      queueMicrotask(() => {
+        if (!this.closed) {
+          this.emit("error", error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      this.scheduleReconnect();
+      return;
+    }
     const socket = createConnection({ path: this.socketPath });
     this.socket = socket;
     socket.setEncoding("utf8");
@@ -362,6 +408,12 @@ function sendOneLine(
   timeoutMs: number,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
+    try {
+      assertTrustedUnixSocketPath(socketPath);
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
     const socket = createConnection({ path: socketPath });
     let received = "";
     let settled = false;

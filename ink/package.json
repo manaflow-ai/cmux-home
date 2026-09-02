@@ -14,7 +14,8 @@
     "dev": "tsx src/index.tsx",
     "start": "tsx src/index.tsx",
     "typecheck": "tsc -p .",
-    "build": "tsc -p . --outDir dist --noEmit false --declaration false"
+    "build": "tsc -p . --outDir dist --noEmit false --declaration false && node scripts/copy-runtime-assets.mjs",
+    "test:security": "tsx --test test/security.test.mjs"
   },
   "dependencies": {
     "freestyle": "0.1.51",

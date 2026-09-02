@@ -14,8 +14,19 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
+import {
+  devServerBrowserUrlForVm,
+  devServerMacPortForVm,
+} from "../bin/freestyle-vm-ssh.mjs";
 import { prepareFreestyleBootstrap } from "./cmux-ssh.js";
-import { openCmuxWsWorkspace, prepareFreestyleWsAttach } from "./cmux-ws.js";
+import {
+  CMUXD_SERVICE_USER,
+  createCodexPromptPath,
+  cleanupFreestyleWsResources,
+  openCmuxWsWorkspace,
+  prepareFreestyleWsAttach,
+  transferCodexPromptFile,
+} from "./cmux-ws.js";
 import {
   COLORS,
   SPINNER_FRAMES,
@@ -120,13 +131,8 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
   const [forkParents, setForkParents] = useState<ReadonlyMap<string, string>>(
     () => new Map(),
   );
-  // With cmuxd-ws attach the workspace gets a local SOCKS5 proxy
-  // (cmux's app reports it as `remote.proxy.url`) that tunnels traffic
-  // through the daemon's WebSocket back to the VM's localhost.
-  // Browser panes routed through this proxy can dial `http://127.0.0.1:3000`
-  // and reach the VM's dev server with no per-VM mac port allocation.
   const browserUrlForVm = useCallback(
-    (_vmId: string): string => "http://127.0.0.1:3000",
+    (vmId: string): string => devServerBrowserUrlForVm(vmId),
     [],
   );
 
@@ -677,12 +683,14 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         });
         const shortChild = vmId.slice(0, 8);
         setStatusLine(`fork ${shortChild} of ${shortParent} (snap ${snapshotId.slice(0, 8)})`);
-        const titlePrompt = prompt && prompt.trim() ? prompt.trim().slice(0, 32) : "shell";
+        // Prompt text can contain credentials or private task details. Keep
+        // it in the protected one-time file, never in workspace metadata.
+        const taskLabel = prompt && prompt.trim() ? "task" : "shell";
         await openTaskWorkspace({
           client,
           freestyle,
           vmId,
-          name: `fork: ${titlePrompt} (${shortParent}→${shortChild})`,
+          name: `fork: ${taskLabel} (${shortParent}→${shortChild})`,
           codexPrompt: prompt && prompt.trim() ? prompt.trim() : null,
           helperPath: VM_SSH_SCRIPT,
           devUrl: browserUrlForVm(vmId),
@@ -739,7 +747,6 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
       setComposer(EMPTY_COMPOSER);
       setComposerMode({ kind: "new" });
       try {
-        const preview = trimmed.slice(0, 48);
         setStatusLine(`creating vm from snapshot…`);
         const { vmId } = await freestyle.createFromSnapshot(snapshotId);
         const shortId = vmId.slice(0, 8);
@@ -748,7 +755,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           client,
           freestyle,
           vmId,
-          name: `task: ${preview}`,
+          name: `task (${shortId})`,
           codexPrompt: trimmed,
           helperPath: VM_SSH_SCRIPT,
           devUrl: browserUrlForVm(vmId),
@@ -780,7 +787,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           setComposer(EMPTY_COMPOSER);
           setComposerMode({ kind: "new" });
           setStatusLine(
-            `forking ${count} × ${selectedVm.id.slice(0, 8)}${prompt ? ` for "${prompt.slice(0, 32)}"` : ""}`,
+            `forking ${count} × ${selectedVm.id.slice(0, 8)}${prompt ? " with task" : ""}`,
           );
           await Promise.allSettled(
             Array.from({ length: count }, () =>
@@ -799,7 +806,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
           }
           setComposer(EMPTY_COMPOSER);
           setComposerMode({ kind: "new" });
-          setStatusLine(`spawning ${count} cloud sandboxes for "${prompt.slice(0, 32)}"`);
+          setStatusLine(`spawning ${count} cloud sandboxes with task`);
           await Promise.allSettled(
             Array.from({ length: count }, () => submitToNewCloudSandbox(prompt)),
           );
@@ -1082,7 +1089,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
     if (s.startsWith("press ctrl+")) return s;
     if (
       submitting ||
-      /^(spawning|waiting|opening|opened|creating|cmux ssh|preparing|vm |destroying|task workspace|destroyed|created vm|started|focused)/i.test(s) ||
+      /^(spawning|waiting|opening|opened|creating|ws workspace|preparing|vm |destroying|task workspace|destroyed|created vm|started|focused)/i.test(s) ||
       / failed:/.test(s) ||
       s.startsWith("rename")
     ) {
@@ -1097,7 +1104,7 @@ export function App({ socketPath, cwd }: AppProps): React.JSX.Element {
         <Text>
           <Text color="blueBright" bold>cmux-freestyle-hq</Text>
           <Text color={COLORS.muted}>
-            {`  ·  ${freestyle.isEnabled() ? "freestyle " + (freestyle.apiKey?.slice(0, 6) ?? "?") + "…" : "no FREESTYLE_API_KEY"}`}
+            {`  ·  ${freestyle.isEnabled() ? "freestyle enabled" : "no FREESTYLE_API_KEY"}`}
             {`  ·  socket ${oneLinePreview(resolvedSocketPath, 36)}`}
           </Text>
         </Text>
@@ -1204,23 +1211,21 @@ function parseSlashCommand(text: string): ParsedSlashCommand | null {
 }
 
 /**
- * Open a task workspace: invoke `cmux ssh` to make the codex pane a
- * first-class ssh-managed workspace (status indicators, reconnect),
- * then add the auxiliary panes (browser, shell, dev-log) via pane.create.
+ * Open a task workspace: attach the codex pane through cmuxd's authenticated
+ * WebSocket transport, then add the auxiliary panes (browser, shell, dev-log)
+ * via pane.create.
  *
  * Final layout is a 2x2 grid:
  *   ┌────────────────────────┬───────────────────────┐
- *   │ cmux ssh (codex)       │ browser → devUrl      │
+ *   │ ws codex               │ browser → devUrl      │
  *   ├────────────────────────┼───────────────────────┤
  *   │ ssh + bash (~/cmux)    │ ssh + dev log tail    │
  *   └────────────────────────┴───────────────────────┘
  *
- * The codex pane goes through `cmux ssh` directly (with
- * --no-daemon-bootstrap so the russh gateway doesn't try to scp
- * cmuxd-remote). The dev-log + shell panes stay on the lightweight
- * helper-script attach modes (--attach-dev-tail / --attach-shell) since
- * each cmux ssh call creates its own workspace and we want them as
- * panes inside this workspace.
+ * The codex pane uses cmuxd's WebSocket PTY, so no SSH credential or exec
+ * channel is needed. The dev-log and shell panes use the lightweight helper
+ * attach modes (`--attach-dev-tail` and `--attach-shell`) inside this
+ * workspace.
  */
 async function openTaskWorkspace(opts: {
   client: CmuxClient;
@@ -1245,39 +1250,70 @@ async function openTaskWorkspace(opts: {
     setStatusLine,
   } = opts;
 
-  // 1. Mint freestyle creds + build the full remote bootstrap script
-  //    that we'll type into the WS-attached shell.
+  const codexPromptFile = codexPrompt?.trim() ? createCodexPromptPath() : null;
+
+  // 1. Build the credential-free remote bootstrap script that we type into
+  //    the authenticated WebSocket PTY.
   setStatusLine(`preparing bootstrap for ${vmId.slice(0, 8)}…`);
   const bootstrap = await prepareFreestyleBootstrap({
     helperPath,
     vmId,
     cloneCmux: true,
-    codexPrompt,
+    codexPromptFile,
     subrouterAccountId,
+    subrouterUrl: process.env.SUBROUTER_REMOTE_URL?.trim() ?? null,
+    subrouterUserEmail: process.env.SUBROUTER_CODEX_USER_EMAIL?.trim() ?? null,
+    allowUntrustedSubrouter: process.env.CMUX_HOME_ALLOW_UNTRUSTED_SUBROUTER === "1",
   });
 
-  // 2. Attach via cmuxd-ws WebSocket. Avoids the SSH exec-channel
-  //    limitation of the russh freestyle gateway entirely. The
-  //    snapshot already runs `cmuxd-remote serve --ws` on port 7777
-  //    (exposed by freestyle at wss://<vmId>.vm.freestyle.sh/), so
-  //    we just mint lease tokens, write them into the VM via the
-  //    Freestyle exec API, and tell cmux to open a workspace pointing
-  //    at the WebSocket endpoints. The daemon RPC + proxy / port
-  //    forwarding cmux normally provides over SSH work too because
-  //    cmuxd-remote serves both /terminal and /rpc.
+  // 2. Attach via cmuxd's WebSocket endpoints. The lease tokens are written
+  //    through the provider API and the RPC token travels only over cmux's
+  //    authenticated Unix socket.
   setStatusLine(`cmux ws attach into ${vmId.slice(0, 8)}…`);
-  const attach = await prepareFreestyleWsAttach(freestyle.sdk, vmId);
-  const ws = await openCmuxWsWorkspace({
-    vmId,
-    attach,
-    workspaceName: name,
-    noFocus: false,
-  });
+  let promptTransferred = false;
+  let attach: Awaited<ReturnType<typeof prepareFreestyleWsAttach>> | null = null;
+  let ws: Awaited<ReturnType<typeof openCmuxWsWorkspace>>;
+  const cleanupPendingAttach = async () => {
+    if (!attach) return;
+    await cleanupFreestyleWsResources(
+      freestyle.sdk,
+      vmId,
+      promptTransferred ? codexPromptFile : null,
+    );
+    attach = null;
+    promptTransferred = false;
+  };
+  try {
+    attach = await prepareFreestyleWsAttach(freestyle.sdk, vmId);
+    if (codexPromptFile && codexPrompt) {
+      await transferCodexPromptFile(
+        freestyle.sdk,
+        vmId,
+        codexPromptFile,
+        codexPrompt.trim(),
+        CMUXD_SERVICE_USER,
+      );
+      promptTransferred = true;
+    }
+    ws = await openCmuxWsWorkspace({
+      vmId,
+      attach,
+      workspaceName: name,
+      // Lease-bearing RPC fields must travel over the authenticated Unix
+      // socket. Passing them through `cmux rpc` would expose them in argv.
+      rpc: client.rpc.bind(client),
+      noFocus: false,
+      cleanupLeases: () => cleanupFreestyleWsResources(freestyle.sdk, vmId),
+    });
+  } catch (error) {
+    await cleanupPendingAttach();
+    throw error;
+  }
   const workspaceRef = ws.workspaceRef;
 
-  // 3. Send the bootstrap to the interactive shell. cmux's SSH bootstrap
-  //    already allocates the PTY before we get a workspace_id back, so
-  //    surface.send_text lands inside the live shell. We pre-pend a
+  // 3. Send the bootstrap to the interactive shell. The WebSocket bridge
+  //    allocates the PTY before we get a workspace_id back, so
+  //    surface.send_text lands inside the live shell. We prepend a
   //    single CR so any pre-prompt buffered input gets flushed first,
   //    and append a trailing CR to actually submit the chain.
   try {
@@ -1290,13 +1326,17 @@ async function openTaskWorkspace(opts: {
       const payload = `\n${bootstrap.remoteCommand}\n`;
       await client.sendText(firstTerm.surfaceRef, payload);
     } else {
-      setStatusLine(`opened cmux ssh, but no surface to send bootstrap to`);
+      await cleanupPendingAttach();
+      setStatusLine(`opened ws workspace, but no surface to send bootstrap to`);
+      return workspaceRef;
     }
   } catch (err) {
-    setStatusLine(`opened cmux ssh, bootstrap send failed: ${(err as Error).message}`);
+    await cleanupPendingAttach();
+    setStatusLine(`opened ws workspace, bootstrap send failed: ${(err as Error).message}`);
+    return workspaceRef;
   }
 
-  // 4. Add the three auxiliary panes. cmux ssh leaves a focused
+  // 4. Add the three auxiliary panes. The WebSocket attach leaves a focused
   //    workspace with one terminal panel, so pane.create has a target.
   //
   // We anchor each split on an explicit surface_id from listPaneSurfaces
@@ -1307,27 +1347,39 @@ async function openTaskWorkspace(opts: {
   //
   // Final layout:
   //   ┌──────────────────────┬──────────────────────┐
-  //   │  codex (cmux ssh)    │  browser → devUrl    │
+  //   │  codex (ws)          │  browser → devUrl    │
   //   ├──────────────────────┼──────────────────────┤
   //   │  shell (~/cmux)      │  dev: bun dev        │
   //   └──────────────────────┴──────────────────────┘
-  const devCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-dev-start`;
+  const devPort = portFromUrl(devUrl);
+  if (devPort === null || devPort < 1 || devPort > 65535) {
+    throw new Error("dev server URL must contain a valid local forward port");
+  }
+  const expectedDevPort = devServerMacPortForVm(vmId);
+  if (devPort !== expectedDevPort) {
+    throw new Error("dev server URL does not match the VM's authenticated forward");
+  }
+  const devCmd =
+    `node ${shellQuote(helperPath)} ${shellQuote(vmId)} ` +
+    `--attach-dev-start --dev-server-mac-port ${devPort}`;
   const shellCmd = `node ${shellQuote(helperPath)} ${shellQuote(vmId)} --attach-shell`;
   try {
     const initialSurfaces = await client.listPaneSurfaces(workspaceRef);
     const codex = initialSurfaces[0];
     if (!codex) {
-      setStatusLine(`opened cmux ssh, but no codex surface to anchor splits`);
+      await cleanupPendingAttach();
+      setStatusLine(`opened ws workspace, but no codex surface to anchor splits`);
       return workspaceRef;
     }
-    // Top-right: browser, anchored on the codex pane.
-    const browser = await client.createPane({
+    // Top-right: browser, anchored on the codex pane. The URL is loopback on
+    // this Mac; the dev pane owns the authenticated SSH forward to the VM.
+    const browser = await client.createBrowserPane({
       workspaceId: workspaceRef,
-      type: "browser",
-      direction: "right",
       url: devUrl,
+      direction: "right",
       focus: false,
       sourceSurfaceId: codex.surfaceId,
+      bypassRemoteProxy: true,
     });
     // Bottom-right: dev server, anchored on the browser pane.
     if (browser?.surfaceId) {
@@ -1350,7 +1402,7 @@ async function openTaskWorkspace(opts: {
       sourceSurfaceId: codex.surfaceId,
     });
   } catch (err) {
-    setStatusLine(`opened cmux ssh, aux panes failed: ${(err as Error).message}`);
+    setStatusLine(`opened ws workspace, aux panes failed: ${(err as Error).message}`);
   }
 
   return workspaceRef;
@@ -1402,4 +1454,3 @@ function composerVisualLineCount(state: ComposerState, width: number): number {
   });
   return Math.max(1, total);
 }
-

@@ -1,0 +1,35 @@
+{
+  "cmuxdRemote": {
+    "releaseTag": "v0.64.5",
+    "releaseCommit": "278b31209c1540b1f658f39dbab5a748a14bcb93",
+    "assets": {
+      "amd64": {
+        "name": "cmuxd-remote-linux-amd64",
+        "sha256": "6e3b1714f02dc8e417452ac85c702e4f1fdf3ee753d38d9c7ddea430115eeddd"
+      },
+      "arm64": {
+        "name": "cmuxd-remote-linux-arm64",
+        "sha256": "01cb21153f1dac5bec7608df603a98cd28cbb804278b76b23be22fa3f10950bf"
+      }
+    }
+  },
+  "tailscale": {
+    "version": "1.102.3",
+    "assets": {
+      "amd64": {
+        "sha256": "36ddd9b51be57ffc2990cf76323cfa13643bfbb1b8a969f6183fa164741cdef5",
+        "tailscaleSha256": "d6ffcba02fa07728f0c4847fc06d61f239f763478bd59156abf3591bdb1a3ad1",
+        "tailscaledSha256": "ce4770bbe6fc9dbcf47d8a2ccc5efad73e3f975460b01738dd0b059879d01221"
+      },
+      "arm64": {
+        "sha256": "a0fa1b154af8c61f862a2259f559f7396d96c0225f4a863eae2333e1546bbe25",
+        "tailscaleSha256": "a14b94589c2630eb68ba7f7651ede226d2976708760ef3460556a00cf1aa4bab",
+        "tailscaledSha256": "dda710b5bed9fbf87efc0126b614ed8f0e9f4a43b2265486bc6ad7eb0570f226"
+      }
+    }
+  },
+  "cmuxRepository": {
+    "url": "https://github.com/manaflow-ai/cmux.git",
+    "commit": "0247f51a1f30308df595606d0951c802ec038550"
+  }
+}
