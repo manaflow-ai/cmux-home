@@ -11,22 +11,14 @@ MUTATION_GROUP="cla-mutation-\${{ github.repository }}-\${{ github.event.pull_re
 command -v jq >/dev/null
 command -v ruby >/dev/null
 [[ -f "${WORKFLOW}" && -f "${FIXTURE}" && -f "${CODEOWNERS}" ]]
-
-# The protected cla-signatures branch is authoritative. Keep the mutable
-# ledger out of main so a pull request cannot change the signer record in the
-# same revision that changes this policy.
-[[ ! -e "${ROOT_DIR}/signatures/version2/cla.json" ]] || {
-  echo "main must not contain a duplicate CLA ledger" >&2
-  exit 1
-}
-grep -Fq 'branch: "cla-signatures"' "${WORKFLOW}" || {
-  echo "CLA action must use the protected cla-signatures branch" >&2
-  exit 1
-}
+# The action reads and writes the protected cla-signatures branch. A second
+# ledger on the default branch would be a writable, unauthoritative copy.
+[[ ! -e "${ROOT_DIR}/signatures/version2/cla.json" ]]
 
 refs="$(grep -oE "manaflow-ai/cla-github-action@[0-9a-f]{40}" "${WORKFLOW}" | sort -u)"
 [[ "${refs}" == "manaflow-ai/cla-github-action@${ACTION_SHA}" ]]
 [[ "$(sed -n '1p' "${WORKFLOW}")" == 'name: "CLA Assistant v3"' ]]
+[[ "$(grep -Ec '^[[:space:]]+branch: "cla-signatures"$' "${WORKFLOW}")" == 3 ]]
 
 # Parse job permissions and mutation lanes as data, so a formatting change
 # cannot hide a missing write permission or split the per-PR queue.
