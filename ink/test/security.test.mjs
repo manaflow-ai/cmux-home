@@ -71,6 +71,7 @@ test("cmux clone bootstrap checks out only the reviewed commit", () => {
   const script = buildCmuxCloneBootstrap();
   assert.match(script, /0247f51a1f30308df595606d0951c802ec038550/);
   assert.match(script, /cmux_git -C .*fetch --quiet --no-tags --depth 1 origin/);
+  assert.match(script, /protocol\.https\.allow=always/);
   assert.match(script, /cat-file -e/);
   assert.match(script, /checkout --quiet --detach/);
   assert.match(script, /--frozen-lockfile --ignore-scripts/);
@@ -405,6 +406,10 @@ test("credential-free bootstrap consumes prompt by file path only", () => {
   ], { encoding: "utf8", env: sanitizedEnvironment() });
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout.trim().split(/\r?\n/).pop());
+  assert.match(
+    payload.remoteCommand,
+    /^prompt_file='[^']+'; cleanup_prompt\(\) \{ rm -f -- "\$prompt_file"; \}; trap cleanup_prompt EXIT && /,
+  );
   assert.match(payload.remoteCommand, /codex exec -/);
   assert.match(payload.remoteCommand, new RegExp(promptPath.replaceAll("/", "\\/")));
   assert.match(payload.remoteCommand, /codex exec -[^;]*; cleanup_prompt; trap - EXIT; exec bash -l/);
@@ -467,6 +472,40 @@ test("credential-free bootstrap removes the prompt after Codex consumes it", () 
   }
 });
 
+test("credential-free bootstrap removes the prompt when an earlier step fails", () => {
+  const home = mkdtempSync(join(tmpdir(), "cmux-home-prompt-failure-"));
+  const prompt = join(home, "prompt.txt");
+  const promptPath = "/run/cmuxd/codex-prompt-0123456789abcdef0123456789abcdef.txt";
+  try {
+    writeFileSync(prompt, "private prompt that must be removed", { mode: 0o600 });
+    const helperRun = spawnSync(process.execPath, [
+      helper,
+      "vm-test",
+      "--print-bootstrap",
+      "--no-ssh-credential",
+      "--no-tailscale",
+      "--no-codex-config",
+      "--codex-prompt-file",
+      promptPath,
+    ], { encoding: "utf8", env: sanitizedEnvironment() });
+    assert.equal(helperRun.status, 0, helperRun.stderr);
+    const payload = JSON.parse(helperRun.stdout.trim().split(/\r?\n/).pop());
+    const remoteCommand = payload.remoteCommand.replaceAll(promptPath, prompt);
+    const separator = remoteCommand.indexOf(" && ");
+    assert.ok(separator > 0, "prompt cleanup must precede bootstrap steps");
+    const failingCommand = `${remoteCommand.slice(0, separator)} && false && ${remoteCommand.slice(separator + 4)}`;
+    const run = spawnSync("bash", ["--noprofile", "--norc", "-c", failingCommand], {
+      encoding: "utf8",
+      env: { HOME: home, PATH: "/usr/bin:/bin", TERM: "xterm" },
+      timeout: 5_000,
+    });
+    assert.notEqual(run.status, 0);
+    assert.equal(existsSync(prompt), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("sha256 shell check fails closed on a digest mismatch", () => {
   const dir = mkdtempSync(join(tmpdir(), "cmux-home-test-"));
   try {
@@ -498,6 +537,7 @@ test("Tailscale bootstrap contains no credential and requires a file path", () =
   });
   assert.match(withFile, /--auth-key="file:\$ts_auth_file"/);
   assert.match(withFile, /chmod 0600/);
+  assert.match(withFile, /sed -n/);
   assert.match(withFile, /rm -f "\$ts_auth_file"/);
   assert.doesNotMatch(withFile, /SECRET|authKeyB64/);
   assert.doesNotMatch(withFile, /TS_HOST/);
