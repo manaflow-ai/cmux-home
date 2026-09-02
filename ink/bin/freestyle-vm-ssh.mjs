@@ -766,7 +766,13 @@ try {
   } else {
     remoteSteps.push(`cd ${codexCwd} && exec bash -l`);
   }
-  const remoteCommand = remoteSteps.join(" && ");
+  const remoteCommandBody = remoteSteps.join(" && ");
+  // Run prompt-bearing bootstraps in a subshell. The command is entered into
+  // an interactive PTY, where an EXIT trap in the parent shell would not run
+  // when an && chain fails and returns to the prompt.
+  const remoteCommand = args.codexPromptFile
+    ? `( ${remoteCommandBody} )`
+    : remoteCommandBody;
 
   // --print-bootstrap is used by cmux-home's WebSocket path. It deliberately
   // emits no credential or identity. The remote command runs in the already
