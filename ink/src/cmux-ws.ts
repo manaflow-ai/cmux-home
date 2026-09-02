@@ -228,6 +228,15 @@ export function buildCmuxdInstallScript(): string {
     `test ! -L ${shellQuote(CMUXD_WS_LEASE_DIR)}`,
     `install -d -o root -g ${serviceUser} -m 0710 ${CMUXD_WS_LEASE_DIR}`,
     `test "$(stat -c '%u:%g:%a' ${shellQuote(CMUXD_WS_LEASE_DIR)})" = "0:$cmux_gid:710"`,
+    // The release binary, launcher, and provenance marker share this parent.
+    // Validate every existing component before install follows the path, then
+    // create the target with root ownership and a fixed non-writable mode.
+    "test ! -L /usr/local || { echo 'cmuxd-ws: refusing a symlink /usr/local' >&2; exit 1; }",
+    "test -d /usr/local || { echo 'cmuxd-ws: /usr/local must be a directory' >&2; exit 1; }",
+    "test ! -L /usr/local/libexec || { echo 'cmuxd-ws: refusing a symlink libexec directory' >&2; exit 1; }",
+    "install -d -o root -g root -m 0755 /usr/local/libexec",
+    "test ! -L /usr/local/libexec || { echo 'cmuxd-ws: libexec directory changed to a symlink' >&2; exit 1; }",
+    "test \"$(stat -c '%u:%g:%a' /usr/local/libexec)\" = '0:0:755' || { echo 'cmuxd-ws: libexec directory ownership or mode is unsafe' >&2; exit 1; }",
     "cmux_sha256() {",
     "  if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{print tolower($1)}'; return; fi",
     "  if command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{print tolower($1)}'; return; fi",

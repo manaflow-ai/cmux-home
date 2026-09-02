@@ -1158,6 +1158,14 @@ export function buildTailscaleBootstrap(options) {
     "  [ ! -L \"$1\" ] || return 1",
     "  [ \"$(stat -c '%u:%g:%a' \"$1\")\" = '0:0:644' ]",
     "}",
+    // Keep the shared provenance marker under a root-owned, non-writable
+    // directory. Check the parent before any install can follow it.
+    "test ! -L /usr/local || { echo '[freestyle-vm-ssh] refusing a symlink /usr/local' >&2; exit 1; }",
+    "test -d /usr/local || { echo '[freestyle-vm-ssh] /usr/local must be a directory' >&2; exit 1; }",
+    "test ! -L /usr/local/libexec || { echo '[freestyle-vm-ssh] refusing a symlink libexec directory' >&2; exit 1; }",
+    "install -d -o root -g root -m 0755 /usr/local/libexec",
+    "test ! -L /usr/local/libexec || { echo '[freestyle-vm-ssh] libexec directory changed to a symlink' >&2; exit 1; }",
+    "test \"$(stat -c '%u:%g:%a' /usr/local/libexec)\" = '0:0:755' || { echo '[freestyle-vm-ssh] libexec directory ownership or mode is unsafe' >&2; exit 1; }",
     `ts_version=${shellQuote(version)}`,
     `ts_tailnet_dns_suffix=${shellQuote(tailnetDnsSuffix.toLowerCase())}`,
     'ts_arch="$(uname -m)"',
