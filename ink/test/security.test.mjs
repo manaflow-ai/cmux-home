@@ -1,12 +1,25 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import {
+  CMUXD_SERVICE_USER,
   buildCmuxdInstallScript,
   buildCmuxdWsLauncherScript,
   buildLeaseWriteScript,
@@ -24,6 +37,7 @@ import {
 } from "../src/cmux-ssh.ts";
 import {
   redactSecrets,
+  buildSecureInstallDirectoryScript,
   sanitizedEnvironment,
   sha256CheckShell,
 } from "../bin/remote-security.mjs";
@@ -68,30 +82,85 @@ test("cmuxd installer pins both architecture digests and least privilege", () =>
   execFileSync("bash", ["-n", "-c", script]);
 });
 
-test("system installers provision a private libexec parent before marker writes", () => {
-  const cases = [
-    {
-      script: buildCmuxdInstallScript(),
-      marker: "/usr/local/libexec/cmuxd-remote.release",
-    },
-    {
-      script: buildTailscaleBootstrap({ hostname: "fs-test", proxyPort: 1055 }),
-      marker: "/usr/local/libexec/tailscale.release",
-    },
-  ];
-  for (const { script, marker } of cases) {
-    const symlinkCheck = script.indexOf("test ! -L /usr/local/libexec");
-    const directoryCreate = script.indexOf(
-      "install -d -o root -g root -m 0755 /usr/local/libexec",
+test("secure install directory guard enforces filesystem policy before writes", () => {
+  const fixture = realpathSync(mkdtempSync(join(tmpdir(), "cmux-home-libexec-")));
+  const bin = join(fixture, "bin");
+  const owner = String(process.getuid?.() ?? 501);
+  const group = String(process.getgid?.() ?? 20);
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "stat"),
+    process.platform === "darwin"
+      ? "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = \"%u:%g:%a\" ]; then exec /usr/bin/stat -f '%u:%g:%Lp' \"$3\"; fi\nexec /usr/bin/stat \"$@\"\n"
+      : "#!/bin/sh\nexec /usr/bin/stat \"$@\"\n",
+    { mode: 0o700 },
+  );
+  const runGuard = (path, marker) =>
+    spawnSync(
+      "bash",
+      [
+        "-euc",
+        [
+          "set -euo pipefail",
+          buildSecureInstallDirectoryScript(path, {
+            owner,
+            group,
+            mode: "0755",
+            label: "test libexec",
+          }),
+          `printf '%s' marker > ${shellQuoteForTest(marker)}`,
+        ].join("\n"),
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          BASH_ENV: "/dev/null",
+          HOME: fixture,
+          PATH: `${bin}:/usr/bin:/bin`,
+        },
+      },
     );
-    const modeCheck = script.indexOf(
-      "stat -c '%u:%g:%a' /usr/local/libexec",
-    );
-    const markerWrite = script.indexOf(marker, modeCheck);
-    assert.ok(symlinkCheck >= 0, "the libexec parent must reject symlinks");
-    assert.ok(directoryCreate > symlinkCheck, "the parent must be checked before creation");
-    assert.ok(modeCheck > directoryCreate, "the parent owner and mode must be verified");
-    assert.ok(markerWrite > modeCheck, `${marker} must be written after the guard`);
+  try {
+    const target = join(fixture, "libexec");
+    const outside = join(fixture, "outside");
+    mkdirSync(outside);
+    symlinkSync(outside, target);
+    const blockedSymlink = runGuard(target, join(target, "release.marker"));
+    assert.notEqual(blockedSymlink.status, 0);
+    assert.equal(existsSync(join(outside, "release.marker")), false);
+
+    rmSync(target);
+    symlinkSync(join(fixture, "missing-target"), target);
+    const blockedDanglingSymlink = runGuard(target, join(target, "release.marker"));
+    assert.notEqual(blockedDanglingSymlink.status, 0);
+    assert.equal(existsSync(join(fixture, "missing-target", "release.marker")), false);
+
+    rmSync(target);
+    writeFileSync(target, "not a directory");
+    const blockedFile = runGuard(target, join(target, "release.marker"));
+    assert.notEqual(blockedFile.status, 0);
+    assert.equal(existsSync(join(outside, "release.marker")), false);
+
+    rmSync(target);
+    const created = runGuard(target, join(target, "release.marker"));
+    assert.equal(created.status, 0, `${created.stdout}\n${created.stderr}`);
+    assert.equal(lstatSync(target).isDirectory(), true);
+    assert.equal(readFileSync(join(target, "release.marker"), "utf8"), "marker");
+    const targetStat = statSync(target);
+    assert.equal(targetStat.uid, process.getuid?.() ?? targetStat.uid);
+    assert.equal(targetStat.gid, process.getgid?.() ?? targetStat.gid);
+    assert.equal(targetStat.mode & 0o777, 0o755);
+
+    const realParent = join(fixture, "real-parent");
+    const parentLink = join(fixture, "parent-link");
+    mkdirSync(realParent);
+    symlinkSync(realParent, parentLink);
+    const nested = join(parentLink, "libexec");
+    const blockedParent = runGuard(nested, join(nested, "release.marker"));
+    assert.notEqual(blockedParent.status, 0);
+    assert.equal(existsSync(join(realParent, "libexec", "release.marker")), false);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
   }
 });
 
@@ -320,26 +389,52 @@ test("Codex prompt transfer is opt-in, path-bound, and non-disclosing", async ()
     delete process.env.CMUX_HOME_ALLOW_PROVIDER_SECRET_FILE_TRANSFER;
     delete process.env.CMUX_HOME_PROVIDER_SECRET_REDACTION_ACK;
     await assert.rejects(
-      () => transferCodexPromptFile(freestyle, "vm-test", path, prompt),
+      () => transferCodexPromptFile(freestyle, "vm-test", path, prompt, "cmux"),
       /confirm provider request-body redaction/,
     );
     assert.equal(calls.length, 0);
 
     process.env.CMUX_HOME_ALLOW_PROVIDER_SECRET_FILE_TRANSFER = "1";
     process.env.CMUX_HOME_PROVIDER_SECRET_REDACTION_ACK = "freestyle-file-api-v1";
-    await transferCodexPromptFile(freestyle, "vm-test", path, prompt);
+    await transferCodexPromptFile(freestyle, "vm-test", path, prompt, "cmux");
     assert.equal(selectedUser, "root");
     assert.deepEqual(writes, [{ filePath: path, content: prompt }]);
     assert.equal(calls.every((command) => !command.includes(prompt)), true);
     assert.match(calls[0], /test ! -e/);
     assert.match(calls[0], /0:.*:710/);
-    assert.match(calls[1], /chown cmux:cmux/);
+    assert.match(calls[1], /chown 'cmux':/);
     assert.equal(removed.length, 0);
+
+    // The WebSocket daemon always runs as the dedicated cmux account. The
+    // transfer primitive remains parameterized so direct callers cannot
+    // silently chown a prompt to the wrong account.
+    assert.equal(CMUXD_SERVICE_USER, "cmux");
+    calls.length = 0;
+    writes.length = 0;
+    selectedUser = null;
+    const customPath = createCodexPromptPath();
+    await transferCodexPromptFile(
+      freestyle,
+      "vm-test",
+      customPath,
+      prompt,
+      "developer",
+    );
+    assert.equal(selectedUser, "root");
+    assert.deepEqual(writes, [{ filePath: customPath, content: prompt }]);
+    assert.match(calls[1], /chown 'developer':/);
+    assert.doesNotMatch(calls[1], /chown cmux:cmux/);
 
     await removeCodexPromptFile(freestyle, "vm-test", path);
     assert.deepEqual(removed, [path]);
     await assert.rejects(
-      () => transferCodexPromptFile(freestyle, "vm-test", "/run/cmuxd/codex-prompt-bad.txt", prompt),
+      () => transferCodexPromptFile(
+        freestyle,
+        "vm-test",
+        "/run/cmuxd/codex-prompt-bad.txt",
+        prompt,
+        "cmux",
+      ),
       /one-time file under \/run\/cmuxd/,
     );
   } finally {
@@ -374,7 +469,7 @@ test("Codex prompt transfer redacts provider errors and removes partial files", 
     process.env.CMUX_HOME_ALLOW_PROVIDER_SECRET_FILE_TRANSFER = "1";
     process.env.CMUX_HOME_PROVIDER_SECRET_REDACTION_ACK = "freestyle-file-api-v1";
     await assert.rejects(
-      () => transferCodexPromptFile(freestyle, "vm-test", path, prompt),
+      () => transferCodexPromptFile(freestyle, "vm-test", path, prompt, "cmux"),
       (error) => {
         assert.match(error.message, /Codex prompt transfer failed/);
         assert.doesNotMatch(error.message, new RegExp(prompt));
