@@ -68,6 +68,33 @@ test("cmuxd installer pins both architecture digests and least privilege", () =>
   execFileSync("bash", ["-n", "-c", script]);
 });
 
+test("system installers provision a private libexec parent before marker writes", () => {
+  const cases = [
+    {
+      script: buildCmuxdInstallScript(),
+      marker: "/usr/local/libexec/cmuxd-remote.release",
+    },
+    {
+      script: buildTailscaleBootstrap({ hostname: "fs-test", proxyPort: 1055 }),
+      marker: "/usr/local/libexec/tailscale.release",
+    },
+  ];
+  for (const { script, marker } of cases) {
+    const symlinkCheck = script.indexOf("test ! -L /usr/local/libexec");
+    const directoryCreate = script.indexOf(
+      "install -d -o root -g root -m 0755 /usr/local/libexec",
+    );
+    const modeCheck = script.indexOf(
+      "stat -c '%u:%g:%a' /usr/local/libexec",
+    );
+    const markerWrite = script.indexOf(marker, modeCheck);
+    assert.ok(symlinkCheck >= 0, "the libexec parent must reject symlinks");
+    assert.ok(directoryCreate > symlinkCheck, "the parent must be checked before creation");
+    assert.ok(modeCheck > directoryCreate, "the parent owner and mode must be verified");
+    assert.ok(markerWrite > modeCheck, `${marker} must be written after the guard`);
+  }
+});
+
 test("cmux clone bootstrap checks out only the reviewed commit", () => {
   const script = buildCmuxCloneBootstrap();
   assert.match(script, /0247f51a1f30308df595606d0951c802ec038550/);
