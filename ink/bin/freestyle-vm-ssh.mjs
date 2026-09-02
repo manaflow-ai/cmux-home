@@ -561,6 +561,15 @@ try {
   }
 
   const remoteSteps = [];
+  // Install cleanup before any bootstrap step. A failed Tailscale, config, or
+  // repository step must not leave private prompt text under /run/cmuxd. The
+  // final nested shell installs its own trap because it replaces this shell.
+  const promptPath = args.codexPromptFile ? shellQuote(args.codexPromptFile) : null;
+  if (promptPath) {
+    remoteSteps.push(
+      `prompt_file=${promptPath}; cleanup_prompt() { rm -f -- "$prompt_file"; }; trap cleanup_prompt EXIT`,
+    );
+  }
 
   // Lightweight attach modes that skip the full bootstrap: just SSH into
   // the VM and run a single fire-and-forget remote command.
@@ -749,7 +758,6 @@ try {
     // stdin, so prompt text never appears in argv, shell history, or the JSON
     // bootstrap. The file is removed by the command and its EXIT trap.
     const previewLine = "[freestyle-vm-ssh] launching codex with prompt";
-    const promptPath = shellQuote(args.codexPromptFile);
     remoteSteps.push(
       `printf '%s\\n\\n' ${shellQuote(previewLine)}`,
       `test -f ${promptPath} && test ! -L ${promptPath} && test "$(stat -c '%a:%u:%g' ${promptPath})" = "600:$(id -u):$(id -g)"`,
@@ -1011,7 +1019,7 @@ export function buildCmuxCloneBootstrap() {
     // Every Git operation uses a fixed command policy. This disables hooks,
     // credential helpers, filters, proxies, protocol extensions, and SSH
     // command overrides that may be present in a pre-existing .git/config.
-    'cmux_git() { /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c http.proxy= -c https.proxy= -c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.allow=never -c fetch.fsckObjects=true -c transfer.fsckObjects=true "$@"; }',
+    'cmux_git() { /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c http.proxy= -c https.proxy= -c protocol.ext.allow=never -c protocol.file.allow=never -c protocol.https.allow=always -c protocol.allow=never -c fetch.fsckObjects=true -c transfer.fsckObjects=true "$@"; }',
     'if [ -e "$cmux_home/cmux" ] && { test -L "$cmux_home/cmux" || test ! -d "$cmux_home/cmux"; }; then',
     '  echo "[freestyle-vm-ssh] refusing to replace a non-git ~/cmux directory" >&2; exit 1',
     "fi",
@@ -1209,7 +1217,7 @@ export function buildTailscaleBootstrap(options) {
     // Refresh status after a join. The first status snapshot can be empty
     // while tailscaled is starting, and must not be used for identity checks.
     `TS_STATUS_JSON=$(tailscale --socket=/run/tailscale/tailscaled.sock status --self=true --peers=false --json 2>/dev/null || echo '{}')`,
-    'TS_SELF_DNS=$(printf "%s" "$TS_STATUS_JSON" | sed \'s/.*"DNSName"[[:space:]]*:[[:space:]]*"\\([^"\\]*\\)".*/\\1/p\' | head -1)',
+    'TS_SELF_DNS=$(printf "%s" "$TS_STATUS_JSON" | sed -n \'s/.*"DNSName"[[:space:]]*:[[:space:]]*"\\([^"\\]*\\)".*/\\1/p\' | head -1)',
     'case "$TS_SELF_DNS" in *."$ts_tailnet_dns_suffix"|*."$ts_tailnet_dns_suffix".) ;; *) echo "[freestyle-vm-ssh] Tailscale identity is not on the approved tailnet" >&2; exit 1 ;; esac',
     'test -d /etc/profile.d && test ! -L /etc/profile.d',
     'cmux_profile_tmp=$(mktemp /etc/profile.d/.cmux-tailnet-proxy.XXXXXX)',
