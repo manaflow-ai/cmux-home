@@ -23,6 +23,7 @@ export const CMUX_REPOSITORY: PinnedRepository;
 export const PROVIDER_FILE_TRANSFER_ACK: string;
 export const DEFAULT_FREESTYLE_API_BASE_URL: string;
 export const TRUSTED_COMMAND_PATH: string;
+export function isValidFreestyleHostKeyLine(value: string): boolean;
 export function providerFileTransferEnabled(): boolean;
 export function freestyleApiBaseUrl(value?: string): string;
 export function freestyleKnownHostsPath(): string;

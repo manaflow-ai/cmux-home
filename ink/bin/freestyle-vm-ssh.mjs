@@ -42,6 +42,7 @@ import {
   buildSecureInstallDirectoryScript,
   freestyleApiBaseUrl,
   ensurePrivateKnownHostsFile,
+  isValidFreestyleHostKeyLine,
   trustedExecutable,
   writePrivateKnownHosts,
   providerFileTransferEnabled,
@@ -187,7 +188,7 @@ function sshHostKeyOptions() {
   ensureKnownHostsFile(path);
   const pinned = process.env.CMUX_FREESTYLE_SSH_HOST_KEY?.trim();
   if (pinned) {
-    if (!/^(?:vm-ssh\.freestyle\.sh|\[vm-ssh\.freestyle\.sh\]:22)\s+ssh-(?:ed25519|rsa|ecdsa)\s+\S+$/.test(pinned)) {
+    if (!isValidFreestyleHostKeyLine(pinned)) {
       throw new Error("CMUX_FREESTYLE_SSH_HOST_KEY must be a single vm-ssh.freestyle.sh known_hosts line");
     }
     writePrivateKnownHosts(path, `${pinned}\n`);

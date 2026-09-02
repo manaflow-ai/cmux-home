@@ -35,6 +35,13 @@ export const DEFAULT_FREESTYLE_API_BASE_URL = "https://api.freestyle.sh";
 export const TRUSTED_COMMAND_PATH =
   "/usr/sbin:/usr/bin:/sbin:/bin";
 
+const FREESTYLE_HOST_KEY_LINE_RE = /^(?:vm-ssh\.freestyle\.sh|\[vm-ssh\.freestyle\.sh\]:22)\s+(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521))\s+\S+$/;
+
+/** Validate one pinned vm-ssh.freestyle.sh known_hosts line. */
+export function isValidFreestyleHostKeyLine(value) {
+  return typeof value === "string" && FREESTYLE_HOST_KEY_LINE_RE.test(value);
+}
+
 /**
  * Provider file writes carry content in an API request body. Keep this opt-in
  * until the provider contract explicitly guarantees that request bodies are
