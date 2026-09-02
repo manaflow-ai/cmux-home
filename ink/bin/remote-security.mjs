@@ -289,6 +289,66 @@ export function sha256CheckShell(file, expected, label = "artifact") {
   ];
 }
 
+/**
+ * Build a fail-closed shell guard for a root-owned install directory.
+ *
+ * The caller supplies only reviewed absolute paths and account names. The
+ * generated commands reject an existing symlink or non-directory parent,
+ * create the directory with the requested owner and mode, then verify the
+ * resulting inode before any caller writes a marker or executable below it.
+ * Optional owner/group/mode values make the same guard executable in an
+ * unprivileged, isolated test fixture; production callers keep the defaults.
+ */
+export function buildSecureInstallDirectoryScript(
+  path,
+  { owner = "root", group = "root", mode = "0755", label = "install directory" } = {},
+) {
+  if (
+    typeof path !== "string" ||
+    !/^\/[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(path) ||
+    path.split("/").some((component) => component === "." || component === "..")
+  ) {
+    throw new Error("secure install directory path must be an absolute POSIX path");
+  }
+  const accountPattern = /^(?:[A-Za-z_][A-Za-z0-9._-]{0,31}|[0-9]+)$/;
+  if (
+    typeof owner !== "string" ||
+    typeof group !== "string" ||
+    !accountPattern.test(owner) ||
+    !accountPattern.test(group)
+  ) {
+    throw new Error("secure install directory owner and group are invalid");
+  }
+  if (typeof mode !== "string" || !/^[0-7]{3,4}$/.test(mode)) {
+    throw new Error("secure install directory mode is invalid");
+  }
+  if (typeof label !== "string" || label.length === 0 || /[\0\r\n]/.test(label)) {
+    throw new Error("secure install directory label is invalid");
+  }
+  const quotedPath = shellQuote(path);
+  const components = [];
+  for (let cursor = path; cursor !== "/"; cursor = dirname(cursor)) {
+    components.unshift(cursor);
+  }
+  const quotedOwner = shellQuote(owner);
+  const quotedGroup = shellQuote(group);
+  const normalizedMode = mode.replace(/^0+/, "") || "0";
+  const ownerId = /^\d+$/.test(owner) ? owner : `$(id -u ${quotedOwner})`;
+  const groupId = /^\d+$/.test(group) ? group : `$(id -g ${quotedGroup})`;
+  const fail = (message) =>
+    `{ echo ${shellQuote(`${label}: ${message}`)} >&2; exit 1; }`;
+  return [
+    ...components.map((component) => {
+      const quotedComponent = shellQuote(component);
+      return `if test -L ${quotedComponent} || { test -e ${quotedComponent} && test ! -d ${quotedComponent}; }; then ${fail("path component is not a real directory")}; fi`;
+    }),
+    `install -d -o ${quotedOwner} -g ${quotedGroup} -m ${mode} ${quotedPath}`,
+    `test ! -L ${quotedPath} || ${fail("secure install directory became a symlink")}`,
+    `test -d ${quotedPath} || ${fail("secure install directory is not a directory")}`,
+    `test "$(stat -c '%u:%g:%a' ${quotedPath})" = "${ownerId}:${groupId}:${normalizedMode}" || ${fail("secure install directory ownership or mode is unsafe")}`,
+  ].join("\n");
+}
+
 /** Redact exact credentials before writing diagnostics. */
 export function redactSecrets(value, secrets = []) {
   let result = String(value);

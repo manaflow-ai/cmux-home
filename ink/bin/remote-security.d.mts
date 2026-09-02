@@ -32,5 +32,14 @@ export function trustedExecutable(name: string): string;
 export function assertTrustedUnixSocketPath(path: string): string;
 export function shellQuote(value: string): string;
 export function sha256CheckShell(file: string, expected: string, label?: string): string[];
+export function buildSecureInstallDirectoryScript(
+  path: string,
+  options?: {
+    owner?: string;
+    group?: string;
+    mode?: string;
+    label?: string;
+  },
+): string;
 export function redactSecrets(value: string, secrets?: readonly string[]): string;
 export function sanitizedEnvironment(extra?: Record<string, string | undefined>): NodeJS.ProcessEnv;

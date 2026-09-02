@@ -16,6 +16,7 @@ const VM_SSH_SCRIPT = resolve(__dirname, "..", "bin", "freestyle-vm-ssh.mjs");
 import { CmuxClient, defaultSocketPath } from "./client.js";
 import { prepareFreestyleBootstrap } from "./cmux-ssh.js";
 import {
+  CMUXD_SERVICE_USER,
   createCodexPromptPath,
   cleanupFreestyleWsResources,
   openCmuxWsWorkspace,
@@ -1291,6 +1292,7 @@ async function openTaskWorkspace(opts: {
         vmId,
         codexPromptFile,
         codexPrompt.trim(),
+        CMUXD_SERVICE_USER,
       );
       promptTransferred = true;
     }

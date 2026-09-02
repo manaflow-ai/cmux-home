@@ -5,6 +5,7 @@ import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Freestyle } from "freestyle";
 import {
   CMUXD_REMOTE_RELEASE,
+  buildSecureInstallDirectoryScript,
   providerFileTransferEnabled,
   redactSecrets,
   shellQuote,
@@ -45,9 +46,17 @@ const CMUXD_WS_PTY_TTL_SECONDS = 5 * 60;
 const CMUXD_WS_RPC_TTL_SECONDS = 12 * 60 * 60;
 const CODEX_PROMPT_MAX_BYTES = 128 * 1024;
 const CODEX_PROMPT_PATH_RE = /^\/run\/cmuxd\/codex-prompt-[A-Fa-f0-9]{32}\.txt$/;
+const LINUX_USER_RE = /^[A-Za-z_][A-Za-z0-9._-]{0,31}$/;
+
+/** Account used by cmuxd-ws.service and therefore by Codex prompt files. */
+export const CMUXD_SERVICE_USER = "cmux";
 
 function isSafeVmId(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
+}
+
+function isSafeLinuxUser(value: string): boolean {
+  return typeof value === "string" && LINUX_USER_RE.test(value);
 }
 
 /** Create a random, fixed-shape path for a one-time Codex prompt file. */
@@ -93,6 +102,7 @@ export async function transferCodexPromptFile(
   vmId: string,
   path: string,
   prompt: string,
+  targetUser: string,
 ): Promise<void> {
   if (!providerFileTransferEnabled()) {
     throw new Error(
@@ -100,12 +110,14 @@ export async function transferCodexPromptFile(
     );
   }
   if (!isSafeVmId(vmId)) throw new Error("invalid Freestyle VM id");
+  if (!isSafeLinuxUser(targetUser)) throw new Error("invalid Linux user");
   assertCodexPrompt(path, prompt);
   const vm = rootVmFor(freestyle, vmId);
+  const quotedTargetUser = shellQuote(targetUser);
   let writeAttempted = false;
   try {
     const setup = await vm.exec({
-      command: `PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; test ! -L ${shellQuote(CMUXD_WS_LEASE_DIR)} && install -d -o root -g cmux -m 0710 ${shellQuote(CMUXD_WS_LEASE_DIR)} && test "$(stat -c '%u:%g:%a' ${shellQuote(CMUXD_WS_LEASE_DIR)})" = "0:$(id -g cmux):710" && find ${shellQuote(CMUXD_WS_LEASE_DIR)} -maxdepth 1 -type f -name 'codex-prompt-*.txt' -mmin +10 -delete && test ! -e ${shellQuote(path)}`,
+      command: `PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; test ! -L ${shellQuote(CMUXD_WS_LEASE_DIR)} && install -d -o root -g ${shellQuote(CMUXD_SERVICE_USER)} -m 0710 ${shellQuote(CMUXD_WS_LEASE_DIR)} && test "$(stat -c '%u:%g:%a' ${shellQuote(CMUXD_WS_LEASE_DIR)})" = "0:$(id -g ${shellQuote(CMUXD_SERVICE_USER)}):710" && id -u ${quotedTargetUser} >/dev/null 2>&1 && id -g ${quotedTargetUser} >/dev/null 2>&1 && find ${shellQuote(CMUXD_WS_LEASE_DIR)} -maxdepth 1 -type f -name 'codex-prompt-*.txt' -mmin +10 -delete && test ! -L ${shellQuote(path)} && test ! -e ${shellQuote(path)}`,
       timeoutMs: 15_000,
     });
     if ((setup.statusCode ?? 0) !== 0) {
@@ -114,7 +126,7 @@ export async function transferCodexPromptFile(
     writeAttempted = true;
     await vm.fs.writeTextFile(path, prompt);
     const verify = await vm.exec({
-      command: `PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; test -f ${shellQuote(path)} && test ! -L ${shellQuote(path)} && chown cmux:cmux ${shellQuote(path)} && chmod 0600 ${shellQuote(path)} && test "$(stat -c '%a:%u:%g' ${shellQuote(path)})" = "600:$(id -u cmux):$(id -g cmux)"`,
+      command: `PATH=/usr/sbin:/usr/bin:/sbin:/bin; export PATH; test -f ${shellQuote(path)} && test ! -L ${shellQuote(path)} && chown ${quotedTargetUser}: ${shellQuote(path)} && chmod 0600 ${shellQuote(path)} && test "$(stat -c '%a:%u:%g' ${shellQuote(path)})" = "600:$(id -u ${quotedTargetUser}):$(id -g ${quotedTargetUser})"`,
       timeoutMs: 15_000,
     });
     if ((verify.statusCode ?? 0) !== 0) {
@@ -206,7 +218,7 @@ export function buildCmuxdInstallScript(): string {
   const launcherPath = "/usr/local/libexec/cmuxd-ws-launch";
   const releasePath = "/usr/local/libexec/cmuxd-remote.release";
   const unitPath = "/etc/systemd/system/cmuxd-ws.service";
-  const serviceUser = "cmux";
+  const serviceUser = CMUXD_SERVICE_USER;
   const digestLines = sha256CheckShell("$cmux_download", "$cmux_expected", "cmuxd-remote");
   return [
     "set -euo pipefail",
@@ -229,14 +241,11 @@ export function buildCmuxdInstallScript(): string {
     `install -d -o root -g ${serviceUser} -m 0710 ${CMUXD_WS_LEASE_DIR}`,
     `test "$(stat -c '%u:%g:%a' ${shellQuote(CMUXD_WS_LEASE_DIR)})" = "0:$cmux_gid:710"`,
     // The release binary, launcher, and provenance marker share this parent.
-    // Validate every existing component before install follows the path, then
-    // create the target with root ownership and a fixed non-writable mode.
-    "test ! -L /usr/local || { echo 'cmuxd-ws: refusing a symlink /usr/local' >&2; exit 1; }",
-    "test -d /usr/local || { echo 'cmuxd-ws: /usr/local must be a directory' >&2; exit 1; }",
-    "test ! -L /usr/local/libexec || { echo 'cmuxd-ws: refusing a symlink libexec directory' >&2; exit 1; }",
-    "install -d -o root -g root -m 0755 /usr/local/libexec",
-    "test ! -L /usr/local/libexec || { echo 'cmuxd-ws: libexec directory changed to a symlink' >&2; exit 1; }",
-    "test \"$(stat -c '%u:%g:%a' /usr/local/libexec)\" = '0:0:755' || { echo 'cmuxd-ws: libexec directory ownership or mode is unsafe' >&2; exit 1; }",
+    // The shared guard validates every existing path component, rejects
+    // dangling symlinks, creates the target, and verifies its inode policy.
+    buildSecureInstallDirectoryScript("/usr/local/libexec", {
+      label: "cmuxd-ws libexec",
+    }),
     "cmux_sha256() {",
     "  if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\" | awk '{print tolower($1)}'; return; fi",
     "  if command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{print tolower($1)}'; return; fi",
