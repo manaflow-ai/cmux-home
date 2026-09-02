@@ -52,8 +52,12 @@ jobs:
       )
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 10
+    # GitHub keeps only one pending run per concurrency group. Scope this
+    # group to the platform-generated workflow attempt, so a later event for
+    # the same pull request cannot replace an earlier signing event. The
+    # signer action performs bounded optimistic locking for the shared ledger.
     concurrency:
-      group: cla-admission-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: cla-admission-${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -206,8 +210,11 @@ jobs:
       )
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 15
+    # Do not use a pull-request-wide queue here. A pending signing run could
+    # otherwise be replaced by a later event. The pinned action merges shared
+    # ledger updates with bounded compare-and-swap retries (three attempts).
     concurrency:
-      group: cla-mutation-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: cla-mutation-${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
     permissions:
       contents: write
@@ -436,8 +443,10 @@ jobs:
       )
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 15
+    # Keep this event-scoped. A pull-request-wide group would allow a later
+    # comment to replace a pending exact rerun request.
     concurrency:
-      group: cla-mutation-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: cla-mutation-${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
     permissions:
       actions: write
@@ -502,8 +511,11 @@ jobs:
       github.event.pull_request.merged == true
     runs-on: ubuntu-24.04 # github-hosted-required: CLA policy jobs
     timeout-minutes: 10
+    # A merged-event lock must not share a pull-request queue with signing or
+    # rerun events. The action validates the closed PR immediately before its
+    # lock write, while this group keeps each workflow attempt independent.
     concurrency:
-      group: cla-mutation-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      group: cla-lock-${{ github.repository }}-${{ github.run_id }}-${{ github.run_attempt }}
       cancel-in-progress: false
     permissions:
       contents: read
