@@ -440,7 +440,7 @@ test("credential-free bootstrap consumes prompt by file path only", () => {
   const payload = JSON.parse(result.stdout.trim().split(/\r?\n/).pop());
   assert.match(
     payload.remoteCommand,
-    /^prompt_file='[^']+'; cleanup_prompt\(\) \{ rm -f -- "\$prompt_file"; \}; trap cleanup_prompt EXIT && /,
+    /^\( prompt_file='[^']+'; cleanup_prompt\(\) \{ rm -f -- "\$prompt_file"; \}; trap cleanup_prompt EXIT && /,
   );
   assert.match(payload.remoteCommand, /codex exec -/);
   assert.match(payload.remoteCommand, new RegExp(promptPath.replaceAll("/", "\\/")));
@@ -526,12 +526,14 @@ test("credential-free bootstrap removes the prompt when an earlier step fails", 
     const separator = remoteCommand.indexOf(" && ");
     assert.ok(separator > 0, "prompt cleanup must precede bootstrap steps");
     const failingCommand = `${remoteCommand.slice(0, separator)} && false && ${remoteCommand.slice(separator + 4)}`;
-    const run = spawnSync("bash", ["--noprofile", "--norc", "-c", failingCommand], {
+    const run = spawnSync("bash", ["--noprofile", "--norc", "-i"], {
       encoding: "utf8",
       env: { HOME: home, PATH: "/usr/bin:/bin", TERM: "xterm" },
+      input: `${failingCommand}\nprintf 'parent shell survived\\n'\nexit\n`,
       timeout: 5_000,
     });
-    assert.notEqual(run.status, 0);
+    assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+    assert.match(`${run.stdout}\n${run.stderr}`, /parent shell survived/);
     assert.equal(existsSync(prompt), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
