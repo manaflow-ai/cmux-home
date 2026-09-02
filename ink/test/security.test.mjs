@@ -44,11 +44,15 @@ import {
 import {
   buildTailscaleBootstrap,
   buildCmuxCloneBootstrap,
+  buildGitConfigIsolationScript,
+  buildSshTransportArgs,
+  devServerMacPortForVm,
   buildSshpassArgs,
   localSecretFromFile,
   providerSecretTransferEnabled,
   transferProviderSecret,
 } from "../bin/freestyle-vm-ssh.mjs";
+import { CmuxClient } from "../src/client.ts";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helper = resolve(root, "bin", "freestyle-vm-ssh.mjs");
@@ -176,6 +180,109 @@ test("cmux clone bootstrap checks out only the reviewed commit", () => {
   assert.match(script, /--frozen-lockfile --ignore-scripts/);
   assert.doesNotMatch(script, /git -C .*pull .*origin main/);
   execFileSync("bash", ["-n", "-c", script]);
+});
+
+test("dev server browser endpoint has an authenticated loopback forward", async () => {
+  const vmId = "vm-forward-test";
+  const macPort = devServerMacPortForVm(vmId);
+  assert.ok(macPort >= 30_000 && macPort < 40_000);
+  const transportArgs = buildSshTransportArgs(
+    {
+      devServerMacPort: macPort,
+      forwardPorts: [],
+      useReverseForward: false,
+      subrouterPort: 31_415,
+    },
+    ["StrictHostKeyChecking=yes", "UserKnownHostsFile=/tmp/known-hosts"],
+  );
+  const forwardIndex = transportArgs.indexOf("-L");
+  assert.notEqual(forwardIndex, -1);
+  assert.equal(transportArgs[forwardIndex + 1], `${macPort}:127.0.0.1:3000`);
+  assert.ok(transportArgs.includes("-o"));
+  const exitOnFailureIndex = transportArgs.indexOf("ExitOnForwardFailure=yes");
+  assert.notEqual(exitOnFailureIndex, -1);
+
+  const calls = [];
+  const client = new CmuxClient({ socketPath: "/tmp/cmux-security-test.sock" });
+  client.rpc = async (method, params) => {
+    calls.push({ method, params });
+    return {
+      pane_id: "pane-id",
+      pane_ref: "pane:1",
+      surface_id: "surface-id",
+      surface_ref: "surface:1",
+    };
+  };
+  const browser = await client.createBrowserPane({
+    workspaceId: "workspace-id",
+    url: `http://127.0.0.1:${macPort}`,
+    sourceSurfaceId: "source-surface-id",
+    bypassRemoteProxy: true,
+  });
+  assert.equal(browser?.surfaceId, "surface-id");
+  assert.deepEqual(calls, [{
+    method: "browser.open_split",
+    params: {
+      workspace_id: "workspace-id",
+      source_surface_id: "source-surface-id",
+      url: `http://127.0.0.1:${macPort}`,
+      focus: false,
+      bypass_remote_proxy: true,
+    },
+  }]);
+});
+
+test("git isolation removes executable local configuration before fetch", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "cmux-home-git-isolation-"));
+  const repo = join(fixture, "repo");
+  const bare = join(fixture, "origin.git");
+  const marker = join(fixture, "executed");
+  try {
+    execFileSync("git", ["init", "--quiet", repo]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "security@example.invalid"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "Security Test"]);
+    writeFileSync(join(repo, "README"), "safe\n");
+    execFileSync("git", ["-C", repo, "add", "README"]);
+    execFileSync("git", ["-C", repo, "commit", "--quiet", "-m", "initial"]);
+    execFileSync("git", ["clone", "--quiet", "--bare", repo, bare]);
+    const markerScript = join(fixture, "marker.sh");
+    writeFileSync(markerScript, `#!/bin/sh\nprintf executed > ${shellQuoteForTest(marker)}\nexit 99\n`, { mode: 0o700 });
+    chmodSync(markerScript, 0o700);
+    writeFileSync(
+      join(repo, ".git", "config"),
+      [
+        "[remote \"origin\"]",
+        `\turl = file://${bare}`,
+        `\tuploadpack = ${markerScript}`,
+        `\tproxy = ${markerScript}`,
+        "[filter \"evil\"]",
+        `\tprocess = ${markerScript}`,
+        "[core]",
+        `\tfsmonitor = ${markerScript}`,
+        "",
+      ].join("\n"),
+    );
+    const script = [
+      "set -euo pipefail",
+      `repo=${shellQuoteForTest(repo)}`,
+      `origin=${shellQuoteForTest(`file://${bare}`)}`,
+      "cmux_git_existing_origin=$(GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -C \"$repo\" config --no-includes --local --get remote.origin.url 2>/dev/null || true)",
+      'test "$cmux_git_existing_origin" = "$origin"',
+      buildGitConfigIsolationScript(),
+      'cmux_git_isolate_local_config "$repo" "$origin"',
+      'cmux_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand=/usr/bin/false -c credential.helper= -c remote.origin.uploadpack=/usr/bin/git-upload-pack -c remote.origin.proxy= -c protocol.file.allow=always -c protocol.allow=never "$@"; }',
+      'cmux_git -C "$repo" fetch --quiet origin HEAD',
+      'cmux_git -C "$repo" checkout --quiet --detach FETCH_HEAD',
+      `test ! -e ${shellQuoteForTest(marker)}`,
+      'test "$(cmux_git -C "$repo" config --get remote.origin.uploadpack || true)" = ""',
+      'test "$(cmux_git -C "$repo" config --get remote.origin.proxy || true)" = ""',
+    ].join("\n");
+    const result = spawnSync("bash", ["-euc", script], { encoding: "utf8" });
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test("cmuxd launcher rejects public listeners and accepts a private interface", () => {
