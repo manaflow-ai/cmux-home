@@ -1,6 +1,7 @@
 import { createConnection, type Socket } from "node:net";
 import { EventEmitter } from "node:events";
 import type { EventFrame, Notification, Workspace } from "./types.js";
+import { assertTrustedUnixSocketPath } from "../bin/remote-security.mjs";
 
 export interface CmuxClientOptions {
   readonly socketPath: string;
@@ -34,7 +35,7 @@ export class CmuxClient {
     let parsed: RawResponse;
     try {
       parsed = JSON.parse(response.trim()) as RawResponse;
-    } catch (err) {
+    } catch {
       throw new Error(`cmux ${method} returned invalid JSON: ${response.slice(0, 200)}`);
     }
     if (parsed.ok !== true) {
@@ -298,6 +299,17 @@ export class CmuxEventStream {
 
   private connect(): void {
     if (this.closed) return;
+    try {
+      assertTrustedUnixSocketPath(this.socketPath);
+    } catch (error) {
+      queueMicrotask(() => {
+        if (!this.closed) {
+          this.emit("error", error instanceof Error ? error : new Error(String(error)));
+        }
+      });
+      this.scheduleReconnect();
+      return;
+    }
     const socket = createConnection({ path: this.socketPath });
     this.socket = socket;
     socket.setEncoding("utf8");
@@ -362,6 +374,12 @@ function sendOneLine(
   timeoutMs: number,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
+    try {
+      assertTrustedUnixSocketPath(socketPath);
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+      return;
+    }
     const socket = createConnection({ path: socketPath });
     let received = "";
     let settled = false;

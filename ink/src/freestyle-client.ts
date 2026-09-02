@@ -1,4 +1,5 @@
 import { Freestyle } from "freestyle";
+import { freestyleApiBaseUrl } from "../bin/remote-security.mjs";
 
 export interface FreestyleVm {
   readonly id: string;
@@ -22,11 +23,11 @@ export interface FreestyleSummary {
 
 export class FreestyleClient {
   private readonly fs: Freestyle | null;
-  readonly apiKey: string | null;
 
   constructor(apiKey: string | null) {
-    this.apiKey = apiKey;
-    this.fs = apiKey ? new Freestyle({ apiKey }) : null;
+    this.fs = apiKey
+      ? new Freestyle({ apiKey, baseUrl: freestyleApiBaseUrl() })
+      : null;
   }
 
   isEnabled(): boolean {
