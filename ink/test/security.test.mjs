@@ -10,6 +10,7 @@ import {
   buildCmuxdInstallScript,
   buildCmuxdWsLauncherScript,
   buildLeaseWriteScript,
+  cleanupFreestyleWsResources,
   createCodexPromptPath,
   digestMatches,
   openCmuxWsWorkspace,
@@ -72,6 +73,8 @@ test("cmux clone bootstrap checks out only the reviewed commit", () => {
   assert.match(script, /0247f51a1f30308df595606d0951c802ec038550/);
   assert.match(script, /cmux_git -C .*fetch --quiet --no-tags --depth 1 origin/);
   assert.match(script, /protocol\.https\.allow=always/);
+  assert.match(script, /cmux_secret_mode\(\)/);
+  assert.match(script, /cmux_secret_mode "\$\(stat -c '%a' "\$cmux_env_file"\)"/);
   assert.match(script, /cat-file -e/);
   assert.match(script, /checkout --quiet --detach/);
   assert.match(script, /--frozen-lockfile --ignore-scripts/);
@@ -218,6 +221,35 @@ test("WebSocket lease transfer uses file API and never serializes lease payloads
       else process.env[name] = value;
     }
   }
+});
+
+test("WebSocket cleanup removes leases and a transferred prompt", async () => {
+  const promptPath = createCodexPromptPath();
+  const commands = [];
+  const removed = [];
+  const vm = {
+    exec: async ({ command }) => {
+      commands.push(command);
+      return { statusCode: 0, stdout: "", stderr: "" };
+    },
+    fs: {
+      remove: async (path) => removed.push(path),
+    },
+  };
+  const freestyle = { vms: { ref: () => ({ user: () => vm }) } };
+  await cleanupFreestyleWsResources(freestyle, "vm-test", promptPath);
+  assert.equal(commands.length, 1);
+  assert.match(commands[0], /attach-pty-lease\.json/);
+  assert.match(commands[0], /attach-rpc-lease\.json/);
+  assert.deepEqual(removed, [promptPath]);
+});
+
+test("WebSocket root-user selection fails closed when the SDK shape is wrong", async () => {
+  const freestyle = { vms: { ref: () => ({}) } };
+  await assert.rejects(
+    () => prepareFreestyleWsAttach(freestyle, "vm-test"),
+    /Freestyle SDK must support an explicit root VM file\/exec user/,
+  );
 });
 
 test("Codex prompt transfer is opt-in, path-bound, and non-disclosing", async () => {
