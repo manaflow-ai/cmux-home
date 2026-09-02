@@ -34,6 +34,7 @@ import {
 import {
   freestyleHostKeyOptions,
   hasEmbeddedCredential,
+  prepareFreestyleBootstrap,
 } from "../src/cmux-ssh.ts";
 import {
   redactSecrets,
@@ -679,6 +680,30 @@ test("credential-free bootstrap consumes prompt by file path only", () => {
   assert.match(payload.remoteCommand, /codex exec -[^;]*; cleanup_prompt; trap - EXIT; exec bash -l/);
   assert.doesNotMatch(payload.remoteCommand, /--codex-prompt(?:=|\s)/);
   execFileSync("bash", ["-n", "-c", payload.remoteCommand]);
+});
+
+test("credential-free bootstrap rejects credential-bearing helper output", async () => {
+  const fixture = mkdtempSync(join(tmpdir(), "cmux-home-bootstrap-contract-"));
+  const helperPath = join(fixture, "helper.mjs");
+  try {
+    writeFileSync(
+      helperPath,
+      [
+        "process.stdout.write(JSON.stringify({",
+        '  destination: "vm-test+cmux:secret@vm-ssh.freestyle.sh",',
+        "  identityId: null,",
+        '  remoteCommand: "true",',
+        "}) + String.fromCharCode(10));",
+      ].join("\n"),
+      { mode: 0o700 },
+    );
+    await assert.rejects(
+      () => prepareFreestyleBootstrap({ helperPath, vmId: "vm-test" }),
+      /invalid credential-free JSON/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test("credential-free bootstrap removes the prompt after Codex consumes it", () => {
